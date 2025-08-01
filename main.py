@@ -117,6 +117,7 @@ def mejores_criptos():
             ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
             if ganancia_neta > 0:
                 t['rsi'] = rsi
+                t['ganancia_neta'] = ganancia_neta  # Guardar ganancia neta para fallback
                 filtered.append(t)
         return sorted(filtered, key=lambda x: float(x.get("priceChangePercent", 0)), reverse=True)
     except BinanceAPIException as e:
@@ -170,6 +171,7 @@ def comprar():
                 change_percent = float(cripto["priceChangePercent"])
                 volume = float(cripto["quoteVolume"])
                 rsi = cripto.get("rsi", 50)
+                ganancia_neta = cripto.get("ganancia_neta", 0)
 
                 prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio 24h {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. Comisión {COMMISSION_RATE*100:.2f}%. ¿Comprar con {cantidad_usdc:.2f} USDC? Busca ganancias rápidas, acepta riesgos moderados, decide en 5 palabras o menos. Responde 'sí' o 'no'."
                 grok_response = consultar_grok(prompt)
@@ -177,10 +179,6 @@ def comprar():
                 cantidad = round(cantidad_usdc / precio, precision)
                 if cantidad <= 0:
                     continue
-                ganancia_bruta = (precio * cantidad) * TAKE_PROFIT
-                comision_compra = (precio * cantidad) * COMMISSION_RATE
-                comision_venta = ((precio * (1 + TAKE_PROFIT)) * cantidad) * COMMISSION_RATE
-                ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
                 if (grok_response and 'sí' in grok_response.lower()) or (ganancia_neta > 0 and rsi < 60):
                     if ganancia_neta <= 0:
                         logger.info(f"Operación no rentable para {symbol}: ganancia neta {ganancia_neta:.4f}")
@@ -260,8 +258,8 @@ def resumen_diario():
 enviar_telegram("🤖 Bot IA activo con razonamiento Grok. Operando con USDC de forma inteligente.")
 
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
-scheduler.add_job(comprar, 'interval', seconds=30)
-scheduler.add_job(vender, 'interval', seconds=30)
+scheduler.add_job(comprar, 'interval', minutes=5)  # Análisis cada 5 minutos
+scheduler.add_job(vender, 'interval', minutes=5)  # Análisis cada 5 minutos
 scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0)
 scheduler.start()
 
