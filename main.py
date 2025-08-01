@@ -233,9 +233,9 @@ def vender():
                 nuevos_registro[symbol] = data
                 if ganancia_neta <= 0:
                     logger.info(f"No se vende {symbol}: ganancia neta {ganancia_neta:.4f}")
-            except BinanceAPIException as e:
-                logger.error(f"Error vendiendo {symbol}: {e}")
-                nuevos_registro[symbol] = data
+        except BinanceAPIException as e:
+            logger.error(f"Error vendiendo {symbol}: {e}")
+            nuevos_registro[symbol] = data
     guardar_json(nuevos_registro, REGISTRO_FILE)
 
 def resumen_diario():
