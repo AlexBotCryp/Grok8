@@ -115,7 +115,7 @@ def mejores_criptos():
             comision_compra = precio * COMMISSION_RATE
             comision_venta = (precio + ganancia_bruta) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-            if ganancia_neta > 0 and rsi < 60:  # Ajustado a RSI < 60 para más flexibilidad
+            if ganancia_neta > 0:
                 t['rsi'] = rsi
                 filtered.append(t)
         return sorted(filtered, key=lambda x: float(x.get("priceChangePercent", 0)), reverse=True)
@@ -171,17 +171,17 @@ def comprar():
                 volume = float(cripto["quoteVolume"])
                 rsi = cripto.get("rsi", 50)
 
-                prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio 24h {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. Comisión {COMMISSION_RATE*100:.2f}%. ¿Comprar con {cantidad_usdc:.2f} USDC? Busca oportunidades a corto plazo, acepta riesgos moderados, y prioriza ganancias rápidas. Responde 'sí' o 'no' con breve explicación."
+                prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio 24h {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. Comisión {COMMISSION_RATE*100:.2f}%. ¿Comprar con {cantidad_usdc:.2f} USDC? Busca ganancias rápidas, acepta riesgos moderados, decide en 5 palabras o menos. Responde 'sí' o 'no'."
                 grok_response = consultar_grok(prompt)
-                if grok_response and 'sí' in grok_response.lower():
-                    precision = get_precision(symbol)
-                    cantidad = round(cantidad_usdc / precio, precision)
-                    if cantidad <= 0:
-                        continue
-                    ganancia_bruta = (precio * cantidad) * TAKE_PROFIT
-                    comision_compra = (precio * cantidad) * COMMISSION_RATE
-                    comision_venta = ((precio * (1 + TAKE_PROFIT)) * cantidad) * COMMISSION_RATE
-                    ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
+                precision = get_precision(symbol)
+                cantidad = round(cantidad_usdc / precio, precision)
+                if cantidad <= 0:
+                    continue
+                ganancia_bruta = (precio * cantidad) * TAKE_PROFIT
+                comision_compra = (precio * cantidad) * COMMISSION_RATE
+                comision_venta = ((precio * (1 + TAKE_PROFIT)) * cantidad) * COMMISSION_RATE
+                ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
+                if (grok_response and 'sí' in grok_response.lower()) or (ganancia_neta > 0 and rsi < 60):
                     if ganancia_neta <= 0:
                         logger.info(f"Operación no rentable para {symbol}: ganancia neta {ganancia_neta:.4f}")
                         continue
@@ -193,7 +193,7 @@ def comprar():
                         "timestamp": datetime.now(TIMEZONE).isoformat()
                     }
                     guardar_json(registro, REGISTRO_FILE)
-                    enviar_telegram(f"🟢 Comprado {symbol} - {cantidad:.{precision}f} a {precio:.4f} USDC. Grok dice: {grok_response}")
+                    enviar_telegram(f"🟢 Comprado {symbol} - {cantidad:.{precision}f} a {precio:.4f} USDC. Grok dice: {grok_response if grok_response else 'Decisión local por RSI'}")
                     break
                 else:
                     logger.info(f"Grok no recomienda comprar {symbol}: {grok_response}")
@@ -214,7 +214,7 @@ def vender():
             precio_actual = float(ticker["lastPrice"])
             cambio = (precio_actual - precio_compra) / precio_compra
 
-            prompt = f"Para {symbol}: Precio compra {precio_compra:.4f}, actual {precio_actual:.4f}, cambio {cambio*100:.2f}%. Comisión {COMMISSION_RATE*100:.2f}%. ¿Vender ahora? Busca oportunidades a corto plazo, acepta riesgos moderados, y prioriza ganancias rápidas. Responde 'sí' o 'no' con breve explicación."
+            prompt = f"Para {symbol}: Precio compra {precio_compra:.4f}, actual {precio_actual:.4f}, cambio {cambio*100:.2f}%. Comisión {COMMISSION_RATE*100:.2f}%. ¿Vender ahora? Busca ganancias rápidas, acepta riesgos moderados, decide en 5 palabras o menos. Responde 'sí' o 'no'."
             grok_response = consultar_grok(prompt)
             ganancia_bruta = cantidad * (precio_actual - precio_compra)
             comision_venta = (precio_actual * cantidad) * COMMISSION_RATE
