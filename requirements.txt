@@ -1,0 +1,7 @@
+python-binance>=1.0.19
+requests>=2.31.0
+pytz>=2024.1
+apscheduler>=3.10.4
+openai>=1.0.0
+numpy>=1.26.0
+setuptools<81
