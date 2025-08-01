@@ -33,8 +33,8 @@ client_openai = OpenAI(
 
 client = Client(API_KEY, API_SECRET)
 PORCENTAJE_USDC = 0.8
-TAKE_PROFIT = 0.003
-STOP_LOSS = -0.005
+TAKE_PROFIT = 0.002  # Ajustado a 0.2% para ventas más rápidas
+STOP_LOSS = -0.003  # Ajustado a -0.3% para limitar pérdidas
 PERDIDA_MAXIMA_DIARIA = 50
 MONEDA_BASE = "USDC"
 RESUMEN_HORA = 23
@@ -117,7 +117,7 @@ def mejores_criptos():
             ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
             if ganancia_neta > 0:
                 t['rsi'] = rsi
-                t['ganancia_neta'] = ganancia_neta  # Guardar ganancia neta para fallback
+                t['ganancia_neta'] = ganancia_neta
                 filtered.append(t)
         return sorted(filtered, key=lambda x: float(x.get("priceChangePercent", 0)), reverse=True)
     except BinanceAPIException as e:
@@ -204,6 +204,7 @@ def comprar():
 def vender():
     registro = cargar_json(REGISTRO_FILE)
     nuevos_registro = {}
+    saldo_usdc = float(client.get_asset_balance(asset=MONEDA_BASE)['free'])
     for symbol, data in list(registro.items()):
         try:
             cantidad = data["cantidad"]
@@ -217,15 +218,17 @@ def vender():
             ganancia_bruta = cantidad * (precio_actual - precio_compra)
             comision_venta = (precio_actual * cantidad) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - comision_venta
-            if (cambio >= TAKE_PROFIT or cambio <= STOP_LOSS or (grok_response and 'sí' in grok_response.lower())) and ganancia_neta > 0:
+            if (cambio >= TAKE_PROFIT or cambio <= STOP_LOSS or (grok_response and 'sí' in grok_response.lower()) or saldo_usdc < MIN_SALDO_COMPRA * 2) and ganancia_neta > 0:
                 precision = get_precision(symbol)
-                cantidad = round(cantidad, precision)
+                cantidad = round(min(cantidad, float(client.get_asset_balance(asset=symbol.split('/')[0])['free'])), precision)
+                if cantidad <= 0:
+                    logger.info(f"No hay saldo suficiente para vender {symbol}")
+                    continue
                 orden = client.order_market_sell(symbol=symbol, quantity=cantidad)
                 logger.info(f"Orden de venta: {orden}")
                 realized_pnl = ganancia_neta
                 actualizar_pnl_diario(realized_pnl)
-                enviar_telegram(f"🔴 Vendido {symbol} - {cantidad:.{precision}f} a {precio_actual:.4f} (Cambio: {cambio*100:.2f}%) PNL: {realized_pnl:.2f} USDC. Grok dice: {grok_response}")
-                # Después de venta, intenta comprar otra inmediatamente
+                enviar_telegram(f"🔴 Vendido {symbol} - {cantidad:.{precision}f} a {precio_actual:.4f} (Cambio: {cambio*100:.2f}%) PNL: {realized_pnl:.2f} USDC. Grok dice: {grok_response if grok_response else 'Venta forzada por bajo saldo'}")
                 comprar()
             else:
                 nuevos_registro[symbol] = data
@@ -258,8 +261,8 @@ def resumen_diario():
 enviar_telegram("🤖 Bot IA activo con razonamiento Grok. Operando con USDC de forma inteligente.")
 
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
-scheduler.add_job(comprar, 'interval', minutes=5)  # Análisis cada 5 minutos
-scheduler.add_job(vender, 'interval', minutes=5)  # Análisis cada 5 minutos
+scheduler.add_job(comprar, 'interval', minutes=5)
+scheduler.add_job(vender, 'interval', minutes=5)
 scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0)
 scheduler.start()
 
