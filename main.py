@@ -32,13 +32,13 @@ client_openai = OpenAI(
 )
 
 client = Client(API_KEY, API_SECRET)
-PORCENTAJE_USDC = 0.5  # Reducido a 50% para transiciones más suaves
-TAKE_PROFIT = 0.005  # 0.5% para más margen
-STOP_LOSS = -0.010  # -1.0% para más tolerancia
+PORCENTAJE_USDC = 0.5  # Reducido a 50% para transiciones suaves
+TAKE_PROFIT = 0.005  # 0.5%
+STOP_LOSS = -0.010  # -1.0%
 PERDIDA_MAXIMA_DIARIA = 50
 MONEDA_BASE = "USDC"
 RESUMEN_HORA = 23
-MIN_VOLUME = 50000  # Reducido para más opciones
+MIN_VOLUME = 50000
 MIN_SALDO_COMPRA = 5
 COMMISSION_RATE = 0.001
 TIMEZONE = pytz.timezone("UTC")
@@ -144,7 +144,7 @@ def consultar_grok(prompt):
         return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Error en llamada a Grok API: {e}")
-        return "no"
+        return "sí"  # Fallback a 'sí' para no bloquear
 
 def comprar():
     if not puede_comprar():
@@ -172,7 +172,7 @@ def comprar():
                 volume = float(cripto["quoteVolume"])
                 rsi = cripto.get("rsi", 50)
 
-                prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. ¿Comprar con {cantidad_usdc:.2f} USDC? Supervisa solo, acepta RSI < 70. 'sí' o 'no'."
+                prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. ¿Comprar con {cantidad_usdc:.2f} USDC? Supervisa solo, prioriza RSI < 70. 'sí' o 'no'."
                 grok_response = consultar_grok(prompt)
                 precision = get_precision(symbol)
                 cantidad = round(cantidad_usdc / precio, precision)
@@ -182,7 +182,7 @@ def comprar():
                 comision_compra = (precio * cantidad) * COMMISSION_RATE
                 comision_venta = ((precio * (1 + TAKE_PROFIT)) * cantidad) * COMMISSION_RATE
                 ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-                if rsi < 70 and ganancia_neta > 0:  # Prioridad a RSI
+                if rsi < 70 and ganancia_neta > 0:  # RSI como prioridad
                     if ganancia_neta <= 0:
                         logger.info(f"Operación no rentable para {symbol}: ganancia neta {ganancia_neta:.4f}")
                         continue
@@ -194,10 +194,10 @@ def comprar():
                         "timestamp": datetime.now(TIMEZONE).isoformat()
                     }
                     guardar_json(registro, REGISTRO_FILE)
-                    enviar_telegram(f"🟢 Comprado {symbol} - {cantidad:.{precision}f} a {precio:.4f} USDC. RSI: {rsi:.2f}, Grok dice: {grok_response}")
+                    enviar_telegram(f"🟢 Comprado {symbol} - {cantidad:.{precision}f} a {precio:.4f} USDC. RSI: {rsi:.2f}, Grok: {grok_response}")
                     break
                 else:
-                    logger.info(f"No se compra {symbol}: RSI {rsi:.2f}, Grok dice: {grok_response}")
+                    logger.info(f"No se compra {symbol}: RSI {rsi:.2f}, Grok: {grok_response}")
             except BinanceAPIException as e:
                 logger.error(f"Error comprando {symbol}: {e}")
                 continue
@@ -220,14 +220,14 @@ def vender():
             closes = [float(k[4]) for k in klines]
             rsi = calculate_rsi(closes)
 
-            prompt = f"Para {symbol}: Precio compra {precio_compra:.4f}, actual {precio_actual:.4f}, cambio {cambio*100:.2f}%, RSI {rsi:.2f}. ¿Vender ahora? Supervisa solo, acepta RSI > 30. 'sí' o 'no'."
+            prompt = f"Para {symbol}: Precio compra {precio_compra:.4f}, actual {precio_actual:.4f}, cambio {cambio*100:.2f}%, RSI {rsi:.2f}. ¿Vender ahora? Supervisa solo, prioriza RSI > 30. 'sí' o 'no'."
             grok_response = consultar_grok(prompt)
             ganancia_bruta = cantidad * (precio_actual - precio_compra)
             comision_venta = (precio_actual * cantidad) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - comision_venta
             if (cambio >= TAKE_PROFIT or cambio <= STOP_LOSS or rsi > 30 or (grok_response and 'sí' in grok_response.lower()) or saldo_usdc < MIN_SALDO_COMPRA * 2 or len(registro) > 0) and ganancia_neta > 0:
                 precision = get_precision(symbol)
-                cantidad_disponible = float(client.get_asset_balance(asset=symbol.split('/')[0])['free'])
+                cantidad_disponible = float(client.get_asset_balance(asset=symbol.split('/')[0])['free']) if client.get_asset_balance(asset=symbol.split('/')[0]) else 0
                 cantidad = round(min(cantidad, cantidad_disponible), precision)
                 if cantidad <= 0:
                     logger.info(f"No hay saldo suficiente para vender {symbol}")
@@ -236,8 +236,8 @@ def vender():
                 logger.info(f"Orden de venta: {orden}")
                 realized_pnl = ganancia_neta
                 actualizar_pnl_diario(realized_pnl)
-                enviar_telegram(f"🔴 Vendido {symbol} - {cantidad:.{precision}f} a {precio_actual:.4f} (Cambio: {cambio*100:.2f}%) PNL: {realized_pnl:.2f} USDC. RSI: {rsi:.2f}, Grok dice: {grok_response}")
-                comprar()
+                enviar_telegram(f"🔴 Vendido {symbol} - {cantidad:.{precision}f} a {precio_actual:.4f} (Cambio: {cambio*100:.2f}%) PNL: {realized_pnl:.2f} USDC. RSI: {rsi:.2f}, Grok: {grok_response}")
+                comprar()  # Reinicia compra tras venta
             else:
                 nuevos_registro[symbol] = data
                 if ganancia_neta <= 0:
