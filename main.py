@@ -137,14 +137,14 @@ def get_precision(symbol):
 def consultar_grok(prompt):
     try:
         response = client_openai.chat.completions.create(
-            model="grok-beta",
+            model="grok-3-mini",  # Cambiado a grok-3-mini, un modelo accesible
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Error en llamada a Grok API: {e}")
-        return None
+        return "no"  # Retorna "no" como fallback para evitar bloqueos
 
 def comprar():
     if not puede_comprar():
