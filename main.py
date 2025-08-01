@@ -33,8 +33,8 @@ client_openai = OpenAI(
 
 client = Client(API_KEY, API_SECRET)
 PORCENTAJE_USDC = 0.8
-TAKE_PROFIT = 0.002  # Ajustado a 0.2% para ventas más rápidas
-STOP_LOSS = -0.003  # Ajustado a -0.3% para limitar pérdidas
+TAKE_PROFIT = 0.002  # 0.2%
+STOP_LOSS = -0.003  # -0.3%
 PERDIDA_MAXIMA_DIARIA = 50
 MONEDA_BASE = "USDC"
 RESUMEN_HORA = 23
@@ -218,9 +218,10 @@ def vender():
             ganancia_bruta = cantidad * (precio_actual - precio_compra)
             comision_venta = (precio_actual * cantidad) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - comision_venta
-            if (cambio >= TAKE_PROFIT or cambio <= STOP_LOSS or (grok_response and 'sí' in grok_response.lower()) or saldo_usdc < MIN_SALDO_COMPRA * 2) and ganancia_neta > 0:
+            if (cambio >= TAKE_PROFIT or cambio <= STOP_LOSS or (grok_response and 'sí' in grok_response.lower()) or saldo_usdc < MIN_SALDO_COMPRA * 2 or len(registro) > 0) and ganancia_neta > 0:
                 precision = get_precision(symbol)
-                cantidad = round(min(cantidad, float(client.get_asset_balance(asset=symbol.split('/')[0])['free'])), precision)
+                cantidad_disponible = float(client.get_asset_balance(asset=symbol.split('/')[0])['free'])
+                cantidad = round(min(cantidad, cantidad_disponible), precision)
                 if cantidad <= 0:
                     logger.info(f"No hay saldo suficiente para vender {symbol}")
                     continue
@@ -228,7 +229,7 @@ def vender():
                 logger.info(f"Orden de venta: {orden}")
                 realized_pnl = ganancia_neta
                 actualizar_pnl_diario(realized_pnl)
-                enviar_telegram(f"🔴 Vendido {symbol} - {cantidad:.{precision}f} a {precio_actual:.4f} (Cambio: {cambio*100:.2f}%) PNL: {realized_pnl:.2f} USDC. Grok dice: {grok_response if grok_response else 'Venta forzada por bajo saldo'}")
+                enviar_telegram(f"🔴 Vendido {symbol} - {cantidad:.{precision}f} a {precio_actual:.4f} (Cambio: {cambio*100:.2f}%) PNL: {realized_pnl:.2f} USDC. Grok dice: {grok_response if grok_response else 'Venta forzada por estancamiento'}")
                 comprar()
             else:
                 nuevos_registro[symbol] = data
