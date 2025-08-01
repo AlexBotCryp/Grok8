@@ -115,7 +115,7 @@ def mejores_criptos():
             comision_compra = precio * COMMISSION_RATE
             comision_venta = (precio + ganancia_bruta) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-            if ganancia_neta > 0 and rsi < 40:
+            if ganancia_neta > 0 and rsi < 60:  # Ajustado a RSI < 60 para más flexibilidad
                 t['rsi'] = rsi
                 filtered.append(t)
         return sorted(filtered, key=lambda x: float(x.get("priceChangePercent", 0)), reverse=True)
@@ -137,14 +137,14 @@ def get_precision(symbol):
 def consultar_grok(prompt):
     try:
         response = client_openai.chat.completions.create(
-            model="grok-4",  # Cambiado a grok-4, el modelo flagship disponible
+            model="grok-4",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Error en llamada a Grok API: {e}")
-        return "no"  # Fallback para evitar bloqueos
+        return "no"
 
 def comprar():
     if not puede_comprar():
@@ -171,7 +171,7 @@ def comprar():
                 volume = float(cripto["quoteVolume"])
                 rsi = cripto.get("rsi", 50)
 
-                prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio 24h {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. Comisión {COMMISSION_RATE*100:.2f}%. ¿Comprar con {cantidad_usdc:.2f} USDC? Responde 'sí' o 'no' y breve explicación."
+                prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio 24h {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. Comisión {COMMISSION_RATE*100:.2f}%. ¿Comprar con {cantidad_usdc:.2f} USDC? Busca oportunidades a corto plazo, acepta riesgos moderados, y prioriza ganancias rápidas. Responde 'sí' o 'no' con breve explicación."
                 grok_response = consultar_grok(prompt)
                 if grok_response and 'sí' in grok_response.lower():
                     precision = get_precision(symbol)
@@ -214,7 +214,7 @@ def vender():
             precio_actual = float(ticker["lastPrice"])
             cambio = (precio_actual - precio_compra) / precio_compra
 
-            prompt = f"Para {symbol}: Precio compra {precio_compra:.4f}, actual {precio_actual:.4f}, cambio {cambio*100:.2f}%. Comisión {COMMISSION_RATE*100:.2f}%. ¿Vender ahora? Responde 'sí' o 'no' y breve explicación."
+            prompt = f"Para {symbol}: Precio compra {precio_compra:.4f}, actual {precio_actual:.4f}, cambio {cambio*100:.2f}%. Comisión {COMMISSION_RATE*100:.2f}%. ¿Vender ahora? Busca oportunidades a corto plazo, acepta riesgos moderados, y prioriza ganancias rápidas. Responde 'sí' o 'no' con breve explicación."
             grok_response = consultar_grok(prompt)
             ganancia_bruta = cantidad * (precio_actual - precio_compra)
             comision_venta = (precio_actual * cantidad) * COMMISSION_RATE
