@@ -33,8 +33,8 @@ client_openai = OpenAI(
 
 client = Client(API_KEY, API_SECRET)
 PORCENTAJE_USDC = 0.8
-TAKE_PROFIT = 0.002  # 0.2%
-STOP_LOSS = -0.003  # -0.3%
+TAKE_PROFIT = 0.002
+STOP_LOSS = -0.003
 PERDIDA_MAXIMA_DIARIA = 50
 MONEDA_BASE = "USDC"
 RESUMEN_HORA = 23
@@ -115,9 +115,8 @@ def mejores_criptos():
             comision_compra = precio * COMMISSION_RATE
             comision_venta = (precio + ganancia_bruta) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-            if ganancia_neta > 0:
+            if ganancia_neta > 0 and rsi < 60:
                 t['rsi'] = rsi
-                t['ganancia_neta'] = ganancia_neta
                 filtered.append(t)
         return sorted(filtered, key=lambda x: float(x.get("priceChangePercent", 0)), reverse=True)
     except BinanceAPIException as e:
@@ -171,7 +170,6 @@ def comprar():
                 change_percent = float(cripto["priceChangePercent"])
                 volume = float(cripto["quoteVolume"])
                 rsi = cripto.get("rsi", 50)
-                ganancia_neta = cripto.get("ganancia_neta", 0)
 
                 prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio 24h {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. Comisión {COMMISSION_RATE*100:.2f}%. ¿Comprar con {cantidad_usdc:.2f} USDC? Busca ganancias rápidas, acepta riesgos moderados, decide en 5 palabras o menos. Responde 'sí' o 'no'."
                 grok_response = consultar_grok(prompt)
@@ -179,6 +177,10 @@ def comprar():
                 cantidad = round(cantidad_usdc / precio, precision)
                 if cantidad <= 0:
                     continue
+                ganancia_bruta = (precio * cantidad) * TAKE_PROFIT
+                comision_compra = (precio * cantidad) * COMMISSION_RATE
+                comision_venta = ((precio * (1 + TAKE_PROFIT)) * cantidad) * COMMISSION_RATE
+                ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
                 if (grok_response and 'sí' in grok_response.lower()) or (ganancia_neta > 0 and rsi < 60):
                     if ganancia_neta <= 0:
                         logger.info(f"Operación no rentable para {symbol}: ganancia neta {ganancia_neta:.4f}")
