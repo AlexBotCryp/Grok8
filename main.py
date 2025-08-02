@@ -32,6 +32,7 @@ client_openai = OpenAI(
 )
 
 client = Client(API_KEY, API_SECRET)
+
 PORCENTAJE_USDC = 0.5  # Reducido a 50% para transiciones suaves
 TAKE_PROFIT = 0.005  # 0.5%
 STOP_LOSS = -0.010  # -1.0%
@@ -86,6 +87,8 @@ def puede_comprar():
     return pnl_hoy > -PERDIDA_MAXIMA_DIARIA
 
 def calculate_rsi(closes, period=14):
+    if len(closes) <= period:
+        return 50  # Valor neutral si no hay suficientes datos
     deltas = np.diff(closes)
     gain = np.where(deltas > 0, deltas, 0)
     loss = np.where(deltas < 0, -deltas, 0)
@@ -141,16 +144,15 @@ def consultar_grok(prompt):
             messages=[{"role": "user", "content": prompt}],
             max_tokens=50
         )
-        return response.choices[0].message.content.strip()
+        return response.choices[0].message.content.strip().lower()
     except Exception as e:
         logger.error(f"Error en llamada a Grok API: {e}")
-        return "sí"  # Fallback a 'sí' para no bloquear
+        return "no"  # Fallback a 'no' para mayor seguridad
 
 def comprar():
     if not puede_comprar():
         logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
         return
-
     try:
         saldo = float(client.get_asset_balance(asset=MONEDA_BASE)['free'])
         logger.info(f"Saldo USDC disponible: {saldo:.2f}")
@@ -160,7 +162,6 @@ def comprar():
         cantidad_usdc = saldo * PORCENTAJE_USDC
         criptos = mejores_criptos()
         registro = cargar_json(REGISTRO_FILE)
-
         for cripto in criptos:
             symbol = cripto["symbol"]
             if symbol in registro:
@@ -171,8 +172,7 @@ def comprar():
                 change_percent = float(cripto["priceChangePercent"])
                 volume = float(cripto["quoteVolume"])
                 rsi = cripto.get("rsi", 50)
-
-                prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. ¿Comprar con {cantidad_usdc:.2f} USDC? Supervisa solo, prioriza RSI < 70. 'sí' o 'no'."
+                prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. ¿Comprar con {cantidad_usdc:.2f} USDC? Supervisa solo, prioriza RSI < 70. Responde solo con 'sí' o 'no'."
                 grok_response = consultar_grok(prompt)
                 precision = get_precision(symbol)
                 cantidad = round(cantidad_usdc / precio, precision)
@@ -182,10 +182,7 @@ def comprar():
                 comision_compra = (precio * cantidad) * COMMISSION_RATE
                 comision_venta = ((precio * (1 + TAKE_PROFIT)) * cantidad) * COMMISSION_RATE
                 ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-                if rsi < 70 and ganancia_neta > 0:  # RSI como prioridad
-                    if ganancia_neta <= 0:
-                        logger.info(f"Operación no rentable para {symbol}: ganancia neta {ganancia_neta:.4f}")
-                        continue
+                if rsi < 70 and ganancia_neta > 0 and 'sí' in grok_response:
                     orden = client.order_market_buy(symbol=symbol, quantity=cantidad)
                     logger.info(f"Orden de compra: {orden}")
                     registro[symbol] = {
@@ -197,7 +194,7 @@ def comprar():
                     enviar_telegram(f"🟢 Comprado {symbol} - {cantidad:.{precision}f} a {precio:.4f} USDC. RSI: {rsi:.2f}, Grok: {grok_response}")
                     break
                 else:
-                    logger.info(f"No se compra {symbol}: RSI {rsi:.2f}, Grok: {grok_response}")
+                    logger.info(f"No se compra {symbol}: RSI {rsi:.2f}, Grok: {grok_response}, Ganancia neta proyectada: {ganancia_neta:.4f}")
             except BinanceAPIException as e:
                 logger.error(f"Error comprando {symbol}: {e}")
                 continue
@@ -219,15 +216,18 @@ def vender():
             klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=15)
             closes = [float(k[4]) for k in klines]
             rsi = calculate_rsi(closes)
-
-            prompt = f"Para {symbol}: Precio compra {precio_compra:.4f}, actual {precio_actual:.4f}, cambio {cambio*100:.2f}%, RSI {rsi:.2f}. ¿Vender ahora? Supervisa solo, prioriza RSI > 30. 'sí' o 'no'."
+            prompt = f"Para {symbol}: Precio compra {precio_compra:.4f}, actual {precio_actual:.4f}, cambio {cambio*100:.2f}%, RSI {rsi:.2f}. ¿Vender ahora? Supervisa solo, prioriza RSI > 70. Responde solo con 'sí' o 'no'."
             grok_response = consultar_grok(prompt)
             ganancia_bruta = cantidad * (precio_actual - precio_compra)
-            comision_venta = (precio_actual * cantidad) * COMMISSION_RATE
-            ganancia_neta = ganancia_bruta - comision_venta
-            if (cambio >= TAKE_PROFIT or cambio <= STOP_LOSS or rsi > 30 or (grok_response and 'sí' in grok_response.lower()) or saldo_usdc < MIN_SALDO_COMPRA * 2 or len(registro) > 0) and ganancia_neta > 0:
+            comision_compra = precio_compra * cantidad * COMMISSION_RATE
+            comision_venta = precio_actual * cantidad * COMMISSION_RATE
+            ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+            vender_por_stop_loss = cambio <= STOP_LOSS
+            vender_por_profit = (cambio >= TAKE_PROFIT or rsi > 70 or 'sí' in grok_response) and ganancia_neta > 0
+            if vender_por_stop_loss or vender_por_profit:
                 precision = get_precision(symbol)
-                cantidad_disponible = float(client.get_asset_balance(asset=symbol.split('/')[0])['free']) if client.get_asset_balance(asset=symbol.split('/')[0]) else 0
+                asset = symbol.replace(MONEDA_BASE, '')
+                cantidad_disponible = float(client.get_asset_balance(asset=asset)['free']) if client.get_asset_balance(asset=asset) else 0
                 cantidad = round(min(cantidad, cantidad_disponible), precision)
                 if cantidad <= 0:
                     logger.info(f"No hay saldo suficiente para vender {symbol}")
@@ -236,12 +236,12 @@ def vender():
                 logger.info(f"Orden de venta: {orden}")
                 realized_pnl = ganancia_neta
                 actualizar_pnl_diario(realized_pnl)
-                enviar_telegram(f"🔴 Vendido {symbol} - {cantidad:.{precision}f} a {precio_actual:.4f} (Cambio: {cambio*100:.2f}%) PNL: {realized_pnl:.2f} USDC. RSI: {rsi:.2f}, Grok: {grok_response}")
+                motivo = "Stop-loss" if vender_por_stop_loss else "Take-profit/RSI/Grok"
+                enviar_telegram(f"🔴 Vendido {symbol} - {cantidad:.{precision}f} a {precio_actual:.4f} (Cambio: {cambio*100:.2f}%) PNL: {realized_pnl:.2f} USDC. Motivo: {motivo}. RSI: {rsi:.2f}, Grok: {grok_response}")
                 comprar()  # Reinicia compra tras venta
             else:
                 nuevos_registro[symbol] = data
-                if ganancia_neta <= 0:
-                    logger.info(f"No se vende {symbol}: ganancia neta {ganancia_neta:.4f}, RSI {rsi:.2f}")
+                logger.info(f"No se vende {symbol}: ganancia neta {ganancia_neta:.4f}, RSI {rsi:.2f}, Grok: {grok_response}")
         except BinanceAPIException as e:
             logger.error(f"Error vendiendo {symbol}: {e}")
             nuevos_registro[symbol] = data
@@ -259,7 +259,6 @@ def resumen_diario():
             if total > 0.001:
                 mensaje += f"{b['asset']}: {total:.4f}\n"
         enviar_telegram(mensaje)
-
         seven_days_ago = (datetime.now(TIMEZONE) - timedelta(days=7)).date().isoformat()
         pnl_data = {k: v for k, v in pnl_data.items() if k >= seven_days_ago}
         guardar_json(pnl_data, PNL_DIARIO_FILE)
@@ -267,13 +266,11 @@ def resumen_diario():
         logger.error(f"Error en resumen diario: {e}")
 
 enviar_telegram("🤖 Bot IA activo con RSI como prioridad y Grok como supervisor.")
-
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
 scheduler.add_job(comprar, 'interval', minutes=2)
 scheduler.add_job(vender, 'interval', minutes=2)
 scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0)
 scheduler.start()
-
 try:
     while True:
         time.sleep(10)
