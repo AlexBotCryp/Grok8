@@ -33,9 +33,9 @@ client_openai = OpenAI(
 
 client = Client(API_KEY, API_SECRET)
 
-PORCENTAJE_USDC = 0.5  # Reducido a 50% para transiciones suaves
-TAKE_PROFIT = 0.005  # 0.5%
-STOP_LOSS = -0.010  # -1.0%
+PORCENTAJE_USDC = 0.3  # Reducido a 30% para permitir más operaciones y flexibilidad
+TAKE_PROFIT = 0.01     # Aumentado a 1% para más oportunidades de venta
+STOP_LOSS = -0.015     # Ajustado a -1.5% para dar más margen
 PERDIDA_MAXIMA_DIARIA = 50
 MONEDA_BASE = "USDC"
 RESUMEN_HORA = 23
@@ -43,10 +43,14 @@ MIN_VOLUME = 50000
 MIN_SALDO_COMPRA = 5
 COMMISSION_RATE = 0.001
 TIMEZONE = pytz.timezone("UTC")
+MAX_POSICIONES = 3     # Permitir hasta 3 posiciones abiertas para más flexibilidad
+GROK_CONSULTA_FRECUENCIA = 5  # Consultar Grok solo cada 5 ciclos (para ahorrar créditos)
 
 # Archivos
 REGISTRO_FILE = "registro.json"
 PNL_DIARIO_FILE = "pnl_diario.json"
+
+consulta_contador = 0  # Contador global para controlar consultas a Grok
 
 def enviar_telegram(mensaje):
     try:
@@ -108,7 +112,7 @@ def mejores_criptos():
         tickers = client.get_ticker()
         candidates = [t for t in tickers if t["symbol"].endswith(MONEDA_BASE) and float(t.get("quoteVolume", 0)) > MIN_VOLUME]
         filtered = []
-        for t in candidates[:15]:
+        for t in candidates[:20]:  # Aumentado a 20 para más opciones
             symbol = t["symbol"]
             klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=15)
             closes = [float(k[4]) for k in klines]
@@ -138,6 +142,10 @@ def get_precision(symbol):
         return 4
 
 def consultar_grok(prompt):
+    global consulta_contador
+    consulta_contador += 1
+    if consulta_contador % GROK_CONSULTA_FRECUENCIA != 0:
+        return "no"  # Skip consulta para ahorrar créditos
     try:
         response = client_openai.chat.completions.create(
             model="grok-4",
@@ -162,7 +170,13 @@ def comprar():
         cantidad_usdc = saldo * PORCENTAJE_USDC
         criptos = mejores_criptos()
         registro = cargar_json(REGISTRO_FILE)
+        if len(registro) >= MAX_POSICIONES:
+            logger.info("Máximo de posiciones abiertas alcanzado. No se comprará más.")
+            return
+        compradas = 0
         for cripto in criptos:
+            if compradas >= 1:  # Limitar a 1 compra por ciclo para control
+                break
             symbol = cripto["symbol"]
             if symbol in registro:
                 continue
@@ -172,7 +186,7 @@ def comprar():
                 change_percent = float(cripto["priceChangePercent"])
                 volume = float(cripto["quoteVolume"])
                 rsi = cripto.get("rsi", 50)
-                prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. ¿Comprar con {cantidad_usdc:.2f} USDC? Supervisa solo, prioriza RSI < 70. Responde solo con 'sí' o 'no'."
+                prompt = f"Analiza {symbol}: Precio {precio:.4f}, Cambio {change_percent:.2f}%, Volumen {volume:.2f}, RSI {rsi:.2f}. ¿Comprar con {cantidad_usdc:.2f} USDC? Supervisa solo, prioriza RSI < 65. Responde solo con 'sí' o 'no'."
                 grok_response = consultar_grok(prompt)
                 precision = get_precision(symbol)
                 cantidad = round(cantidad_usdc / precio, precision)
@@ -182,7 +196,7 @@ def comprar():
                 comision_compra = (precio * cantidad) * COMMISSION_RATE
                 comision_venta = ((precio * (1 + TAKE_PROFIT)) * cantidad) * COMMISSION_RATE
                 ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-                if rsi < 70 and ganancia_neta > 0 and 'sí' in grok_response:
+                if rsi < 65 and ganancia_neta > 0 and ('sí' in grok_response or consulta_contador % GROK_CONSULTA_FRECUENCIA != 0):  # Más flexible con RSI <65
                     orden = client.order_market_buy(symbol=symbol, quantity=cantidad)
                     logger.info(f"Orden de compra: {orden}")
                     registro[symbol] = {
@@ -192,7 +206,7 @@ def comprar():
                     }
                     guardar_json(registro, REGISTRO_FILE)
                     enviar_telegram(f"🟢 Comprado {symbol} - {cantidad:.{precision}f} a {precio:.4f} USDC. RSI: {rsi:.2f}, Grok: {grok_response}")
-                    break
+                    compradas += 1
                 else:
                     logger.info(f"No se compra {symbol}: RSI {rsi:.2f}, Grok: {grok_response}, Ganancia neta proyectada: {ganancia_neta:.4f}")
             except BinanceAPIException as e:
@@ -201,11 +215,11 @@ def comprar():
     except BinanceAPIException as e:
         logger.error(f"Error general en compra: {e}")
 
-def vender():
+def vender_y_convertir():
     registro = cargar_json(REGISTRO_FILE)
     nuevos_registro = {}
-    saldo_usdc = float(client.get_asset_balance(asset=MONEDA_BASE)['free'])
-    logger.info(f"Saldo USDC antes de vender: {saldo_usdc:.2f}")
+    saldo_usdc_antes = float(client.get_asset_balance(asset=MONEDA_BASE)['free'])
+    logger.info(f"Saldo USDC antes de vender: {saldo_usdc_antes:.2f}")
     for symbol, data in list(registro.items()):
         try:
             cantidad = data["cantidad"]
@@ -216,14 +230,14 @@ def vender():
             klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=15)
             closes = [float(k[4]) for k in klines]
             rsi = calculate_rsi(closes)
-            prompt = f"Para {symbol}: Precio compra {precio_compra:.4f}, actual {precio_actual:.4f}, cambio {cambio*100:.2f}%, RSI {rsi:.2f}. ¿Vender ahora? Supervisa solo, prioriza RSI > 70. Responde solo con 'sí' o 'no'."
+            prompt = f"Para {symbol}: Precio compra {precio_compra:.4f}, actual {precio_actual:.4f}, cambio {cambio*100:.2f}%, RSI {rsi:.2f}. ¿Vender ahora para convertir? Supervisa solo, prioriza RSI > 65 o ganancia >1%. Responde solo con 'sí' o 'no'."
             grok_response = consultar_grok(prompt)
             ganancia_bruta = cantidad * (precio_actual - precio_compra)
             comision_compra = precio_compra * cantidad * COMMISSION_RATE
             comision_venta = precio_actual * cantidad * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - comision_compra - comision_venta
             vender_por_stop_loss = cambio <= STOP_LOSS
-            vender_por_profit = (cambio >= TAKE_PROFIT or rsi > 70 or 'sí' in grok_response) and ganancia_neta > 0
+            vender_por_profit = (cambio >= TAKE_PROFIT or rsi > 65 or 'sí' in grok_response) and ganancia_neta > 0  # RSI >65 para venta
             if vender_por_stop_loss or vender_por_profit:
                 precision = get_precision(symbol)
                 asset = symbol.replace(MONEDA_BASE, '')
@@ -236,9 +250,10 @@ def vender():
                 logger.info(f"Orden de venta: {orden}")
                 realized_pnl = ganancia_neta
                 actualizar_pnl_diario(realized_pnl)
-                motivo = "Stop-loss" if vender_por_stop_loss else "Take-profit/RSI/Grok"
+                motivo = "Stop-loss" if vender_por_stop_loss else "Take-profit/RSI/Grok/Conversión"
                 enviar_telegram(f"🔴 Vendido {symbol} - {cantidad:.{precision}f} a {precio_actual:.4f} (Cambio: {cambio*100:.2f}%) PNL: {realized_pnl:.2f} USDC. Motivo: {motivo}. RSI: {rsi:.2f}, Grok: {grok_response}")
-                comprar()  # Reinicia compra tras venta
+                # Intentar comprar otra inmediatamente para conversión
+                comprar()
             else:
                 nuevos_registro[symbol] = data
                 logger.info(f"No se vende {symbol}: ganancia neta {ganancia_neta:.4f}, RSI {rsi:.2f}, Grok: {grok_response}")
@@ -265,10 +280,10 @@ def resumen_diario():
     except BinanceAPIException as e:
         logger.error(f"Error en resumen diario: {e}")
 
-enviar_telegram("🤖 Bot IA activo con RSI como prioridad y Grok como supervisor.")
+enviar_telegram("🤖 Bot IA activo con RSI flexible, Grok optimizado y conversiones entre criptos.")
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
-scheduler.add_job(comprar, 'interval', minutes=2)
-scheduler.add_job(vender, 'interval', minutes=2)
+scheduler.add_job(comprar, 'interval', minutes=3)  # Aumentado a 3 min para menos frecuencia
+scheduler.add_job(vender_y_convertir, 'interval', minutes=3)
 scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0)
 scheduler.start()
 try:
