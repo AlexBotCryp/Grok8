@@ -2,7 +2,6 @@
 import os
 import time
 import json
-import math
 import random
 import logging
 import threading
@@ -37,11 +36,11 @@ if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GROK_API_KEY]
 
 # Mercado
 MONEDA_BASE = "USDC"
-MIN_VOLUME = 200_000         # ↑ evita pares con poca liquidez/notional
+MIN_VOLUME = 200_000       # evita pares poco líquidos
 MAX_POSICIONES = 7
 MIN_SALDO_COMPRA = 5
 PORCENTAJE_USDC = 0.30
-MAX_POR_ORDEN = 0.15         # tope adicional por orden
+MAX_POR_ORDEN = 0.15       # cap adicional por orden
 
 # Estrategia
 TAKE_PROFIT = 0.03
@@ -51,11 +50,11 @@ RSI_BUY_MAX = 45
 RSI_SELL_MIN = 65
 
 # Ritmo / límites
-TRADE_COOLDOWN_SEC = 600     # 10 min entre compras del MISMO símbolo
-MAX_TRADES_PER_HOUR = 6      # tope global de operaciones/hora
+TRADE_COOLDOWN_SEC = 600   # 10 min entre compras del MISMO símbolo
+MAX_TRADES_PER_HOUR = 6    # tope global de operaciones/hora
 
 # Riesgo diario
-PERDIDA_MAXIMA_DIARIA = 50   # USDC
+PERDIDA_MAXIMA_DIARIA = 50 # USDC
 
 # Horarios
 TZ_MADRID = pytz.timezone("Europe/Madrid")
@@ -170,12 +169,20 @@ def load_symbol_info(symbol):
     pricef = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
     notional_f = next((f for f in info['filters'] if f['filterType'] in ('NOTIONAL','MIN_NOTIONAL')), None)
 
+    def D(x): return Decimal(x)
+
     meta = {
-        "stepSize": Decimal(lot['stepSize']),
-        "tickSize": Decimal(pricef['tickSize']),
-        "marketStepSize": Decimal(market_lot['stepSize']) if market_lot else Decimal(lot['stepSize']),
-        "minNotional": Decimal(notional_f.get('minNotional', '0')) if notional_f else Decimal('0'),
+        # LIMIT/GENÉRICO
+        "stepSize": D(lot['stepSize']),
+        "minQty": D(lot.get('minQty', '0')),
+        # MARKET específico (si no existe, usa LOT_SIZE)
+        "marketStepSize": D(market_lot['stepSize']) if market_lot else D(lot['stepSize']),
+        "marketMinQty": D(market_lot.get('minQty', lot.get('minQty', '0'))) if market_lot else D(lot.get('minQty', '0')),
+
+        "tickSize": D(pricef['tickSize']),
+        "minNotional": D(notional_f.get('minNotional', '0')) if notional_f else D('0'),
         "applyToMarket": bool(notional_f.get('applyToMarket', True)) if notional_f else True,
+
         "baseAsset": info['baseAsset'],
         "quoteAsset": info['quoteAsset'],
     }
@@ -191,7 +198,7 @@ def quantize_qty(qty: Decimal, step: Decimal) -> Decimal:
 def min_quote_for_market(symbol, price: Decimal) -> Decimal:
     meta = load_symbol_info(symbol)
     min_q = meta["minNotional"] if meta["applyToMarket"] else Decimal('0')
-    # margen 1%
+    # margen 1% por latencia/variación
     return (min_q * Decimal('1.01')).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
 
 def safe_get_ticker(symbol):
@@ -275,29 +282,33 @@ def precio_medio_si_hay(symbol, lookback_days=30):
     return None
 
 def inicializar_registro():
+    """
+    Lee la cartera actual y registra TODAS las posiciones no-USDC.
+    Usa precio medio reciente si hay trades; si no, último precio.
+    """
     with LOCK:
-        registro = cargar_json(REGISTRO_FILE)
+        registro = {}
         try:
             cuenta = retry(lambda: client.get_account())
             for b in cuenta['balances']:
                 asset = b['asset']
                 free = float(b['free'])
-                if asset != MONEDA_BASE and free > 0.0001:
+                if asset != MONEDA_BASE and free > 0.0000001:
                     symbol = asset + MONEDA_BASE
+                    # evita pares raros sin ticker
                     try:
                         t = safe_get_ticker(symbol)
                     except Exception:
                         continue
                     precio_actual = float(t['lastPrice'])
-                    if symbol not in registro:
-                        pm = precio_medio_si_hay(symbol) or precio_actual
-                        registro[symbol] = {
-                            "cantidad": round(free, 8),
-                            "precio_compra": float(pm),
-                            "timestamp": now_tz().isoformat(),
-                            "from_cartera": True
-                        }
-                        logger.info(f"Posición agregada: {symbol} {free} a {pm} (actual {precio_actual})")
+                    pm = precio_medio_si_hay(symbol) or precio_actual
+                    registro[symbol] = {
+                        "cantidad": float(free),     # arranca EXACTO con tu balance actual
+                        "precio_compra": float(pm),  # mejor estimación
+                        "timestamp": now_tz().isoformat(),
+                        "from_cartera": True
+                    }
+                    logger.info(f"Posición inicial: {symbol} {free} a {pm} (last {precio_actual})")
             guardar_json(registro, REGISTRO_FILE)
         except BinanceAPIException as e:
             logger.error(f"Error inicializando registro: {e}")
@@ -324,6 +335,7 @@ def mejores_criptos(max_candidates=30):
                 continue
             rsi = rsi_wilder(closes)
             precio = float(t["lastPrice"])
+            # economía neta aproximada con comisiones
             ganancia_bruta = precio * TAKE_PROFIT
             comision_compra = precio * COMMISSION_RATE
             comision_venta = (precio * (1 + TAKE_PROFIT)) * COMMISSION_RATE
@@ -389,7 +401,7 @@ def comprar():
                     volume = float(cripto.get("quoteVolume", 0))
                     rsi = float(cripto.get("rsi", 50))
 
-                    meta = load_symbol_info(symbol)
+                    _ = load_symbol_info(symbol)  # cachea filtros
 
                     # min notional para MARKET y quote a gastar
                     min_quote = min_quote_for_market(symbol, precio)
@@ -408,6 +420,7 @@ def comprar():
                     )
                     grok_response = consultar_grok(prompt)
 
+                    # Econ aproximada
                     cantidad_estim = float(quote_to_spend) / float(precio)
                     ganancia_bruta = float(precio) * cantidad_estim * TAKE_PROFIT
                     comision_compra = float(precio) * cantidad_estim * COMMISSION_RATE
@@ -418,7 +431,7 @@ def comprar():
                     cond_compra = (rsi < RSI_BUY_MAX) and (change_percent > 0.8)
 
                     if cond_compra and (ganancia_neta > 0) and ('sí' in grok_response or (time.time() - _LAST_GROK_TS < GROK_COOLDOWN)):
-                        # COMPRA por importe (quoteOrderQty) → evita NOTIONAL y stepSize en BUY
+                        # COMPRA por importe (quoteOrderQty)
                         orden = retry(
                             lambda: client.create_order(
                                 symbol=symbol,
@@ -430,7 +443,7 @@ def comprar():
                         )
                         logger.info(f"Orden de compra: {orden}")
                         registro[symbol] = {
-                            "cantidad": cantidad_estim,  # aprox
+                            "cantidad": cantidad_estim,  # aprox; al vender usamos balance real
                             "precio_compra": float(precio),
                             "timestamp": now_tz().isoformat()
                         }
@@ -456,7 +469,6 @@ def vender_y_convertir():
 
         for symbol, data in list(registro.items()):
             try:
-                cantidad_reg = Decimal(str(data["cantidad"]))
                 precio_compra = Decimal(str(data["precio_compra"]))
                 ticker = safe_get_ticker(symbol)
                 precio_actual = Decimal(str(ticker["lastPrice"]))
@@ -473,46 +485,74 @@ def vender_y_convertir():
                 )
                 grok_response = consultar_grok(prompt)
 
-                ganancia_bruta = float(cantidad_reg) * (float(precio_actual) - float(precio_compra))
-                comision_compra = float(precio_compra) * float(cantidad_reg) * COMMISSION_RATE
-                comision_venta = float(precio_actual) * float(cantidad_reg) * COMMISSION_RATE
-                ganancia_neta = ganancia_bruta - comision_compra - comision_venta
-
                 vender_por_stop = float(cambio) <= STOP_LOSS
-                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN or 'sí' in grok_response) and ganancia_neta > 0
+                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN or 'sí' in grok_response)
 
                 if vender_por_stop or vender_por_profit:
                     meta = load_symbol_info(symbol)
                     asset = symbol.replace(MONEDA_BASE, '')
-                    cantidad_wallet = Decimal(str(safe_get_balance(asset)))
 
-                    qty = min(cantidad_reg, cantidad_wallet)
-                    # Ajusta a MARKET_LOT_SIZE
-                    qty = quantize_qty(qty, meta["marketStepSize"])
-                    if qty <= Decimal('0'):
-                        logger.info(f"No hay saldo suficiente para vender {symbol}")
+                    # usa SIEMPRE balance real
+                    cantidad_wallet = Decimal(str(safe_get_balance(asset)))
+                    qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
+
+                    # si queda por debajo del mínimo → dust (no vendemos)
+                    if qty < meta["marketMinQty"] or qty <= Decimal('0'):
+                        logger.info(f"{symbol}: cantidad {float(qty):.8f} < marketMinQty {float(meta['marketMinQty']):.8f}. Dust, saltando.")
+                        # si el balance real < mínimo, no lo mantenemos en registro
+                        if cantidad_wallet >= meta["marketMinQty"]:
+                            nuevos_registro[symbol] = data
                         continue
 
+                    # (opcional) chequeo de notional MARKET si aplica
+                    precio_ref = precio_actual
+                    if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_ref > 0:
+                        notional_est = (qty * precio_ref)
+                        if notional_est < meta["minNotional"]:
+                            logger.info(f"{symbol}: notional estimado {float(notional_est):.6f} < minNotional {float(meta['minNotional']):.6f}. Saltando.")
+                            if cantidad_wallet >= meta["marketMinQty"]:
+                                nuevos_registro[symbol] = data
+                            continue
+
+                    # Orden de venta MARKET
                     orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=float(qty)), tries=2, base_delay=0.6)
                     logger.info(f"Orden de venta: {orden}")
-                    realized_pnl = ganancia_neta
-                    total_hoy = actualizar_pnl_diario(realized_pnl)
+
+                    # PnL aproximado
+                    ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
+                    comision_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
+                    comision_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
+                    ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+                    total_hoy = actualizar_pnl_diario(ganancia_neta)
+
                     motivo = "Stop-loss" if vender_por_stop else "Take-profit/RSI/Grok"
                     enviar_telegram(
-                        f"🔴 Vendido {symbol} - {float(qty):.8f} a {float(precio_actual):.6f} "
-                        f"(Cambio: {float(cambio)*100:.2f}%) PnL: {realized_pnl:.2f} {MONEDA_BASE}. "
+                        f"🔴 Vendido {symbol} - {float(qty):.8f} a ~{float(precio_actual):.6f} "
+                        f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
                         f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}"
                     )
-                    # intenta rotar
-                    comprar()
+
+                    # tras vender, recarga balance y decide si permanece en registro
+                    nuevo_balance = Decimal(str(safe_get_balance(asset)))
+                    if nuevo_balance >= meta["marketMinQty"]:
+                        data["cantidad"] = float(nuevo_balance)
+                        nuevos_registro[symbol] = data
                 else:
                     nuevos_registro[symbol] = data
-                    logger.info(f"No se vende {symbol}: ganancia neta {ganancia_neta:.4f}, RSI {rsi:.2f}, Grok: {grok_response}")
+                    logger.info(f"No se vende {symbol}: RSI {rsi:.2f}, Grok: {grok_response}")
             except BinanceAPIException as e:
                 logger.error(f"Error vendiendo {symbol}: {e}")
                 nuevos_registro[symbol] = data
 
-        guardar_json(nuevos_registro, REGISTRO_FILE)
+        # limpiar dust en registro
+        limpio = {}
+        for sym, d in nuevos_registro.items():
+            meta = load_symbol_info(sym)
+            asset = sym.replace(MONEDA_BASE, '')
+            bal = Decimal(str(safe_get_balance(asset)))
+            if bal >= meta["marketMinQty"]:
+                limpio[sym] = d
+        guardar_json(limpio, REGISTRO_FILE)
 
 def resumen_diario():
     try:
@@ -537,13 +577,14 @@ def resumen_diario():
 # Inicio
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Arranca leyendo tu cartera ACTUAL y la registra
     inicializar_registro()
 
-    enviar_telegram("🤖 Bot IA activo: compras con quoteOrderQty (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora.")
 
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=3, id="comprar")
-    scheduler.add_job(vender_y_convertir, 'interval', minutes=3, seconds=90, id="vender")
+    scheduler.add_job(vender_y_convertir, 'interval', minutes=4, seconds=30, id="vender")  # un poco más espaciado
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
