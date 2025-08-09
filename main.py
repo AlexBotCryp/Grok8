@@ -192,6 +192,12 @@ def quantize_qty(qty: Decimal, step: Decimal) -> Decimal:
     steps = (qty / step).quantize(Decimal('1.'), rounding=ROUND_DOWN)
     return (steps * step).normalize()
 
+def quantize_quote(quote: Decimal, tick: Decimal) -> Decimal:
+    if tick <= 0:
+        return quote
+    steps = (quote / tick).quantize(Decimal('1.'), rounding=ROUND_DOWN)
+    return (steps * tick).normalize()
+
 def min_quote_for_market(symbol, price: Decimal) -> Decimal:
     meta = load_symbol_info(symbol)
     if not meta:
@@ -398,6 +404,8 @@ def comprar():
                         else:
                             logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}). Saltando.")
                             continue
+                    # Redondear quote_to_spend según tickSize
+                    quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
                     prompt = (
                         f"Analiza {symbol}: Precio {float(precio):.6f}, Cambio {change_percent:.2f}%, "
                         f"Volumen {volume:.2f}, RSI {rsi:.2f}. ¿Comprar con {float(quote_to_spend):.2f} {MONEDA_BASE}? "
@@ -409,8 +417,8 @@ def comprar():
                     comision_compra = float(precio) * cantidad_estim * COMMISSION_RATE
                     comision_venta = float(precio) * (1 + TAKE_PROFIT) * cantidad_estim * COMMISSION_RATE
                     ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-                    cond_compra = (rsi < RSI_BUY_MAX) and (change_percent > 0.1)
-                    if cond_compra and (ganancia_neta > 0.1):
+                    cond_compra = (rsi < RSI_BUY_MAX) and (change_percent > 0.05)
+                    if cond_compra and (ganancia_neta > 0.05):
                         orden = retry(
                             lambda: client.create_order(
                                 symbol=symbol,
@@ -530,7 +538,7 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas y rápidas con ganancias modestas en mercados estables.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de precisión para evitar errores de Binance.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
