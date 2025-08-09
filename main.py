@@ -381,8 +381,10 @@ def inicializar_registro():
             for b in cuenta['balances']:
                 asset = b['asset']
                 free = float(b['free'])
-                if free > 0:
-                    logger.info(f"  {asset}: {free:.8f}")
+                if free <= 0:
+                    logger.info(f"Omitiendo {asset}: saldo insuficiente ({free:.8f})")
+                    continue
+                logger.info(f"  {asset}: {free:.8f}")
                 if asset != MONEDA_BASE and free > 0.0000001:
                     symbol = asset + MONEDA_BASE
                     if symbol in INVALID_SYMBOL_CACHE:
@@ -408,8 +410,6 @@ def inicializar_registro():
                     except Exception as e:
                         logger.info(f"Omitiendo {symbol}: error al inicializar - {e}")
                         continue
-                elif asset != MONEDA_BASE and free <= 0.0000001:
-                    logger.info(f"Omitiendo {asset}: saldo insuficiente ({free:.8f})")
             guardar_json(registro, REGISTRO_FILE)
             logger.info(f"Posiciones registradas: {list(registro.keys())}")
         except BinanceAPIException as e:
@@ -429,12 +429,14 @@ def mejores_criptos(max_candidates=30):
             and float(t.get("quoteVolume", 0)) > MIN_VOLUME
             and t["symbol"] not in INVALID_SYMBOL_CACHE
         ]
+        logger.info(f"Candidatos encontrados: {len(candidates)}")
         filtered = []
         for t in candidates[:max_candidates]:
             symbol = t["symbol"]
             klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=60))
             closes = [float(k[4]) for k in klines]
             if len(closes) < 20:
+                logger.info(f"Omitiendo {symbol}: datos insuficientes ({len(closes)} velas)")
                 continue
             rsi = calculate_rsi(closes)
             precio = float(t["lastPrice"])
@@ -445,6 +447,7 @@ def mejores_criptos(max_candidates=30):
             if ganancia_neta > 0:
                 t['rsi'] = rsi
                 filtered.append(t)
+        logger.info(f"Candidatos filtrados: {len(filtered)}")
         return sorted(filtered, key=lambda x: (float(x.get("priceChangePercent", 0)), -x.get('rsi', 50)), reverse=True)
     except BinanceAPIException as e:
         logger.error(f"Error obteniendo tickers: {e}")
@@ -521,8 +524,8 @@ def comprar():
                     comision_compra = float(precio) * cantidad_estim * COMMISSION_RATE
                     comision_venta = float(precio) * (1 + TAKE_PROFIT) * cantidad_estim * COMMISSION_RATE
                     ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-                    cond_compra = (rsi < RSI_BUY_MAX) and (change_percent > 0.05)
-                    if cond_compra and (ganancia_neta > 0.01):  # Reducido para más compras
+                    cond_compra = (rsi < RSI_BUY_MAX) and (change_percent > 0.0)  # Relajado para más compras
+                    if cond_compra and (ganancia_neta > 0.01):
                         orden = retry(
                             lambda: client.create_order(
                                 symbol=symbol,
@@ -664,7 +667,7 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de LOT_SIZE mejorada, conversión de dust optimizada, mayor frecuencia de trading, símbolos inválidos, precisión, manejo robusto de errores, y zona horaria correcta.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con inicialización optimizada, corrección de LOT_SIZE mejorada, conversión de dust optimizada, mayor frecuencia de trading, símbolos inválidos, precisión, manejo robusto de errores, y zona horaria correcta.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
