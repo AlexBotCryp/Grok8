@@ -180,14 +180,18 @@ def load_symbol_info(symbol):
         meta = {
             "stepSize": D(lot['stepSize']),
             "minQty": D(lot.get('minQty', '0')),
-            "marketStepSize": D(market_lot['stepSize']) if market_lot else D(lot['stepSize']),
-            "marketMinQty": D(market_lot.get('minQty', lot.get('minQty', '0'))) if market_lot else D(lot.get('minQty', '0')),
+            "marketStepSize": D(market_lot['stepSize']) if market_lot and D(market_lot['stepSize']) > 0 else D(lot['stepSize']),
+            "marketMinQty": D(market_lot.get('minQty', lot.get('minQty', '0'))) if market_lot and D(market_lot.get('minQty', '0')) > 0 else D(lot.get('minQty', '0')),
             "tickSize": D(pricef['tickSize']),
             "minNotional": D(notional_f.get('minNotional', '0')) if notional_f else D('0'),
             "applyToMarket": bool(notional_f.get('applyToMarket', True)) if notional_f else True,
             "baseAsset": info['baseAsset'],
             "quoteAsset": info['quoteAsset'],
         }
+        if meta["marketStepSize"] <= 0 or meta["marketMinQty"] <= 0:
+            logger.warning(f"Valores inválidos para {symbol}: marketStepSize {meta['marketStepSize']}, marketMinQty {meta['marketMinQty']}. Usando LOT_SIZE como fallback.")
+            meta["marketStepSize"] = meta["stepSize"]
+            meta["marketMinQty"] = meta["minQty"]
         SYMBOL_CACHE[symbol] = meta
         return meta
     except Exception as e:
@@ -197,12 +201,14 @@ def load_symbol_info(symbol):
 
 def quantize_qty(qty: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
+        logger.warning(f"stepSize inválido: {step}. No se cuantiza.")
         return qty
     steps = (qty / step).quantize(Decimal('1.'), rounding=ROUND_DOWN)
     return (steps * step).normalize()
 
 def quantize_quote(quote: Decimal, tick: Decimal) -> Decimal:
     if tick <= 0:
+        logger.warning(f"tickSize inválido: {tick}. No se cuantiza.")
         return quote
     steps = (quote / tick).quantize(Decimal('1.'), rounding=ROUND_DOWN)
     return (steps * tick).normalize()
@@ -240,7 +246,9 @@ def safe_get_balance(asset):
 # ──────────────────────────────────────────────────────────────────────────────
 def convertir_dust_a_usdc(asset, cantidad):
     try:
-        # Intentar vender el asset por USDT o BUSD y luego convertir a USDC
+        if cantidad <= 0:
+            logger.info(f"{asset}: cantidad {cantidad:.8f} no válida para conversión")
+            return False
         for quote_asset in ["USDT", "BUSD"]:
             alt_symbol = f"{asset}{quote_asset}"
             meta_alt = load_symbol_info(alt_symbol)
@@ -249,18 +257,25 @@ def convertir_dust_a_usdc(asset, cantidad):
                 continue
             qty = quantize_qty(Decimal(str(cantidad)), meta_alt["marketStepSize"])
             if qty < meta_alt["marketMinQty"] or qty <= Decimal('0'):
-                logger.info(f"{asset}: cantidad {float(qty):.8f} < marketMinQty {float(meta_alt['marketMinQty']):.8f}. No convertible")
-                continue
+                logger.info(f"{asset}: cantidad {float(qty):.8f} < marketMinQty {float(meta_alt['marketMinQty']):.8f} (stepSize {float(meta_alt['marketStepSize']):.8f}). No convertible")
+                return False
             ticker_alt = safe_get_ticker(alt_symbol)
             if not ticker_alt:
                 continue
             precio_alt = Decimal(str(ticker_alt["lastPrice"]))
+            if precio_alt <= 0:
+                logger.info(f"{asset}: precio inválido ({float(precio_alt):.6f}) para {alt_symbol}. No convertible")
+                continue
             notional_est = qty * precio_alt
             if notional_est < meta_alt["minNotional"] or notional_est < Decimal('0.01'):
                 logger.info(f"{asset}: notional estimado {float(notional_est):.6f} < minNotional {float(meta_alt['minNotional']):.6f} o demasiado pequeño. No convertible")
-                continue
-            orden_venta = retry(lambda: client.order_market_sell(symbol=alt_symbol, quantity=float(qty)), tries=2, base_delay=0.6)
-            logger.info(f"Vendido {asset} a {quote_asset}: {orden_venta}")
+                return False
+            try:
+                orden_venta = retry(lambda: client.order_market_sell(symbol=alt_symbol, quantity=float(qty)), tries=2, base_delay=0.6)
+                logger.info(f"Vendido {asset} a {quote_asset}: {orden_venta}")
+            except BinanceAPIException as e:
+                logger.error(f"Error vendiendo {asset} a {quote_asset}: {e}. Cantidad {float(qty):.8f}, marketMinQty {float(meta_alt['marketMinQty']):.8f}, stepSize {float(meta_alt['marketStepSize']):.8f}")
+                return False
             balance_alt = safe_get_balance(quote_asset)
             if balance_alt <= 0:
                 logger.info(f"No hay saldo {quote_asset} para convertir a {MONEDA_BASE}")
@@ -272,12 +287,16 @@ def convertir_dust_a_usdc(asset, cantidad):
                 continue
             qty_alt = quantize_qty(Decimal(str(balance_alt)), meta_usdc["marketStepSize"])
             if qty_alt < meta_usdc["marketMinQty"] or qty_alt <= Decimal('0'):
-                logger.info(f"{quote_asset}: cantidad {float(qty_alt):.8f} < marketMinQty {float(meta_usdc['marketMinQty']):.8f}. No convertible")
+                logger.info(f"{quote_asset}: cantidad {float(qty_alt):.8f} < marketMinQty {float(meta_usdc['marketMinQty']):.8f} (stepSize {float(meta_usdc['marketStepSize']):.8f}). No convertible")
                 continue
-            orden_compra = retry(lambda: client.order_market_buy(symbol=usdc_symbol, quantity=float(qty_alt)), tries=2, base_delay=0.6)
-            logger.info(f"Convertido {quote_asset} a {MONEDA_BASE}: {orden_compra}")
-            enviar_telegram(f"🔄 Convertido {float(qty):.8f} {asset} a {MONEDA_BASE} vía {quote_asset}")
-            return True
+            try:
+                orden_compra = retry(lambda: client.order_market_buy(symbol=usdc_symbol, quantity=float(qty_alt)), tries=2, base_delay=0.6)
+                logger.info(f"Convertido {quote_asset} a {MONEDA_BASE}: {orden_compra}")
+                enviar_telegram(f"🔄 Convertido {float(qty):.8f} {asset} a {MONEDA_BASE} vía {quote_asset}")
+                return True
+            except BinanceAPIException as e:
+                logger.error(f"Error comprando {MONEDA_BASE} con {quote_asset}: {e}. Cantidad {float(qty_alt):.8f}, marketMinQty {float(meta_usdc['marketMinQty']):.8f}, stepSize {float(meta_usdc['marketStepSize']):.8f}")
+                continue
         logger.info(f"No se pudo convertir {asset} a {MONEDA_BASE}: ningún par disponible")
         return False
     except Exception as e:
@@ -637,7 +656,7 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de LOT_SIZE, símbolos inválidos, manejo de dust a USDC, precisión, manejo robusto de errores, y zona horaria correcta.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de LOT_SIZE mejorada, símbolos inválidos, manejo de dust a USDC, precisión, manejo robusto de errores, y zona horaria correcta.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
