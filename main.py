@@ -164,7 +164,10 @@ def load_symbol_info(symbol):
     if symbol in SYMBOL_CACHE:
         return SYMBOL_CACHE[symbol]
     try:
-        info = retry(lambda: client.get_symbol_info(symbol))
+        info = client.get_symbol_info(symbol)
+        if info is None:
+            logger.error(f"Símbolo {symbol} no disponible en Binance")
+            return None
         lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
         market_lot = next((f for f in info['filters'] if f['filterType'] == 'MARKET_LOT_SIZE'), None)
         pricef = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
@@ -557,7 +560,7 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de símbolos inválidos, precisión, manejo robusto de errores y zona horaria.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de símbolos inválidos, manejo robusto de errores, y zona horaria correcta.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
