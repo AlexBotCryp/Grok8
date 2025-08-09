@@ -211,7 +211,11 @@ def min_quote_for_market(symbol, price: Decimal) -> Decimal:
 
 def safe_get_ticker(symbol):
     try:
-        return retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5, exceptions=(Exception,))
+        ticker = retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5, exceptions=(Exception,))
+        if ticker and float(ticker.get('lastPrice', 0)) <= 0:
+            logger.error(f"Precio inválido (cero) para {symbol}")
+            return None
+        return ticker
     except Exception as e:
         logger.error(f"Error obteniendo ticker para {symbol}: {e}")
         return None
@@ -404,6 +408,9 @@ def comprar():
                     if not ticker:
                         continue
                     precio = Decimal(str(ticker["lastPrice"]))
+                    if precio <= 0:
+                        logger.info(f"{symbol}: precio inválido ({float(precio):.6f}). Saltando.")
+                        continue
                     change_percent = float(cripto.get("priceChangePercent", 0))
                     volume = float(cripto.get("quoteVolume", 0))
                     rsi = float(cripto.get("rsi", 50))
@@ -454,7 +461,7 @@ def comprar():
                         ULTIMAS_OPERACIONES.append(now_ts)
                     else:
                         logger.info(f"No se compra {symbol}: RSI {rsi:.2f}, Grok: {grok_response}, Ganancia neta {ganancia_neta:.4f}")
-                except BinanceAPIException as e:
+                except (BinanceAPIException, ZeroDivisionError) as e:
                     logger.error(f"Error comprando {symbol}: {e}")
                     continue
                 except Exception as e:
@@ -560,7 +567,7 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de símbolos inválidos, manejo robusto de errores, y zona horaria correcta.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de símbolos inválidos, precisión, manejo robusto de errores, zona horaria correcta, y prevención de división por cero.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
