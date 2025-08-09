@@ -64,7 +64,8 @@ REGISTRO_FILE = "registro.json"
 PNL_DIARIO_FILE = "pnl_diario.json"
 
 # Grok (x.ai)
-GROK_COOLDOWN = 60 * 5
+GROK_CONSULTA_FRECUENCIA = 5
+consulta_contador = 0
 _LAST_GROK_TS = 0
 
 # Estado y clientes
@@ -220,7 +221,7 @@ def safe_get_balance(asset):
 # ──────────────────────────────────────────────────────────────────────────────
 # Indicadores
 # ──────────────────────────────────────────────────────────────────────────────
-def rsi_wilder(closes, period=14):
+def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50.0
     deltas = np.diff(closes)
@@ -244,9 +245,10 @@ def rsi_wilder(closes, period=14):
 # Grok helper
 # ──────────────────────────────────────────────────────────────────────────────
 def consultar_grok(prompt):
-    global _LAST_GROK_TS
+    global consulta_contador, _LAST_GROK_TS
+    consulta_contador += 1
     now = time.time()
-    if now - _LAST_GROK_TS < GROK_COOLDOWN:
+    if now - _LAST_GROK_TS < GROK_CONSULTA_FRECUENCIA * 60:
         return "no"
     try:
         resp = client_openai.chat.completions.create(
@@ -286,12 +288,8 @@ def precio_medio_si_hay(symbol, lookback_days=30):
     return None
 
 def inicializar_registro():
-    """
-    Lee la cartera actual y registra TODAS las posiciones no-USDC.
-    Usa precio medio reciente si hay trades; si no, último precio.
-    """
     with LOCK:
-        registro = {}
+        registro = cargar_json(REGISTRO_FILE)
         try:
             cuenta = retry(lambda: client.get_account())
             for b in cuenta['balances']:
@@ -336,7 +334,7 @@ def mejores_criptos(max_candidates=30):
             closes = [float(k[4]) for k in klines]
             if len(closes) < 20:
                 continue
-            rsi = rsi_wilder(closes)
+            rsi = calculate_rsi(closes)
             precio = float(t["lastPrice"])
             ganancia_bruta = precio * TAKE_PROFIT
             comision_compra = precio * COMMISSION_RATE
@@ -404,7 +402,6 @@ def comprar():
                         else:
                             logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}). Saltando.")
                             continue
-                    # Redondear quote_to_spend según tickSize
                     quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
                     prompt = (
                         f"Analiza {symbol}: Precio {float(precio):.6f}, Cambio {change_percent:.2f}%, "
@@ -462,15 +459,19 @@ def vender_y_convertir():
                 cambio = (precio_actual - precio_compra) / precio_compra
                 klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=60))
                 closes = [float(k[4]) for k in klines]
-                rsi = rsi_wilder(closes)
+                rsi = calculate_rsi(closes)
                 prompt = (
                     f"Para {symbol}: Precio compra {float(precio_compra):.6f}, actual {float(precio_actual):.6f}, "
                     f"cambio {float(cambio)*100:.2f}%, RSI {rsi:.2f}. ¿Vender ahora? Prioriza RSI > {RSI_SELL_MIN} "
                     f"o ganancia >= {TAKE_PROFIT*100:.1f}%. Responde solo 'sí' o 'no'."
                 )
                 grok_response = consultar_grok(prompt)
+                ganancia_bruta = float(cantidad) * (float(precio_actual) - float(precio_compra))
+                comision_compra = float(precio_compra) * float(cantidad) * COMMISSION_RATE
+                comision_venta = float(precio_actual) * float(cantidad) * COMMISSION_RATE
+                ganancia_neta = ganancia_bruta - comision_compra - comision_venta
                 vender_por_stop = float(cambio) <= STOP_LOSS
-                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN or 'sí' in grok_response)
+                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN or 'sí' in grok_response) and ganancia_neta > 0
                 meta = load_symbol_info(symbol)
                 if not meta:
                     nuevos_registro[symbol] = data
@@ -497,13 +498,13 @@ def vender_y_convertir():
                     comision_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
                     ganancia_neta = ganancia_bruta - comision_compra - comision_venta
                     total_hoy = actualizar_pnl_diario(ganancia_neta)
-                    motivo = "Stop-loss" if vender_por_stop else "Take-profit/RSI/Grok"
+                    motivo = "Stop-loss" if vender_por_stop else "Take-profit/RSI/Grok/Conversión"
                     enviar_telegram(
                         f"🔴 Vendido {symbol} - {float(qty):.8f} a ~{float(precio_actual):.6f} "
                         f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
                         f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}"
                     )
-                    comprar()  # Intentar comprar otra inmediatamente para conversión
+                    comprar()
                 else:
                     nuevos_registro[symbol] = data
                     logger.info(f"No se vende {symbol}: RSI {rsi:.2f}, Grok: {grok_response}")
@@ -538,7 +539,7 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de precisión para evitar errores de Binance.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de precisión y manejo de dust.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
