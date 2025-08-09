@@ -207,7 +207,11 @@ def min_quote_for_market(symbol, price: Decimal) -> Decimal:
     return (min_q * Decimal('1.01')).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
 
 def safe_get_ticker(symbol):
-    return retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5, exceptions=(Exception,))
+    try:
+        return retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5, exceptions=(Exception,))
+    except Exception as e:
+        logger.error(f"Error obteniendo ticker para {symbol}: {e}")
+        return None
 
 def safe_get_balance(asset):
     try:
@@ -216,6 +220,7 @@ def safe_get_balance(asset):
             return 0.0
         return float(b.get('free', 0))
     except Exception:
+        logger.error(f"Error obteniendo balance para {asset}: {e}")
         return 0.0
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -285,7 +290,7 @@ def precio_medio_si_hay(symbol, lookback_days=30):
             return float(cost_sum / qty_sum)
     except Exception as e:
         logger.warning(f"No se pudo calcular precio medio {symbol}: {e}")
-    return None
+        return None
 
 def inicializar_registro():
     with LOCK:
@@ -299,6 +304,8 @@ def inicializar_registro():
                     symbol = asset + MONEDA_BASE
                     try:
                         t = safe_get_ticker(symbol)
+                        if not t:
+                            continue
                         precio_actual = float(t['lastPrice'])
                         pm = precio_medio_si_hay(symbol) or precio_actual
                         registro[symbol] = {
@@ -387,6 +394,8 @@ def comprar():
                     continue
                 try:
                     ticker = safe_get_ticker(symbol)
+                    if not ticker:
+                        continue
                     precio = Decimal(str(ticker["lastPrice"]))
                     change_percent = float(cripto.get("priceChangePercent", 0))
                     volume = float(cripto.get("quoteVolume", 0))
@@ -441,7 +450,7 @@ def comprar():
                 except BinanceAPIException as e:
                     logger.error(f"Error comprando {symbol}: {e}")
                     continue
-        except BinanceAPIException as e:
+        except Exception as e:
             logger.error(f"Error general en compra: {e}")
 
 def vender_y_convertir():
@@ -455,6 +464,9 @@ def vender_y_convertir():
             try:
                 precio_compra = Decimal(str(data["precio_compra"]))
                 ticker = safe_get_ticker(symbol)
+                if not ticker:
+                    nuevos_registro[symbol] = data
+                    continue
                 precio_actual = Decimal(str(ticker["lastPrice"]))
                 cambio = (precio_actual - precio_compra) / precio_compra
                 klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=60))
@@ -466,12 +478,6 @@ def vender_y_convertir():
                     f"o ganancia >= {TAKE_PROFIT*100:.1f}%. Responde solo 'sí' o 'no'."
                 )
                 grok_response = consultar_grok(prompt)
-                ganancia_bruta = float(cantidad) * (float(precio_actual) - float(precio_compra))
-                comision_compra = float(precio_compra) * float(cantidad) * COMMISSION_RATE
-                comision_venta = float(precio_actual) * float(cantidad) * COMMISSION_RATE
-                ganancia_neta = ganancia_bruta - comision_compra - comision_venta
-                vender_por_stop = float(cambio) <= STOP_LOSS
-                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN or 'sí' in grok_response) and ganancia_neta > 0
                 meta = load_symbol_info(symbol)
                 if not meta:
                     nuevos_registro[symbol] = data
@@ -490,6 +496,8 @@ def vender_y_convertir():
                         logger.info(f"{symbol}: notional estimado {float(notional_est):.6f} < minNotional {float(meta['minNotional']):.6f}. Dust, saltando.")
                         dust_positions.append(symbol)
                         continue
+                vender_por_stop = float(cambio) <= STOP_LOSS
+                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN or 'sí' in grok_response) and ganancia_neta > 0
                 if vender_por_stop or vender_por_profit:
                     orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=float(qty)), tries=2, base_delay=0.6)
                     logger.info(f"Orden de venta: {orden}")
@@ -508,8 +516,11 @@ def vender_y_convertir():
                 else:
                     nuevos_registro[symbol] = data
                     logger.info(f"No se vende {symbol}: RSI {rsi:.2f}, Grok: {grok_response}")
-            except BinanceAPIException as e:
+            except (BinanceAPIException, TypeError, ValueError) as e:
                 logger.error(f"Error vendiendo {symbol}: {e}")
+                nuevos_registro[symbol] = data
+            except Exception as e:
+                logger.error(f"Error inesperado vendiendo {symbol}: {e}")
                 nuevos_registro[symbol] = data
         limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
         guardar_json(limpio, REGISTRO_FILE)
@@ -539,7 +550,7 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de precisión y manejo de dust.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de precisión y manejo robusto de errores.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
