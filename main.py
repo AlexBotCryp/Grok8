@@ -37,20 +37,20 @@ if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GROK_API_KEY]
 MONEDA_BASE = "USDC"
 MIN_VOLUME = 200_000  # evita pares poco líquidos
 MAX_POSICIONES = 7
-MIN_SALDO_COMPRA = 10  # Aumentado para cumplir con minNotional
+MIN_SALDO_COMPRA = 10  # Asegurar cumplimiento con minNotional
 PORCENTAJE_USDC = 0.30
 MAX_POR_ORDEN = 0.15  # cap adicional por orden
 
 # Estrategia
-TAKE_PROFIT = 0.05  # Aumentado a 5% para mayores ganancias
-STOP_LOSS = -0.03  # Ajustado a -3% para dar margen
+TAKE_PROFIT = 0.015  # 1.5% para operaciones rápidas
+STOP_LOSS = -0.015  # -1.5% para limitar pérdidas
 COMMISSION_RATE = 0.001
-RSI_BUY_MAX = 55  # Más flexible para más compras
-RSI_SELL_MIN = 55  # Más sensible para más ventas
+RSI_BUY_MAX = 60  # Más flexible para más compras
+RSI_SELL_MIN = 50  # Más sensible para más ventas
 
 # Ritmo / límites
-TRADE_COOLDOWN_SEC = 300  # 5 min entre compras del MISMO símbolo
-MAX_TRADES_PER_HOUR = 10  # tope global de operaciones/hora
+TRADE_COOLDOWN_SEC = 120  # 2 min entre compras del MISMO símbolo
+MAX_TRADES_PER_HOUR = 15  # Más operaciones por hora
 
 # Riesgo diario
 PERDIDA_MAXIMA_DIARIA = 50  # USDC
@@ -358,7 +358,6 @@ def comprar():
             if saldo < MIN_SALDO_COMPRA:
                 logger.info("Saldo insuficiente para comprar.")
                 return
-            # Sizing dinámico por orden
             registro = cargar_json(REGISTRO_FILE)
             cantidad_usdc = min(saldo / (MAX_POSICIONES - len(registro) + 1) * PORCENTAJE_USDC, saldo * MAX_POR_ORDEN)
             criptos = mejores_criptos()
@@ -410,8 +409,8 @@ def comprar():
                     comision_compra = float(precio) * cantidad_estim * COMMISSION_RATE
                     comision_venta = float(precio) * (1 + TAKE_PROFIT) * cantidad_estim * COMMISSION_RATE
                     ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-                    cond_compra = (rsi < RSI_BUY_MAX) and (change_percent > 0.3)
-                    if cond_compra and (ganancia_neta > 0) and ('sí' in grok_response or (time.time() - _LAST_GROK_TS < GROK_COOLDOWN)):
+                    cond_compra = (rsi < RSI_BUY_MAX) and (change_percent > 0.1)
+                    if cond_compra and (ganancia_neta > 0.1):
                         orden = retry(
                             lambda: client.create_order(
                                 symbol=symbol,
@@ -479,7 +478,7 @@ def vender_y_convertir():
                 if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_ref > 0:
                     notional_est = qty * precio_ref
                     if notional_est < meta["minNotional"]:
-                        logger.info(f"{symbol}: notional estimado {float(notional_est):.6f} < minNotional {float(meta['minNotional']):.6f}. Saltando.")
+                        logger.info(f"{symbol}: notional estimado {float(notional_est):.6f} < minNotional {float(meta['minNotional']):.6f}. Dust, saltando.")
                         dust_positions.append(symbol)
                         continue
                 if vender_por_stop or vender_por_profit:
@@ -531,10 +530,10 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para mayores ganancias, más operaciones en mercados estables, y manejo optimizado de dust.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas y rápidas con ganancias modestas en mercados estables.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', minutes=3, id="comprar")
-    scheduler.add_job(vender_y_convertir, 'interval', minutes=4, seconds=30, id="vender")
+    scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
+    scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
