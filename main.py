@@ -50,7 +50,7 @@ RSI_SELL_MIN = 50  # Más sensible para más ventas
 
 # Ritmo / límites
 TRADE_COOLDOWN_SEC = 120  # 2 min entre compras del MISMO símbolo
-MAX_TRADES_PER_HOUR = 15  # Más operaciones por hora
+MAX_TRADES_PER_HOUR = 20  # Aumentado para mayor frecuencia
 
 # Riesgo diario
 PERDIDA_MAXIMA_DIARIA = 50  # USDC
@@ -249,7 +249,7 @@ def convertir_dust_a_usdc(asset, cantidad):
         if cantidad <= 0:
             logger.info(f"{asset}: cantidad {cantidad:.8f} no válida para conversión")
             return False
-        for quote_asset in ["USDT", "BUSD"]:
+        for quote_asset in ["USDT", "BUSD", "BTC"]:
             alt_symbol = f"{asset}{quote_asset}"
             meta_alt = load_symbol_info(alt_symbol)
             if not meta_alt:
@@ -258,7 +258,7 @@ def convertir_dust_a_usdc(asset, cantidad):
             qty = quantize_qty(Decimal(str(cantidad)), meta_alt["marketStepSize"])
             if qty < meta_alt["marketMinQty"] or qty <= Decimal('0'):
                 logger.info(f"{asset}: cantidad {float(qty):.8f} < marketMinQty {float(meta_alt['marketMinQty']):.8f} (stepSize {float(meta_alt['marketStepSize']):.8f}). No convertible")
-                return False
+                continue
             ticker_alt = safe_get_ticker(alt_symbol)
             if not ticker_alt:
                 continue
@@ -269,13 +269,13 @@ def convertir_dust_a_usdc(asset, cantidad):
             notional_est = qty * precio_alt
             if notional_est < meta_alt["minNotional"] or notional_est < Decimal('0.01'):
                 logger.info(f"{asset}: notional estimado {float(notional_est):.6f} < minNotional {float(meta_alt['minNotional']):.6f} o demasiado pequeño. No convertible")
-                return False
+                continue
             try:
                 orden_venta = retry(lambda: client.order_market_sell(symbol=alt_symbol, quantity=float(qty)), tries=2, base_delay=0.6)
                 logger.info(f"Vendido {asset} a {quote_asset}: {orden_venta}")
             except BinanceAPIException as e:
                 logger.error(f"Error vendiendo {asset} a {quote_asset}: {e}. Cantidad {float(qty):.8f}, marketMinQty {float(meta_alt['marketMinQty']):.8f}, stepSize {float(meta_alt['marketStepSize']):.8f}")
-                return False
+                continue
             balance_alt = safe_get_balance(quote_asset)
             if balance_alt <= 0:
                 logger.info(f"No hay saldo {quote_asset} para convertir a {MONEDA_BASE}")
@@ -377,9 +377,12 @@ def inicializar_registro():
         registro = cargar_json(REGISTRO_FILE)
         try:
             cuenta = retry(lambda: client.get_account())
+            logger.info("Balances detectados en la cartera:")
             for b in cuenta['balances']:
                 asset = b['asset']
                 free = float(b['free'])
+                if free > 0:
+                    logger.info(f"  {asset}: {free:.8f}")
                 if asset != MONEDA_BASE and free > 0.0000001:
                     symbol = asset + MONEDA_BASE
                     if symbol in INVALID_SYMBOL_CACHE:
@@ -391,6 +394,7 @@ def inicializar_registro():
                     try:
                         t = safe_get_ticker(symbol)
                         if not t:
+                            logger.info(f"Omitiendo {symbol}: no se pudo obtener ticker")
                             continue
                         precio_actual = float(t['lastPrice'])
                         pm = precio_medio_si_hay(symbol) or precio_actual
@@ -401,9 +405,13 @@ def inicializar_registro():
                             "from_cartera": True
                         }
                         logger.info(f"Posición inicial: {symbol} {free} a {pm} (last {precio_actual})")
-                    except Exception:
+                    except Exception as e:
+                        logger.info(f"Omitiendo {symbol}: error al inicializar - {e}")
                         continue
+                elif asset != MONEDA_BASE and free <= 0.0000001:
+                    logger.info(f"Omitiendo {asset}: saldo insuficiente ({free:.8f})")
             guardar_json(registro, REGISTRO_FILE)
+            logger.info(f"Posiciones registradas: {list(registro.keys())}")
         except BinanceAPIException as e:
             logger.error(f"Error inicializando registro: {e}")
 
@@ -514,7 +522,7 @@ def comprar():
                     comision_venta = float(precio) * (1 + TAKE_PROFIT) * cantidad_estim * COMMISSION_RATE
                     ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
                     cond_compra = (rsi < RSI_BUY_MAX) and (change_percent > 0.05)
-                    if cond_compra and (ganancia_neta > 0.05):
+                    if cond_compra and (ganancia_neta > 0.01):  # Reducido para más compras
                         orden = retry(
                             lambda: client.create_order(
                                 symbol=symbol,
@@ -536,7 +544,7 @@ def comprar():
                         ULTIMA_COMPRA[symbol] = now_ts
                         ULTIMAS_OPERACIONES.append(now_ts)
                     else:
-                        logger.info(f"No se compra {symbol}: RSI {rsi:.2f}, Grok: {grok_response}, Ganancia neta {ganancia_neta:.4f}")
+                        logger.info(f"No se compra {symbol}: RSI {rsi:.2f}, Change {change_percent:.2f}%, Ganancia neta {ganancia_neta:.4f}, Grok: {grok_response}")
                 except (BinanceAPIException, ZeroDivisionError) as e:
                     logger.error(f"Error comprando {symbol}: {e}")
                     continue
@@ -615,7 +623,7 @@ def vender_y_convertir():
                         )
                         comprar()
                     except BinanceAPIException as e:
-                        logger.error(f"Error vendiendo {symbol}: {e}. Cantidad {float(qty):.8f}, marketMinQty {float(meta['marketMinQty']):.8f}, stepSize {float(meta['marketStepSize']):.8f}")
+                        logger.error(f"Error vendiendo {symbol}: {e}. Cantidad {float(qty):.8f}, marketMinQty {float(meta['marketMinQty']):.8f}, stepSize {float(meta['marketStepSize']):.8f}, Saldo disponible {float(cantidad_wallet):.8f}")
                         dust_positions.append(symbol)
                         convertir_dust_a_usdc(asset, float(cantidad_wallet))
                         continue
@@ -656,7 +664,7 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de LOT_SIZE mejorada, símbolos inválidos, manejo de dust a USDC, precisión, manejo robusto de errores, y zona horaria correcta.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de LOT_SIZE mejorada, conversión de dust optimizada, mayor frecuencia de trading, símbolos inválidos, precisión, manejo robusto de errores, y zona horaria correcta.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
