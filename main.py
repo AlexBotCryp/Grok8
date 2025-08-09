@@ -75,6 +75,7 @@ client_openai = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
 # Locks / caches / rate controls
 LOCK = threading.RLock()
 SYMBOL_CACHE = {}
+INVALID_SYMBOL_CACHE = set()  # Cache para símbolos inválidos
 ULTIMA_COMPRA = {}  # symbol -> ts
 ULTIMAS_OPERACIONES = []  # lista de ts globales
 
@@ -161,12 +162,15 @@ def reset_diario():
 # Mercado: info símbolos y precisión
 # ──────────────────────────────────────────────────────────────────────────────
 def load_symbol_info(symbol):
+    if symbol in INVALID_SYMBOL_CACHE:
+        return None
     if symbol in SYMBOL_CACHE:
         return SYMBOL_CACHE[symbol]
     try:
         info = client.get_symbol_info(symbol)
         if info is None:
-            logger.error(f"Símbolo {symbol} no disponible en Binance")
+            logger.info(f"Símbolo {symbol} no disponible en Binance")
+            INVALID_SYMBOL_CACHE.add(symbol)
             return None
         lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
         market_lot = next((f for f in info['filters'] if f['filterType'] == 'MARKET_LOT_SIZE'), None)
@@ -187,7 +191,8 @@ def load_symbol_info(symbol):
         SYMBOL_CACHE[symbol] = meta
         return meta
     except Exception as e:
-        logger.error(f"Error cargando info de {symbol}: {e}")
+        logger.info(f"Error cargando info de {symbol}: {e}")
+        INVALID_SYMBOL_CACHE.add(symbol)
         return None
 
 def quantize_qty(qty: Decimal, step: Decimal) -> Decimal:
@@ -213,7 +218,7 @@ def safe_get_ticker(symbol):
     try:
         ticker = retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5, exceptions=(Exception,))
         if ticker and float(ticker.get('lastPrice', 0)) <= 0:
-            logger.error(f"Precio inválido (cero) para {symbol}")
+            logger.info(f"Precio inválido (cero) para {symbol}")
             return None
         return ticker
     except Exception as e:
@@ -229,6 +234,49 @@ def safe_get_balance(asset):
     except Exception as e:
         logger.error(f"Error obteniendo balance para {asset}: {e}")
         return 0.0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Conversión de dust a USDC
+# ──────────────────────────────────────────────────────────────────────────────
+def convertir_dust_a_usdc(asset, cantidad):
+    try:
+        # Intentar vender el asset por USDT y luego convertir USDT a USDC
+        usdt_symbol = f"{asset}USDT"
+        meta_usdt = load_symbol_info(usdt_symbol)
+        if not meta_usdt:
+            logger.info(f"No se puede convertir {asset}: par {usdt_symbol} no disponible")
+            return False
+        qty = quantize_qty(Decimal(str(cantidad)), meta_usdt["marketStepSize"])
+        if qty < meta_usdt["marketMinQty"] or qty <= Decimal('0'):
+            logger.info(f"{asset}: cantidad {float(qty):.8f} < marketMinQty {float(meta_usdt['marketMinQty']):.8f}. No convertible")
+            return False
+        precio_usdt = Decimal(str(safe_get_ticker(usdt_symbol)["lastPrice"]))
+        notional_est = qty * precio_usdt
+        if notional_est < meta_usdt["minNotional"]:
+            logger.info(f"{asset}: notional estimado {float(notional_est):.6f} < minNotional {float(meta_usdt['minNotional']):.6f}. No convertible")
+            return False
+        orden_venta = retry(lambda: client.order_market_sell(symbol=usdt_symbol, quantity=float(qty)), tries=2, base_delay=0.6)
+        logger.info(f"Vendido {asset} a USDT: {orden_venta}")
+        usdt_balance = safe_get_balance("USDT")
+        if usdt_balance <= 0:
+            logger.info(f"No hay saldo USDT para convertir a {MONEDA_BASE}")
+            return False
+        usdc_symbol = "USDTUSDC"
+        meta_usdc = load_symbol_info(usdc_symbol)
+        if not meta_usdc:
+            logger.info(f"No se puede convertir USDT a {MONEDA_BASE}: par {usdc_symbol} no disponible")
+            return False
+        qty_usdt = quantize_qty(Decimal(str(usdt_balance)), meta_usdc["marketStepSize"])
+        if qty_usdt < meta_usdc["marketMinQty"] or qty_usdt <= Decimal('0'):
+            logger.info(f"USDT: cantidad {float(qty_usdt):.8f} < marketMinQty {float(meta_usdc['marketMinQty']):.8f}. No convertible")
+            return False
+        orden_compra = retry(lambda: client.order_market_buy(symbol=usdc_symbol, quantity=float(qty_usdt)), tries=2, base_delay=0.6)
+        logger.info(f"Convertido USDT a {MONEDA_BASE}: {orden_compra}")
+        enviar_telegram(f"🔄 Convertido {float(qty):.8f} {asset} a {MONEDA_BASE} vía USDT")
+        return True
+    except Exception as e:
+        logger.error(f"Error convirtiendo {asset} a {MONEDA_BASE}: {e}")
+        return False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Indicadores
@@ -309,6 +357,10 @@ def inicializar_registro():
                 free = float(b['free'])
                 if asset != MONEDA_BASE and free > 0.0000001:
                     symbol = asset + MONEDA_BASE
+                    # Verificar si el par está en el cache de inválidos
+                    if symbol in INVALID_SYMBOL_CACHE:
+                        logger.info(f"Omitiendo {symbol}: par no disponible en Binance (cache)")
+                        continue
                     # Verificar si el par existe
                     if not load_symbol_info(symbol):
                         logger.info(f"Omitiendo {symbol}: par no disponible en Binance")
@@ -344,6 +396,7 @@ def mejores_criptos(max_candidates=30):
             and not t["symbol"].startswith(MONEDA_BASE)
             and "DOWN" not in t["symbol"] and "UP" not in t["symbol"]
             and float(t.get("quoteVolume", 0)) > MIN_VOLUME
+            and t["symbol"] not in INVALID_SYMBOL_CACHE
         ]
         filtered = []
         for t in candidates[:max_candidates]:
@@ -505,6 +558,7 @@ def vender_y_convertir():
                 if qty < meta["marketMinQty"] or qty <= Decimal('0'):
                     logger.info(f"{symbol}: cantidad {float(qty):.8f} < marketMinQty {float(meta['marketMinQty']):.8f}. Dust, saltando.")
                     dust_positions.append(symbol)
+                    convertir_dust_a_usdc(asset, float(cantidad_wallet))
                     continue
                 precio_ref = precio_actual
                 if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_ref > 0:
@@ -512,6 +566,7 @@ def vender_y_convertir():
                     if notional_est < meta["minNotional"]:
                         logger.info(f"{symbol}: notional estimado {float(notional_est):.6f} < minNotional {float(meta['minNotional']):.6f}. Dust, saltando.")
                         dust_positions.append(symbol)
+                        convertir_dust_a_usdc(asset, float(cantidad_wallet))
                         continue
                 ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
                 comision_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
@@ -567,7 +622,7 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de símbolos inválidos, precisión, manejo robusto de errores, zona horaria correcta, y prevención de división por cero.")
+    enviar_telegram("🤖 Bot IA activo: inicia con tu cartera actual, compras por importe (anti-NOTIONAL), ventas con MARKET_LOT_SIZE, cooldown y tope/hora. Ajustado para operaciones pequeñas, rápidas y con ganancias modestas, con corrección de símbolos inválidos, manejo de dust a USDC, precisión, manejo robusto de errores, y zona horaria correcta.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
