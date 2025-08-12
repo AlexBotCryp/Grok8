@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+ # -*- coding: utf-8 -*-
 import os
 import time
 import json
@@ -31,22 +31,23 @@ if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GROK_API_KEY]
     raise ValueError("Faltan variables de entorno: BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GROK_API_KEY")
 # Mercado
 MONEDA_BASE = "USDC"
-MIN_VOLUME = 200_000 # evita pares poco líquidos
-MAX_POSICIONES = 7
-MIN_SALDO_COMPRA = 10 # Asegurar cumplimiento con minNotional
-PORCENTAJE_USDC = 0.30
-MAX_POR_ORDEN = 0.15 # cap adicional por orden
+MIN_VOLUME = 1_000_000  # Mayor liquidez
+MAX_POSICIONES = 4  # Menos posiciones
+MIN_SALDO_COMPRA = 50  # Trades más grandes
+PORCENTAJE_USDC = 0.25  # Más % por trade
+ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC']  # Top por volumen 2025
 # Estrategia
-TAKE_PROFIT = 0.015 # 1.5% para operaciones rápidas
-STOP_LOSS = -0.015 # -1.5% para limitar pérdidas
-COMMISSION_RATE = 0.001
-RSI_BUY_MAX = 60 # Más flexible para más compras
-RSI_SELL_MIN = 50 # Más sensible para más ventas
+TAKE_PROFIT = 0.03  # 3%
+STOP_LOSS = -0.02  # -2%
+COMMISSION_RATE = 0.002  # Conservador con slippage
+RSI_BUY_MAX = 45  # Más estricto
+RSI_SELL_MIN = 55
+MIN_NET_GAIN_ABS = 0.5  # Ganancia neta mínima absoluta
 # Ritmo / límites
-TRADE_COOLDOWN_SEC = 120 # 2 min entre compras del MISMO símbolo
-MAX_TRADES_PER_HOUR = 15 # Más operaciones por hora
+TRADE_COOLDOWN_SEC = 600  # 10 min
+MAX_TRADES_PER_HOUR = 3  # Mucho menos
 # Riesgo diario
-PERDIDA_MAXIMA_DIARIA = 50 # USDC
+PERDIDA_MAXIMA_DIARIA = 50  # USDC
 # Horarios
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
@@ -54,7 +55,7 @@ RESUMEN_HORA = 23
 REGISTRO_FILE = "registro.json"
 PNL_DIARIO_FILE = "pnl_diario.json"
 # Grok (x.ai)
-GROK_CONSULTA_FRECUENCIA = 5
+GROK_CONSULTA_FRECUENCIA = 1  # Más frecuente
 consulta_contador = 0
 _LAST_GROK_TS = 0
 # Estado y clientes
@@ -63,11 +64,12 @@ client_openai = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
 # Locks / caches / rate controls
 LOCK = threading.RLock()
 SYMBOL_CACHE = {}
-INVALID_SYMBOL_CACHE = set() # Cache para símbolos inválidos
-ULTIMA_COMPRA = {} # symbol -> ts
-ULTIMAS_OPERACIONES = [] # lista de ts globales
+INVALID_SYMBOL_CACHE = set()
+ULTIMA_COMPRA = {}
+ULTIMAS_OPERACIONES = []
+DUST_THRESHOLD = 1.0  # USDC para dust
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilidades tiempo / JSON
+# Utilidades tiempo / JSON (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def now_tz():
     return datetime.now(TZ_MADRID)
@@ -89,7 +91,7 @@ def atomic_write_json(data, file):
 def guardar_json(data, file):
     atomic_write_json(data, file)
 # ──────────────────────────────────────────────────────────────────────────────
-# Reintentos / Red
+# Reintentos / Red (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def retry(fn, tries=3, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
     for i in range(tries):
@@ -111,15 +113,15 @@ def enviar_telegram(mensaje: str):
     except Exception as e:
         logger.error(f"Telegram fallo: {e}")
 # ──────────────────────────────────────────────────────────────────────────────
-# PnL diario / Riesgo
+# PnL diario / Riesgo (agrego fees estimadas)
 # ──────────────────────────────────────────────────────────────────────────────
-def actualizar_pnl_diario(realized_pnl):
+def actualizar_pnl_diario(realized_pnl, fees=0.1):  # Fee flat por trade
     with LOCK:
         pnl_data = cargar_json(PNL_DIARIO_FILE)
         today = get_current_date()
         if today not in pnl_data:
             pnl_data[today] = 0
-        pnl_data[today] += float(realized_pnl)
+        pnl_data[today] += float(realized_pnl) - fees
         guardar_json(pnl_data, PNL_DIARIO_FILE)
         return pnl_data[today]
 def pnl_hoy():
@@ -135,7 +137,7 @@ def reset_diario():
             pnl[hoy] = 0
             guardar_json(pnl, PNL_DIARIO_FILE)
 # ──────────────────────────────────────────────────────────────────────────────
-# Mercado: info símbolos y precisión
+# Mercado: info símbolos y precisión (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def load_symbol_info(symbol):
     if symbol in INVALID_SYMBOL_CACHE:
@@ -212,7 +214,7 @@ def safe_get_balance(asset):
         logger.error(f"Error obteniendo balance para {asset}: {e}")
         return 0.0
 # ──────────────────────────────────────────────────────────────────────────────
-# Indicadores
+# Indicadores (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -234,7 +236,7 @@ def calculate_rsi(closes, period=14):
         rsi = 100 - (100 / (1 + rs))
     return float(rsi)
 # ──────────────────────────────────────────────────────────────────────────────
-# Grok helper
+# Grok helper (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def consultar_grok(prompt):
     global consulta_contador, _LAST_GROK_TS
@@ -255,7 +257,7 @@ def consultar_grok(prompt):
         logger.error(f"Error Grok: {e}")
         return "no"
 # ──────────────────────────────────────────────────────────────────────────────
-# Registro posiciones / precio medio
+# Registro posiciones / precio medio (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def precio_medio_si_hay(symbol, lookback_days=30):
     try:
@@ -287,6 +289,8 @@ def inicializar_registro():
                 free = float(b['free'])
                 if asset != MONEDA_BASE and free > 0.0000001:
                     symbol = asset + MONEDA_BASE
+                    if symbol not in ALLOWED_SYMBOLS:  # Solo top
+                        continue
                     if symbol in INVALID_SYMBOL_CACHE:
                         logger.info(f"Omitiendo {symbol}: par no disponible en Binance (cache)")
                         continue
@@ -312,16 +316,62 @@ def inicializar_registro():
         except BinanceAPIException as e:
             logger.error(f"Error inicializando registro: {e}")
 # ──────────────────────────────────────────────────────────────────────────────
-# Selección de criptos
+# Nueva: Liquidar cartera al inicio
 # ──────────────────────────────────────────────────────────────────────────────
-def mejores_criptos(max_candidates=30):
+def liquidar_cartera():
+    enviar_telegram("🔥 Liquidando cartera actual para reinicio con estrategia mejorada.")
+    with LOCK:
+        registro = cargar_json(REGISTRO_FILE)
+        dust_positions = []
+        for symbol, data in list(registro.items()):
+            try:
+                ticker = safe_get_ticker(symbol)
+                if not ticker:
+                    continue
+                precio_actual = Decimal(str(ticker["lastPrice"]))
+                meta = load_symbol_info(symbol)
+                if not meta:
+                    continue
+                asset = symbol.replace(MONEDA_BASE, '')
+                cantidad_wallet = Decimal(str(safe_get_balance(asset)))
+                if cantidad_wallet <= 0:
+                    dust_positions.append(symbol)
+                    continue
+                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
+                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
+                    dust_positions.append(symbol)
+                    continue
+                if meta["applyToMarket"] and meta["minNotional"] > 0:
+                    notional_est = qty * precio_actual
+                    if notional_est < meta["minNotional"]:
+                        dust_positions.append(symbol)
+                        continue
+                # Fuerza venta
+                orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=float(qty)), tries=2, base_delay=0.6)
+                logger.info(f"Orden de liquidación: {orden}")
+                precio_compra = Decimal(str(data["precio_compra"]))
+                ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
+                comision_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
+                comision_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
+                ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+                total_hoy = actualizar_pnl_diario(ganancia_neta)
+                enviar_telegram(f"🔥 Liquidado {symbol} - PnL: {ganancia_neta:.2f} {MONEDA_BASE}. PnL hoy: {total_hoy:.2f}")
+            except Exception as e:
+                logger.error(f"Error liquidando {symbol}: {e}")
+                dust_positions.append(symbol)
+        limpio = {sym: d for sym, d in registro.items() if sym not in dust_positions}
+        guardar_json(limpio, REGISTRO_FILE)
+        if dust_positions:
+            enviar_telegram(f"🧹 Dust liquidado: {', '.join(dust_positions)}")
+# ──────────────────────────────────────────────────────────────────────────────
+# Selección de criptos (filtrado a top, orden por volumen)
+# ──────────────────────────────────────────────────────────────────────────────
+def mejores_criptos(max_candidates=10):
     try:
         tickers = retry(lambda: client.get_ticker())
         candidates = [
             t for t in tickers
-            if t["symbol"].endswith(MONEDA_BASE)
-            and not t["symbol"].startswith(MONEDA_BASE)
-            and "DOWN" not in t["symbol"] and "UP" not in t["symbol"]
+            if t["symbol"] in ALLOWED_SYMBOLS  # Solo top
             and float(t.get("quoteVolume", 0)) > MIN_VOLUME
             and t["symbol"] not in INVALID_SYMBOL_CACHE
         ]
@@ -341,7 +391,7 @@ def mejores_criptos(max_candidates=30):
             if ganancia_neta > 0:
                 t['rsi'] = rsi
                 filtered.append(t)
-        return sorted(filtered, key=lambda x: float(x.get("priceChangePercent", 0)), reverse=True)
+        return sorted(filtered, key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)  # Por volumen
     except BinanceAPIException as e:
         logger.error(f"Error obteniendo tickers: {e}")
         return []
@@ -407,7 +457,7 @@ def comprar():
                 comision_compra = float(precio) * cantidad * COMMISSION_RATE
                 comision_venta = float(precio) * (1 + TAKE_PROFIT) * cantidad * COMMISSION_RATE
                 ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-                if rsi < RSI_BUY_MAX and ganancia_neta > 0:
+                if rsi < RSI_BUY_MAX and ganancia_neta > MIN_NET_GAIN_ABS:
                     orden = retry(
                         lambda: client.create_order(
                             symbol=symbol,
@@ -471,14 +521,13 @@ def vender_y_convertir():
                     continue
                 qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
                 if qty < meta["marketMinQty"] or qty <= Decimal('0'):
-                    logger.info(f"{symbol}: cantidad {float(qty):.8f} < marketMinQty {float(meta['marketMinQty']):.8f} (stepSize {float(meta['marketStepSize']):.8f}). Dust, saltando.")
+                    logger.info(f"{symbol}: cantidad {float(qty):.8f} < marketMinQty {float(meta['marketMinQty']):.8f}. Dust, saltando.")
                     dust_positions.append(symbol)
                     continue
-                precio_ref = precio_actual
-                if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_ref > 0:
-                    notional_est = qty * precio_ref
-                    if notional_est < meta["minNotional"]:
-                        logger.info(f"{symbol}: notional estimado {float(notional_est):.6f} < minNotional {float(meta['minNotional']):.6f}. Dust, saltando.")
+                if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_actual > 0:
+                    notional_est = qty * precio_actual
+                    if notional_est < meta["minNotional"] or float(notional_est) < DUST_THRESHOLD:
+                        logger.info(f"{symbol}: notional {float(notional_est):.6f} < threshold. Dust.")
                         dust_positions.append(symbol)
                         continue
                 ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
@@ -486,7 +535,7 @@ def vender_y_convertir():
                 comision_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
                 ganancia_neta = ganancia_bruta - comision_compra - comision_venta
                 vender_por_stop = float(cambio) <= STOP_LOSS
-                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN) and ganancia_neta > 0
+                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN) and ganancia_neta > MIN_NET_GAIN_ABS
                 if vender_por_stop or vender_por_profit:
                     try:
                         orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=float(qty)), tries=2, base_delay=0.6)
@@ -498,25 +547,21 @@ def vender_y_convertir():
                             f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
                             f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}"
                         )
-                        comprar()
                     except BinanceAPIException as e:
-                        logger.error(f"Error vendiendo {symbol}: {e}. Cantidad {float(qty):.8f}, marketMinQty {float(meta['marketMinQty']):.8f}, stepSize {float(meta['marketStepSize']):.8f}")
+                        logger.error(f"Error vendiendo {symbol}: {e}")
                         dust_positions.append(symbol)
                         continue
                 else:
                     nuevos_registro[symbol] = data
                     logger.info(f"No se vende {symbol}: RSI {rsi:.2f}, Ganancia neta {ganancia_neta:.4f}")
-            except (BinanceAPIException, TypeError, ValueError) as e:
-                logger.error(f"Error vendiendo {symbol}: {e}")
-                nuevos_registro[symbol] = data
             except Exception as e:
-                logger.error(f"Error inesperado vendiendo {symbol}: {e}")
+                logger.error(f"Error vendiendo {symbol}: {e}")
                 nuevos_registro[symbol] = data
         limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
         guardar_json(limpio, REGISTRO_FILE)
         if dust_positions:
             enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
-        # Lógica de rotación usando Grok si saldo es bajo
+        # Rotación con Grok si saldo bajo
         saldo_actual = safe_get_balance(MONEDA_BASE)
         if saldo_actual < MIN_SALDO_COMPRA:
             criptos = mejores_criptos()
@@ -545,9 +590,9 @@ def vender_y_convertir():
                         ganancia_neta = ganancia_bruta - comision_compra - comision_venta
                         pos_perfs.append((sym, change, rsi, ganancia_neta))
                     if pos_perfs:
-                        pos_perfs.sort(key=lambda x: x[1])  # Ordenar por change ascendente (peor primero)
+                        pos_perfs.sort(key=lambda x: x[1])  # Peor primero
                         worst_sym, worst_change, worst_rsi, worst_net = pos_perfs[0]
-                        prompt = f"Debo vender {worst_sym} con RSI {worst_rsi:.2f}, ganancia neta {worst_net:.4f} para liberar fondos y comprar {best_symbol} con RSI {best_rsi:.2f} y cambio de precio {best_change}%? Responde solo con 'si' o 'no'."
+                        prompt = f"Debo vender {worst_sym} con RSI {worst_rsi:.2f}, ganancia neta {worst_net:.4f} para liberar fondos y comprar {best_symbol} con RSI {best_rsi:.2f} y cambio {best_change}%? Responde solo con 'si' o 'no'."
                         respuesta = consultar_grok(prompt)
                         if 'si' in respuesta:
                             try:
@@ -565,7 +610,6 @@ def vender_y_convertir():
                                 enviar_telegram(f"🔄 Vendido {worst_sym} por rotación - PnL: {worst_net:.2f} {MONEDA_BASE}. RSI: {worst_rsi:.2f}. Para comprar {best_symbol}.")
                                 del limpio[worst_sym]
                                 guardar_json(limpio, REGISTRO_FILE)
-                                comprar()
                             except Exception as e:
                                 logger.error(f"Error en venta por rotación {worst_sym}: {e}")
 def resumen_diario():
@@ -574,7 +618,7 @@ def resumen_diario():
         pnl_data = cargar_json(PNL_DIARIO_FILE)
         today = get_current_date()
         pnl_hoy_v = pnl_data.get(today, 0)
-        mensaje = f"📊 Resumen diario ({today}):\nPNL hoy: {pnl_hoy_v:.2f} {MONEDA_BASE}\nBalances:\n"
+        mensaje = f"📊 Resumen diario ({today}):\nPNL hoy: {pnl_hoy_v:.2f} {MONEDA_BASE} (fees estimadas incluidas)\nBalances:\n"
         for b in cuenta["balances"]:
             total = float(b["free"]) + float(b["locked"])
             if total > 0.001:
@@ -590,10 +634,11 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA restaurado a la versión de alta frecuencia de esta mañana, con correcciones para LOT_SIZE, ganancia_neta, símbolos inválidos, precisión, manejo robusto de errores, y zona horaria correcta.")
+    liquidar_cartera()  # Vende todo al inicio
+    enviar_telegram("🤖 Bot IA mejorado: Menos trades, posiciones más grandes en top cryptos, liquidación inicial completada.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
-    scheduler.add_job(vender_y_convertir, 'interval', minutes=3, id="vender")
+    scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")
+    scheduler.add_job(vender_y_convertir, 'interval', minutes=10, id="vender")
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
