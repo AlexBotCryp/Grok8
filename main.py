@@ -1,4 +1,4 @@
- # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import os
 import time
 import json
@@ -346,8 +346,8 @@ def liquidar_cartera():
                     if notional_est < meta["minNotional"]:
                         dust_positions.append(symbol)
                         continue
-                # Fuerza venta
-                orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=float(qty)), tries=2, base_delay=0.6)
+                # Fuerza venta, usa str(format(qty, 'f')) para evitar scientific notation
+                orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=format(qty, 'f')), tries=2, base_delay=0.6)
                 logger.info(f"Orden de liquidación: {orden}")
                 precio_compra = Decimal(str(data["precio_compra"]))
                 ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
@@ -463,7 +463,7 @@ def comprar():
                             symbol=symbol,
                             side="BUY",
                             type="MARKET",
-                            quoteOrderQty=float(quote_to_spend)
+                            quoteOrderQty=format(quote_to_spend, 'f')
                         ),
                         tries=2, base_delay=0.6
                     )
@@ -538,7 +538,7 @@ def vender_y_convertir():
                 vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN) and ganancia_neta > MIN_NET_GAIN_ABS
                 if vender_por_stop or vender_por_profit:
                     try:
-                        orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=float(qty)), tries=2, base_delay=0.6)
+                        orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=format(qty, 'f')), tries=2, base_delay=0.6)
                         logger.info(f"Orden de venta: {orden}")
                         total_hoy = actualizar_pnl_diario(ganancia_neta)
                         motivo = "Stop-loss" if vender_por_stop else "Take-profit/RSI"
@@ -604,7 +604,7 @@ def vender_y_convertir():
                                     del limpio[worst_sym]
                                     guardar_json(limpio, REGISTRO_FILE)
                                     return
-                                orden = retry(lambda: client.order_market_sell(symbol=worst_sym, quantity=float(qty)))
+                                orden = retry(lambda: client.order_market_sell(symbol=worst_sym, quantity=format(qty, 'f')))
                                 logger.info(f"Orden de venta por rotación: {orden}")
                                 total_hoy = actualizar_pnl_diario(worst_net)
                                 enviar_telegram(f"🔄 Vendido {worst_sym} por rotación - PnL: {worst_net:.2f} {MONEDA_BASE}. RSI: {worst_rsi:.2f}. Para comprar {best_symbol}.")
