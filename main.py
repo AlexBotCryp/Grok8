@@ -8,6 +8,10 @@ import threading
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from datetime import datetime, timedelta
 
+import hmac
+import hashlib
+from urllib.parse import urlencode
+
 import requests
 import pytz
 import numpy as np
@@ -16,7 +20,7 @@ from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Opcional: Grok (x.ai) — ahora es opcional y no bloquea el arranque
+# Opcional: Grok (x.ai)
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from openai import OpenAI
@@ -77,7 +81,7 @@ REGISTRO_FILE = "registro.json"
 PNL_DIARIO_FILE = "pnl_diario.json"
 
 # Grok
-GROK_CONSULTA_FRECUENCIA = 1  # en minutos
+GROK_CONSULTA_FRECUENCIA = 1  # minutos
 consulta_contador = 0
 _LAST_GROK_TS = 0
 
@@ -104,7 +108,7 @@ ULTIMAS_OPERACIONES = []
 DUST_THRESHOLD = 1.0  # en USDC
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilidades
+# Utilidades generales
 # ──────────────────────────────────────────────────────────────────────────────
 def now_tz():
     return datetime.now(TZ_MADRID)
@@ -155,6 +159,31 @@ def retry(fn, tries=3, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
             time.sleep(base_delay * (2 ** i) + random.random() * jitter)
 
 # ──────────────────────────────────────────────────────────────────────────────
+# SAPI firmada para Simple Earn (parche independiente del SDK)
+# ──────────────────────────────────────────────────────────────────────────────
+BINANCE_BASE_URL = "https://api.binance.com"  # SAPI v1
+
+def _sapi_request(method: str, path: str, params: dict | None = None, api_key: str = API_KEY, api_secret: str = API_SECRET):
+    if params is None:
+        params = {}
+    params["timestamp"] = int(time.time() * 1000)
+    params.setdefault("recvWindow", 5000)
+    query = urlencode(params, doseq=True)
+    signature = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+    url = f"{BINANCE_BASE_URL}{path}?{query}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+
+    if method.upper() == "GET":
+        r = requests.get(url, headers=headers, timeout=10)
+    elif method.upper() == "POST":
+        r = requests.post(url, headers=headers, timeout=10)
+    else:
+        raise ValueError("Método HTTP no soportado.")
+    if r.status_code >= 400:
+        raise Exception(f"SAPI error {r.status_code}: {r.text}")
+    return r.json()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # PnL diario / Riesgo
 # ──────────────────────────────────────────────────────────────────────────────
 def actualizar_pnl_diario(realized_pnl, fees=0.1):
@@ -183,36 +212,41 @@ def reset_diario():
             guardar_json(pnl, PNL_DIARIO_FILE)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Yield management (Simple Earn flexible) — tolerante a errores
+# Simple Earn (usando SAPI firmada)
 # ──────────────────────────────────────────────────────────────────────────────
 def get_usdc_flexible_product_id():
     global USDC_PRODUCT_ID
-    if USDC_PRODUCT_ID is None:
-        try:
-            products_resp = retry(lambda: client.get_simple_earn_flexible_product_list(
-                asset=MONEDA_BASE, status='ALL', featured='ALL', size=5
-            ))
-            products = products_resp.get('rows', [])
-            for product in products:
-                if product.get('asset') == MONEDA_BASE:
-                    USDC_PRODUCT_ID = product.get('productId')
-                    break
-            if USDC_PRODUCT_ID is None:
-                logger.warning("No se encontró producto Flexible Savings para USDC.")
-        except Exception as e:
-            logger.warning(f"Simple Earn no disponible/permiso: {e}")
-            USDC_PRODUCT_ID = None
+    if USDC_PRODUCT_ID is not None:
+        return USDC_PRODUCT_ID
+    try:
+        resp = retry(lambda: _sapi_request(
+            "GET",
+            "/sapi/v1/simple-earn/flexible/list",
+            {"asset": MONEDA_BASE, "size": 50}
+        ))
+        rows = resp.get("rows", []) if isinstance(resp, dict) else []
+        for p in rows:
+            if p.get("asset") == MONEDA_BASE:
+                USDC_PRODUCT_ID = p.get("productId")
+                break
+        if not USDC_PRODUCT_ID:
+            logger.warning("No se encontró producto Flexible Savings para USDC.")
+    except Exception as e:
+        logger.warning(f"Simple Earn/list no disponible: {e}")
+        USDC_PRODUCT_ID = None
     return USDC_PRODUCT_ID
 
 def get_savings_balance():
     try:
-        if get_usdc_flexible_product_id() is None:
-            return 0.0
-        positions_resp = retry(lambda: client.get_simple_earn_flexible_position(asset=MONEDA_BASE))
-        positions = positions_resp.get('rows', [])
-        for pos in positions:
-            if pos.get('asset') == MONEDA_BASE:
-                return float(pos.get('totalAmount', 0))
+        resp = retry(lambda: _sapi_request(
+            "GET",
+            "/sapi/v1/simple-earn/flexible/position",
+            {"asset": MONEDA_BASE, "size": 50}
+        ))
+        rows = resp.get("rows", []) if isinstance(resp, dict) else []
+        for pos in rows:
+            if pos.get("asset") == MONEDA_BASE:
+                return float(pos.get("totalAmount", 0) or 0)
         return 0.0
     except Exception as e:
         logger.warning(f"Error obteniendo balance en savings: {e}")
@@ -222,24 +256,32 @@ def subscribe_to_savings(amount: float):
     if amount <= 0:
         return
     try:
-        product_id = get_usdc_flexible_product_id()
-        if product_id is None:
+        pid = get_usdc_flexible_product_id()
+        if not pid:
             return
-        retry(lambda: client.simple_earn_flexible_subscribe(product_id=product_id, amount=amount))
+        retry(lambda: _sapi_request(
+            "POST",
+            "/sapi/v1/simple-earn/flexible/subscribe",
+            {"productId": pid, "amount": str(amount)}
+        ))
         logger.info(f"Subscrito {amount:.2f} {MONEDA_BASE} a Flexible Savings.")
         enviar_telegram(f"💰 Subscrito {amount:.2f} {MONEDA_BASE} a yield (Flexible Savings).")
     except Exception as e:
         logger.warning(f"Error subscribiendo a savings: {e}")
 
-def redeem_from_savings(amount: float, redeem_type='FAST'):
+def redeem_from_savings(amount: float, redeem_type="FAST"):
     if amount <= 0:
         return
     try:
-        product_id = get_usdc_flexible_product_id()
-        if product_id is None:
+        pid = get_usdc_flexible_product_id()
+        if not pid:
             return
-        retry(lambda: client.simple_earn_flexible_redeem(product_id=product_id, amount=amount, type=redeem_type))
-        logger.info(f"Redimido {amount:.2f} {MONEDA_BASE} de Flexible Savings ({redeem_type}).")
+        retry(lambda: _sapi_request(
+            "POST",
+            "/sapi/v1/simple-earn/flexible/redeem",
+            {"productId": pid, "amount": str(amount)}
+        ))
+        logger.info(f"Redimido {amount:.2f} {MONEDA_BASE} de Flexible Savings.")
         enviar_telegram(f"💸 Redimido {amount:.2f} {MONEDA_BASE} de yield para trading.")
         time.sleep(5)
     except Exception as e:
@@ -295,7 +337,6 @@ def load_symbol_info(symbol):
             "quoteAsset": info['quoteAsset'],
         }
         if meta["marketStepSize"] <= 0 or meta["marketMinQty"] <= 0:
-            # FIX: fallback seguro
             meta["marketStepSize"] = meta["stepSize"]
             meta["marketMinQty"] = meta["minQty"]
         SYMBOL_CACHE[symbol] = meta
@@ -371,7 +412,7 @@ def calculate_rsi(closes, period=14):
     return float(rsi)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Grok helper (opcional y con ritmo)
+# Grok helper (opcional)
 # ──────────────────────────────────────────────────────────────────────────────
 def consultar_grok(prompt):
     global consulta_contador, _LAST_GROK_TS
@@ -395,17 +436,16 @@ def consultar_grok(prompt):
         return "no"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilidad: obtener baseAsset de un símbolo de forma segura
+# Utilidad: baseAsset del símbolo
 # ──────────────────────────────────────────────────────────────────────────────
 def base_from_symbol(symbol: str) -> str:
     if symbol.endswith(MONEDA_BASE):
         return symbol[:-len(MONEDA_BASE)]
-    # Fallback (raro)
     meta = load_symbol_info(symbol)
     return meta["baseAsset"] if meta else symbol.replace(MONEDA_BASE, "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Registro posiciones / precio medio
+# Precio medio / inicialización cartera
 # ──────────────────────────────────────────────────────────────────────────────
 def precio_medio_si_hay(symbol, lookback_days=30):
     try:
@@ -421,7 +461,6 @@ def precio_medio_si_hay(symbol, lookback_days=30):
             price = dec(t['price'])
             comm = dec(t.get('commission', '0'))
             comm_asset = t.get('commissionAsset', '')
-            # Contabiliza comisión si es en la misma quote (USDC) — si usas BNB fees, suele ser BNB.
             if comm_asset == MONEDA_BASE:
                 cost_sum += qty * price + comm
             else:
@@ -472,9 +511,6 @@ def inicializar_registro():
 # Helpers de orden: fallback para LOT_SIZE (-1013)
 # ──────────────────────────────────────────────────────────────────────────────
 def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
-    """
-    Intenta vender; si devuelve -1013 (LOT_SIZE), reduce 1 paso y reintenta hasta 3 veces.
-    """
     attempts = 0
     last_err = None
     q = quantize_qty(qty, meta["marketStepSize"])
@@ -484,7 +520,6 @@ def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
         except BinanceAPIException as e:
             last_err = e
             if e.code == -1013:
-                # Reduce un paso
                 q = q - meta["marketStepSize"]
                 q = quantize_qty(q, meta["marketStepSize"])
                 attempts += 1
@@ -495,18 +530,13 @@ def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
         raise last_err
 
 def executed_qty_from_order(order_resp) -> float:
-    """
-    Suma la cantidad ejecutada real desde 'fills' (si existe). Si no, usa cummulativeQuoteQty/price aprox.
-    """
     try:
         fills = order_resp.get('fills') or []
         if fills:
-            q = sum(float(f.get('qty', 0)) for f in fills if f)
-            return q
+            return sum(float(f.get('qty', 0)) for f in fills if f)
     except Exception:
         pass
     try:
-        # Fallback aproximado
         executed_quote = float(order_resp.get('cummulativeQuoteQty', 0))
         price = float(order_resp.get('price') or 0) or float(order_resp.get('fills', [{}])[0].get('price', 0) or 0)
         if executed_quote and price:
@@ -516,7 +546,7 @@ def executed_qty_from_order(order_resp) -> float:
     return 0.0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Liquidar cartera al inicio (opcional, ya presente)
+# Liquidar cartera al inicio
 # ──────────────────────────────────────────────────────────────────────────────
 def liquidar_cartera():
     enviar_telegram("🔥 Liquidando cartera actual para reinicio con estrategia mejorada.")
@@ -546,7 +576,7 @@ def liquidar_cartera():
                     if notional_est < meta["minNotional"]:
                         dust_positions.append(symbol)
                         continue
-                orden = market_sell_with_fallback(symbol, qty, meta)  # FIX: fallback -1013
+                orden = market_sell_with_fallback(symbol, qty, meta)
                 logger.info(f"Orden de liquidación: {orden}")
                 precio_compra = dec(str(data["precio_compra"]))
                 ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
@@ -568,7 +598,7 @@ def liquidar_cartera():
 # ──────────────────────────────────────────────────────────────────────────────
 def mejores_criptos(max_candidates=10):
     try:
-        tickers = retry(lambda: client.get_ticker())  # 24h tickers
+        tickers = retry(lambda: client.get_ticker())
         candidates = [
             t for t in tickers
             if t.get("symbol") in ALLOWED_SYMBOLS
@@ -667,7 +697,7 @@ def comprar():
                     continue
 
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
-            # COMPRA por QUOTE: Binance ajusta la cantidad. Guardamos la ejecutada real.
+
             if rsi < RSI_BUY_MAX:
                 try:
                     orden = retry(
@@ -679,9 +709,8 @@ def comprar():
                         ),
                         tries=2, base_delay=0.6
                     )
-                    executed_qty = executed_qty_from_order(orden)  # FIX: cantidad ejecutada real
+                    executed_qty = executed_qty_from_order(orden)
                     if executed_qty <= 0:
-                        # fallback: estimación
                         executed_qty = float(quote_to_spend) / float(precio)
 
                     with LOCK:
@@ -753,7 +782,6 @@ def vender_y_convertir():
                         dust_positions.append(symbol)
                         continue
 
-                # ¿Vender?
                 ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
                 comision_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
                 comision_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
@@ -764,7 +792,7 @@ def vender_y_convertir():
 
                 if vender_por_stop or vender_por_profit:
                     try:
-                        orden = market_sell_with_fallback(symbol, qty, meta)  # FIX: fallback -1013
+                        orden = market_sell_with_fallback(symbol, qty, meta)
                         logger.info(f"Orden de venta: {orden}")
                         total_hoy = actualizar_pnl_diario(ganancia_neta)
                         motivo = "Stop-loss" if vender_por_stop else "Take-profit/RSI"
@@ -879,7 +907,7 @@ if __name__ == "__main__":
     inicializar_registro()
     liquidar_cartera()
     manage_savings()
-    enviar_telegram("🤖 Bot IA mejorado: más robusto (cuantización, fallback LOT_SIZE, Grok/Telegram opcionales) y yield en USDC idle.")
+    enviar_telegram("🤖 Bot IA mejorado: robusto (cuantización, fallback LOT_SIZE, Simple Earn vía SAPI firmada) y yield en USDC idle.")
 
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")
