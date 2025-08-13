@@ -8,10 +8,6 @@ import threading
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from datetime import datetime, timedelta
 
-import hmac
-import hashlib
-from urllib.parse import urlencode
-
 import requests
 import pytz
 import numpy as np
@@ -20,7 +16,7 @@ from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Opcional: Grok (x.ai)
+# Opcional: Grok (x.ai) — se usa MUY poco y puedes desactivarlo
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from openai import OpenAI
@@ -43,8 +39,13 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 
+# Grok (opcional y mínimo)
 GROK_API_KEY = os.getenv("GROK_API_KEY") or ""
 GROK_BASE_URL = "https://api.x.ai/v1"
+ENABLE_GROK_ROTATION = True  # pon False para desactivar completamente
+GROK_CONSULTA_FRECUENCIA_MIN = 30  # cada cuántos minutos como mínimo se le pregunta algo
+consulta_contador = 0
+_LAST_GROK_TS = 0
 
 for var, name in [(API_KEY, "BINANCE_API_KEY"), (API_SECRET, "BINANCE_API_SECRET")]:
     if not var:
@@ -59,19 +60,19 @@ PORCENTAJE_USDC = 0.25
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC']
 
 # Estrategia
-TAKE_PROFIT = 0.03
-STOP_LOSS = -0.02
-COMMISSION_RATE = 0.002
+TAKE_PROFIT = 0.03      # 3%
+STOP_LOSS = -0.02       # -2%
+COMMISSION_RATE = 0.002 # 0.2% aprox
 RSI_BUY_MAX = 50
 RSI_SELL_MIN = 55
-MIN_NET_GAIN_ABS = 0.5
+MIN_NET_GAIN_ABS = 0.5  # ganancia neta mínima absoluta en USDC
 
 # Ritmo / límites
 TRADE_COOLDOWN_SEC = 300
 MAX_TRADES_PER_HOUR = 4
 
 # Riesgo diario
-PERDIDA_MAXIMA_DIARIA = 50
+PERDIDA_MAXIMA_DIARIA = 50  # USDC
 
 # Horarios
 TZ_MADRID = pytz.timezone("Europe/Madrid")
@@ -81,25 +82,17 @@ RESUMEN_HORA = 23
 REGISTRO_FILE = "registro.json"
 PNL_DIARIO_FILE = "pnl_diario.json"
 
-# Grok
-GROK_CONSULTA_FRECUENCIA = 1  # minutos
-consulta_contador = 0
-_LAST_GROK_TS = 0
-
-# Yield on idle USDC (Simple Earn)
-MIN_RESERVE_USDC = 100
-USDC_PRODUCT_ID = None
-PRODUCT_RULES = {"min": None, "precision": 6}  # reglas opcionales del producto
-
 # Estado y clientes
 client = Client(API_KEY, API_SECRET)
 client_openai = None
-if GROK_API_KEY and OpenAI is not None:
+if ENABLE_GROK_ROTATION and GROK_API_KEY and OpenAI is not None:
     try:
         client_openai = OpenAI(api_key=GROK_API_KEY, base_url=GROK_BASE_URL)
     except Exception as e:
         logger.warning(f"No se pudo inicializar Grok: {e}")
         client_openai = None
+else:
+    ENABLE_GROK_ROTATION = False
 
 # Locks / caches / rate controls
 LOCK = threading.RLock()
@@ -107,7 +100,7 @@ SYMBOL_CACHE = {}
 INVALID_SYMBOL_CACHE = set()
 ULTIMA_COMPRA = {}
 ULTIMAS_OPERACIONES = []
-DUST_THRESHOLD = 1.0  # en USDC
+DUST_THRESHOLD = 1.0  # USDC
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilidades generales
@@ -161,65 +154,6 @@ def retry(fn, tries=3, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
             time.sleep(base_delay * (2 ** i) + random.random() * jitter)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SAPI firmada para Simple Earn (parche independiente del SDK)
-# ──────────────────────────────────────────────────────────────────────────────
-BINANCE_BASE_URL = "https://api.binance.com"  # SAPI v1
-
-def _sapi_request(method: str, path: str, params: dict | None = None, api_key: str = API_KEY, api_secret: str = API_SECRET):
-    """
-    GET: firma + params en query.
-    POST: firma + params en BODY (form-encoded). ← evita 400 'amount' missing.
-    """
-    if params is None:
-        params = {}
-    params["timestamp"] = int(time.time() * 1000)
-    params.setdefault("recvWindow", 5000)
-
-    query = urlencode(params, doseq=True)
-    signature = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
-    headers = {"X-MBX-APIKEY": api_key}
-
-    if method.upper() == "GET":
-        url = f"{BINANCE_BASE_URL}{path}?{query}&signature={signature}"
-        r = requests.get(url, headers=headers, timeout=10)
-    elif method.upper() == "POST":
-        url = f"{BINANCE_BASE_URL}{path}"
-        payload = query + "&signature=" + signature
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-        r = requests.post(url, headers=headers, data=payload, timeout=10)
-    else:
-        raise ValueError("Método HTTP no soportado.")
-
-    if r.status_code >= 400:
-        raise Exception(f"SAPI error {r.status_code}: {r.text}")
-    return r.json()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers de Decimal / formateo de amount
-# ──────────────────────────────────────────────────────────────────────────────
-def dec(x: str) -> Decimal:
-    try:
-        return Decimal(x)
-    except (InvalidOperation, TypeError):
-        return Decimal('0')
-
-def fmt_amount_with_rules(x) -> str:
-    """
-    Aplica precisión del producto (si está disponible) y mínimo.
-    Evita notación científica. Recorta ceros finales.
-    """
-    prec = PRODUCT_RULES.get("precision", 6) or 6
-    q = "1" if prec == 0 else "0." + "0" * (prec - 1) + "1"
-    d = Decimal(str(x)).quantize(Decimal(q), rounding=ROUND_DOWN)
-    mn = PRODUCT_RULES.get("min")
-    if isinstance(mn, Decimal) and mn > 0 and d < mn:
-        d = mn
-    s = format(d.normalize(), 'f')
-    if '.' in s:
-        s = s.rstrip('0').rstrip('.') or '0'
-    return s
-
-# ──────────────────────────────────────────────────────────────────────────────
 # PnL diario / Riesgo
 # ──────────────────────────────────────────────────────────────────────────────
 def actualizar_pnl_diario(realized_pnl, fees=0.1):
@@ -248,114 +182,14 @@ def reset_diario():
             guardar_json(pnl, PNL_DIARIO_FILE)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Simple Earn (vía SAPI)
-# ──────────────────────────────────────────────────────────────────────────────
-USDC_PRODUCT_ID = None
-
-def get_usdc_flexible_product_id():
-    global USDC_PRODUCT_ID, PRODUCT_RULES
-    if USDC_PRODUCT_ID is not None:
-        return USDC_PRODUCT_ID
-    try:
-        resp = retry(lambda: _sapi_request(
-            "GET",
-            "/sapi/v1/simple-earn/flexible/list",
-            {"asset": MONEDA_BASE, "size": 50}
-        ))
-        rows = resp.get("rows", []) if isinstance(resp, dict) else []
-        for p in rows:
-            if p.get("asset") == MONEDA_BASE:
-                USDC_PRODUCT_ID = p.get("productId")
-                # guarda reglas si existen
-                try:
-                    PRODUCT_RULES["min"] = dec(str(p.get("minPurchaseAmount", "0") or "0"))
-                except Exception:
-                    PRODUCT_RULES["min"] = None
-                try:
-                    PRODUCT_RULES["precision"] = int(p.get("purchaseAmountPrecision", 6) or 6)
-                except Exception:
-                    PRODUCT_RULES["precision"] = 6
-                break
-        if not USDC_PRODUCT_ID:
-            logger.warning("No se encontró producto Flexible Savings para USDC.")
-    except Exception as e:
-        logger.warning(f"Simple Earn/list no disponible: {e}")
-        USDC_PRODUCT_ID = None
-    return USDC_PRODUCT_ID
-
-def get_savings_balance():
-    try:
-        resp = retry(lambda: _sapi_request(
-            "GET",
-            "/sapi/v1/simple-earn/flexible/position",
-            {"asset": MONEDA_BASE, "size": 50}
-        ))
-        rows = resp.get("rows", []) if isinstance(resp, dict) else []
-        for pos in rows:
-            if pos.get("asset") == MONEDA_BASE:
-                return float(pos.get("totalAmount", 0) or 0)
-        return 0.0
-    except Exception as e:
-        logger.warning(f"Error obteniendo balance en savings: {e}")
-        return 0.0
-
-def subscribe_to_savings(amount: float):
-    if amount <= 0:
-        return
-    try:
-        pid = get_usdc_flexible_product_id()
-        if not pid:
-            return
-        retry(lambda: _sapi_request(
-            "POST",
-            "/sapi/v1/simple-earn/flexible/subscribe",
-            {
-                "productId": pid,
-                "amount": fmt_amount_with_rules(amount)
-            }
-        ))
-        logger.info(f"Subscrito {float(amount):.6f} {MONEDA_BASE} a Flexible Savings.")
-        enviar_telegram(f"💰 Subscrito {float(amount):.2f} {MONEDA_BASE} a yield (Flexible Savings).")
-    except Exception as e:
-        logger.warning(f"Error subscribiendo a savings: {e}")
-
-def redeem_from_savings(amount: float, redeem_type="FAST"):
-    if amount <= 0:
-        return
-    try:
-        pid = get_usdc_flexible_product_id()
-        if not pid:
-            return
-        retry(lambda: _sapi_request(
-            "POST",
-            "/sapi/v1/simple-earn/flexible/redeem",
-            {
-                "productId": pid,
-                "amount": fmt_amount_with_rules(amount)
-            }
-        ))
-        logger.info(f"Redimido {float(amount):.6f} {MONEDA_BASE} de Flexible Savings.")
-        enviar_telegram(f"💸 Redimido {float(amount):.2f} {MONEDA_BASE} de yield para trading.")
-        time.sleep(5)
-    except Exception as e:
-        logger.warning(f"Error redimiendo de savings: {e}")
-
-def manage_savings():
-    try:
-        saldo_spot = safe_get_balance(MONEDA_BASE)
-        saldo_savings = get_savings_balance()
-        if saldo_spot > MIN_RESERVE_USDC + MIN_SALDO_COMPRA:
-            excess = saldo_spot - MIN_RESERVE_USDC
-            subscribe_to_savings(excess)
-        elif saldo_spot < MIN_RESERVE_USDC and saldo_savings > 0:
-            to_redeem = min(saldo_savings, MIN_RESERVE_USDC - saldo_spot)
-            redeem_from_savings(to_redeem)
-    except Exception as e:
-        logger.warning(f"Error en manage_savings: {e}")
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Mercado: info símbolos y precisión
 # ──────────────────────────────────────────────────────────────────────────────
+def dec(x: str) -> Decimal:
+    try:
+        return Decimal(x)
+    except (InvalidOperation, TypeError):
+        return Decimal('0')
+
 def load_symbol_info(symbol):
     if symbol in INVALID_SYMBOL_CACHE:
         return None
@@ -459,21 +293,21 @@ def calculate_rsi(closes, period=14):
     return float(rsi)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Grok helper (opcional)
+# Grok helper (opcional, uso mínimo)
 # ──────────────────────────────────────────────────────────────────────────────
 def consultar_grok(prompt):
     global consulta_contador, _LAST_GROK_TS
-    if client_openai is None:
+    if not ENABLE_GROK_ROTATION or client_openai is None:
         return "no"
     now = time.time()
-    if now - _LAST_GROK_TS < GROK_CONSULTA_FRECUENCIA * 60:
+    if now - _LAST_GROK_TS < GROK_CONSULTA_FRECUENCIA_MIN * 60:
         return "no"
     try:
         consulta_contador += 1
         resp = client_openai.chat.completions.create(
             model="grok-beta",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=50,
+            max_tokens=40,
             temperature=0
         )
         _LAST_GROK_TS = time.time()
@@ -492,7 +326,7 @@ def base_from_symbol(symbol: str) -> str:
     return meta["baseAsset"] if meta else symbol.replace(MONEDA_BASE, "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Precio medio / inicialización cartera
+# Precio medio / inicialización cartera (NO liquida; arranca como estás)
 # ──────────────────────────────────────────────────────────────────────────────
 def precio_medio_si_hay(symbol, lookback_days=30):
     try:
@@ -593,54 +427,6 @@ def executed_qty_from_order(order_resp) -> float:
     return 0.0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Liquidar cartera al inicio
-# ──────────────────────────────────────────────────────────────────────────────
-def liquidar_cartera():
-    enviar_telegram("🔥 Liquidando cartera actual para reinicio con estrategia mejorada.")
-    with LOCK:
-        registro = cargar_json(REGISTRO_FILE)
-        dust_positions = []
-        for symbol, data in list(registro.items()):
-            try:
-                ticker = safe_get_ticker(symbol)
-                if not ticker:
-                    continue
-                precio_actual = dec(str(ticker["lastPrice"]))
-                meta = load_symbol_info(symbol)
-                if not meta:
-                    continue
-                asset = base_from_symbol(symbol)
-                cantidad_wallet = dec(str(safe_get_balance(asset)))
-                if cantidad_wallet <= 0:
-                    dust_positions.append(symbol)
-                    continue
-                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
-                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
-                    dust_positions.append(symbol)
-                    continue
-                if meta["applyToMarket"] and meta["minNotional"] > 0:
-                    notional_est = qty * precio_actual
-                    if notional_est < meta["minNotional"]:
-                        dust_positions.append(symbol)
-                        continue
-                orden = market_sell_with_fallback(symbol, qty, meta)
-                logger.info(f"Orden de liquidación: {orden}")
-                precio_compra = dec(str(data["precio_compra"]))
-                ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
-                comision_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
-                comision_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
-                ganancia_neta = ganancia_bruta - comision_compra - comision_venta
-                total_hoy = actualizar_pnl_diario(ganancia_neta)
-                enviar_telegram(f"🔥 Liquidado {symbol} - PnL: {ganancia_neta:.2f} {MONEDA_BASE}. PnL hoy: {total_hoy:.2f}")
-            except Exception as e:
-                logger.error(f"Error liquidando {symbol}: {e}")
-                dust_positions.append(symbol)
-        limpio = {sym: d for sym, d in registro.items() if sym not in dust_positions}
-        guardar_json(limpio, REGISTRO_FILE)
-        if dust_positions:
-            enviar_telegram(f"🧹 Dust liquidado: {', '.join(dust_positions)}")
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Selección de criptos
 # ──────────────────────────────────────────────────────────────────────────────
 def mejores_criptos(max_candidates=10):
@@ -682,22 +468,11 @@ def comprar():
         return
     try:
         saldo_spot = safe_get_balance(MONEDA_BASE)
-        saldo_savings = get_savings_balance()
-        saldo_total = saldo_spot + saldo_savings
-        logger.info(f"Saldo total {MONEDA_BASE} (spot + savings): {saldo_total:.2f}")
-        if saldo_total < MIN_SALDO_COMPRA:
-            logger.info("Saldo total insuficiente para comprar.")
+        if saldo_spot < MIN_SALDO_COMPRA:
+            logger.info("Saldo USDC insuficiente para comprar.")
             return
 
-        cantidad_usdc = saldo_total * PORCENTAJE_USDC
-        if saldo_spot < cantidad_usdc:
-            to_redeem = cantidad_usdc - saldo_spot
-            if saldo_savings >= to_redeem:
-                redeem_from_savings(to_redeem)
-                saldo_spot = safe_get_balance(MONEDA_BASE)
-            else:
-                cantidad_usdc = saldo_spot
-
+        cantidad_usdc = saldo_spot * PORCENTAJE_USDC
         criptos = mejores_criptos()
         registro = cargar_json(REGISTRO_FILE)
 
@@ -737,11 +512,8 @@ def comprar():
             min_quote = min_quote_for_market(symbol)
             quote_to_spend = dec(str(cantidad_usdc))
             if quote_to_spend < min_quote:
-                if dec(str(saldo_spot)) >= min_quote:
-                    quote_to_spend = min_quote
-                else:
-                    logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
-                    continue
+                logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
+                continue
 
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
 
@@ -779,8 +551,6 @@ def comprar():
                     logger.error(f"Error inesperado comprando {symbol}: {e}")
             else:
                 logger.info(f"No se compra {symbol}: RSI {rsi:.2f} > {RSI_BUY_MAX}")
-
-        manage_savings()
     except Exception as e:
         logger.error(f"Error general en compra: {e}")
 
@@ -789,8 +559,6 @@ def vender_y_convertir():
         registro = cargar_json(REGISTRO_FILE)
         nuevos_registro = {}
         dust_positions = []
-        saldo_usdc_antes = safe_get_balance(MONEDA_BASE)
-        logger.info(f"Saldo {MONEDA_BASE} antes de vender: {saldo_usdc_antes:.2f}")
 
         for symbol, data in list(registro.items()):
             try:
@@ -864,73 +632,68 @@ def vender_y_convertir():
         if dust_positions:
             enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
 
-        # Rotación con Grok si saldo bajo
-        saldo_spot = safe_get_balance(MONEDA_BASE)
-        saldo_savings = get_savings_balance()
-        saldo_total = saldo_spot + saldo_savings
-        if saldo_total < MIN_SALDO_COMPRA:
-            criptos = mejores_criptos()
-            if criptos:
-                candidates = [c for c in criptos if c['symbol'] not in limpio]
-                if candidates:
-                    best = candidates[0]
-                    best_symbol = best['symbol']
-                    best_rsi = best['rsi']
-                    best_change = best.get('priceChangePercent', '0')
-                    pos_perfs = []
-                    for sym, data in limpio.items():
-                        ticker = safe_get_ticker(sym)
-                        if not ticker:
-                            continue
-                        price = float(ticker['lastPrice'])
-                        buy_price = data['precio_compra']
-                        change = (price - buy_price) / buy_price if buy_price else 0
-                        klines = retry(lambda: client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
-                        closes = [float(k[4]) for k in klines]
-                        rsi = calculate_rsi(closes)
-                        qty = data['cantidad']
-                        ganancia_bruta = qty * (price - buy_price)
-                        comision_compra = buy_price * qty * COMMISSION_RATE
-                        comision_venta = price * qty * COMMISSION_RATE
-                        ganancia_neta = ganancia_bruta - comision_compra - comision_venta
-                        pos_perfs.append((sym, change, rsi, ganancia_neta))
-                    if pos_perfs:
-                        pos_perfs.sort(key=lambda x: x[1])
-                        worst_sym, worst_change, worst_rsi, worst_net = pos_perfs[0]
-                        prompt = (
-                            f"Debo vender {worst_sym} con RSI {worst_rsi:.2f}, ganancia neta {worst_net:.4f} "
-                            f"para liberar fondos y comprar {best_symbol} con RSI {best_rsi:.2f} y cambio {best_change}%? "
-                            f"Responde solo con 'si' o 'no'."
-                        )
-                        respuesta = consultar_grok(prompt)
-                        if 'si' in respuesta:
-                            try:
-                                meta = load_symbol_info(worst_sym)
-                                asset = base_from_symbol(worst_sym)
-                                cantidad_wallet = dec(str(safe_get_balance(asset)))
-                                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
-                                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
-                                    del limpio[worst_sym]
-                                    guardar_json(limpio, REGISTRO_FILE)
-                                    return
-                                orden = market_sell_with_fallback(worst_sym, qty, meta)
-                                logger.info(f"Orden de venta por rotación: {orden}")
-                                total_hoy = actualizar_pnl_diario(worst_net)
-                                enviar_telegram(
-                                    f"🔄 Vendido {worst_sym} por rotación - PnL: {worst_net:.2f} {MONEDA_BASE}. "
-                                    f"RSI: {worst_rsi:.2f}. Para comprar {best_symbol}."
-                                )
-                                del limpio[worst_sym]
-                                guardar_json(limpio, REGISTRO_FILE)
-                            except Exception as e:
-                                logger.error(f"Error en venta por rotación {worst_sym}: {e}")
-
-        manage_savings()
+        # Rotación (opcional, con Grok mínimo)
+        if ENABLE_GROK_ROTATION:
+            try:
+                registro = cargar_json(REGISTRO_FILE)
+                if not registro:
+                    return
+                criptos = mejores_criptos()
+                if criptos:
+                    candidates = [c for c in criptos if c['symbol'] not in registro]
+                    if candidates:
+                        best = candidates[0]
+                        best_symbol = best['symbol']
+                        best_rsi = best.get('rsi', 50)
+                        pos_perfs = []
+                        for sym, data in registro.items():
+                            ticker = safe_get_ticker(sym)
+                            if not ticker:
+                                continue
+                            price = float(ticker['lastPrice'])
+                            buy_price = data['precio_compra']
+                            change = (price - buy_price) / buy_price if buy_price else 0
+                            klines = retry(lambda: client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
+                            closes = [float(k[4]) for k in klines]
+                            rsi = calculate_rsi(closes)
+                            qty = data['cantidad']
+                            ganancia_bruta = qty * (price - buy_price)
+                            comision_compra = buy_price * qty * COMMISSION_RATE
+                            comision_venta = price * qty * COMMISSION_RATE
+                            ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+                            pos_perfs.append((sym, change, rsi, ganancia_neta))
+                        if pos_perfs:
+                            pos_perfs.sort(key=lambda x: x[1])  # peor primero
+                            worst_sym, worst_change, worst_rsi, worst_net = pos_perfs[0]
+                            prompt = (
+                                f"Debo vender {worst_sym} (RSI {worst_rsi:.2f}, net {worst_net:.4f}) "
+                                f"para rotar a {best_symbol} (RSI {best_rsi:.2f})? responde 'si' o 'no'."
+                            )
+                            respuesta = consultar_grok(prompt)
+                            if 'si' in respuesta:
+                                try:
+                                    meta = load_symbol_info(worst_sym)
+                                    asset = base_from_symbol(worst_sym)
+                                    cantidad_wallet = dec(str(safe_get_balance(asset)))
+                                    qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
+                                    if qty < meta["marketMinQty"] or qty <= Decimal('0'):
+                                        del registro[worst_sym]
+                                        guardar_json(registro, REGISTRO_FILE)
+                                        return
+                                    orden = market_sell_with_fallback(worst_sym, qty, meta)
+                                    logger.info(f"Rotación: vendido {worst_sym}: {orden}")
+                                    total_hoy = actualizar_pnl_diario(worst_net)
+                                    enviar_telegram(f"🔄 Rotación: vendido {worst_sym} (PnL neto {worst_net:.2f}). Para entrar en {best_symbol}.")
+                                    del registro[worst_sym]
+                                    guardar_json(registro, REGISTRO_FILE)
+                                except Exception as e:
+                                    logger.error(f"Error en venta por rotación {worst_sym}: {e}")
+            except Exception as e:
+                logger.error(f"Error en bloque de rotación: {e}")
 
 def resumen_diario():
     try:
         cuenta = retry(lambda: client.get_account())
-        saldo_savings = get_savings_balance()
         pnl_data = cargar_json(PNL_DIARIO_FILE)
         today = get_current_date()
         pnl_hoy_v = pnl_data.get(today, 0)
@@ -939,7 +702,6 @@ def resumen_diario():
             total = float(b["free"]) + float(b["locked"])
             if total > 0.001:
                 mensaje += f"{b['asset']}: {total:.6f}\n"
-        mensaje += f"{MONEDA_BASE} en Savings: {saldo_savings:.2f}\n"
         enviar_telegram(mensaje)
         seven_days_ago = (now_tz() - timedelta(days=7)).date().isoformat()
         pnl_data = {k: v for k, v in pnl_data.items() if k >= seven_days_ago}
@@ -951,15 +713,12 @@ def resumen_diario():
 # Inicio
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    inicializar_registro()
-    liquidar_cartera()
-    manage_savings()
-    enviar_telegram("🤖 Bot IA mejorado: robusto (cuantización, fallback LOT_SIZE, Simple Earn vía SAPI firmada con body form) y yield en USDC idle.")
+    inicializar_registro()         # ← arranca con tu cartera actual
+    enviar_telegram("🤖 Bot IA activo: trading spot con RSI/TP/SL. Sin Simple Earn. Cartera inicial conservada.")
 
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=10, id="vender")
-    scheduler.add_job(manage_savings, 'interval', minutes=10, id="manage_savings")
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
