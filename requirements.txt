@@ -1,3 +1,4 @@
+pip>=25.2
 python-binance>=1.0.19
 requests>=2.31.0
 pytz>=2024.1
