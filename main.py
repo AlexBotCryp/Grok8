@@ -10,15 +10,14 @@ from datetime import datetime, timedelta
 import requests
 import pytz
 import numpy as np
-from binance.spot import Spot as Client
-from binance.lib.utils import config_logging
-from binance.error import ClientError
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
 from openai import OpenAI
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
-config_logging(logging, logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("bot-ia")
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -63,7 +62,7 @@ _LAST_GROK_TS = 0
 MIN_RESERVE_USDC = 100  # Reserva mínima en spot para operaciones inmediatas
 USDC_PRODUCT_ID = None
 # Estado y clientes
-client = Client(key=API_KEY, secret=API_SECRET, base_url='https://api.binance.com')
+client = Client(API_KEY, API_SECRET)
 client_openai = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
 # Locks / caches / rate controls
 LOCK = threading.RLock()
@@ -147,11 +146,10 @@ def get_usdc_flexible_product_id():
     global USDC_PRODUCT_ID
     if USDC_PRODUCT_ID is None:
         try:
-            products_resp = retry(lambda: client.simple_earn_flexible_product_list(asset=MONEDA_BASE, status='ALL', featured='ALL', size=5))
-            products = products_resp.get('rows', [])
-            for product in products:
-                if product.get('asset') == MONEDA_BASE:
-                    USDC_PRODUCT_ID = product.get('productId')
+            products = retry(lambda: client.get_simple_earn_flexible_product_list(asset=MONEDA_BASE, status='ALL', featured='ALL', size=5))
+            for product in products['rows']:
+                if product['asset'] == MONEDA_BASE:
+                    USDC_PRODUCT_ID = product['productId']
                     break
             if USDC_PRODUCT_ID is None:
                 logger.error("No se encontró producto Flexible Savings para USDC.")
@@ -164,11 +162,10 @@ def get_savings_balance():
         product_id = get_usdc_flexible_product_id()
         if product_id is None:
             return 0.0
-        positions_resp = retry(lambda: client.simple_earn_flexible_position(asset=MONEDA_BASE))
-        positions = positions_resp.get('rows', [])
-        for pos in positions:
-            if pos.get('productId') == product_id:
-                return float(pos.get('totalAmount', 0))
+        positions = retry(lambda: client.get_simple_earn_flexible_position(asset=MONEDA_BASE))
+        for pos in positions['rows']:
+            if pos['productId'] == product_id:
+                return float(pos['totalAmount'])
         return 0.0
     except Exception as e:
         logger.error(f"Error obteniendo balance en savings: {e}")
@@ -181,7 +178,7 @@ def subscribe_to_savings(amount: float):
         product_id = get_usdc_flexible_product_id()
         if product_id is None:
             return
-        retry(lambda: client.simple_earn_flexible_subscribe(product_id=product_id, amount=amount))
+        retry(lambda: client.simple_earn_flexible_subscribe(productId=product_id, amount=amount))
         logger.info(f"Subscrito {amount:.2f} {MONEDA_BASE} a Flexible Savings.")
         enviar_telegram(f"💰 Subscrito {amount:.2f} {MONEDA_BASE} a yield (Flexible Savings).")
     except Exception as e:
@@ -194,7 +191,7 @@ def redeem_from_savings(amount: float, redeem_type='FAST'):
         product_id = get_usdc_flexible_product_id()
         if product_id is None:
             return
-        retry(lambda: client.simple_earn_flexible_redeem(product_id=product_id, amount=amount, type=redeem_type))
+        retry(lambda: client.simple_earn_flexible_redeem(productId=product_id, amount=amount, type=redeem_type))
         logger.info(f"Redimido {amount:.2f} {MONEDA_BASE} de Flexible Savings ({redeem_type}).")
         enviar_telegram(f"💸 Redimido {amount:.2f} {MONEDA_BASE} de yield para trading.")
         time.sleep(5)  # Espera para que se refleje en balance spot
@@ -222,21 +219,24 @@ def load_symbol_info(symbol):
     if symbol in SYMBOL_CACHE:
         return SYMBOL_CACHE[symbol]
     try:
-        exchange_info = retry(lambda: client.exchange_info(symbols=[symbol]))
-        info = exchange_info['symbols'][0]
+        info = client.get_symbol_info(symbol)
+        if info is None:
+            logger.info(f"Símbolo {symbol} no disponible en Binance")
+            INVALID_SYMBOL_CACHE.add(symbol)
+            return None
         lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
         market_lot = next((f for f in info['filters'] if f['filterType'] == 'MARKET_LOT_SIZE'), None)
         pricef = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
         notional_f = next((f for f in info['filters'] if f['filterType'] in ('NOTIONAL','MIN_NOTIONAL')), None)
-        def D(x): return Decimal(str(x))
+        def D(x): return Decimal(x)
         meta = {
             "stepSize": D(lot['stepSize']),
-            "minQty": D(lot['minQty']),
+            "minQty": D(lot.get('minQty', '0')),
             "marketStepSize": D(market_lot['stepSize']) if market_lot and D(market_lot['stepSize']) > 0 else D(lot['stepSize']),
-            "marketMinQty": D(market_lot['minQty']) if market_lot and D(market_lot['minQty']) > 0 else D(lot['minQty']),
+            "marketMinQty": D(market_lot.get('minQty', lot.get('minQty', '0'))) if market_lot and D(market_lot.get('minQty', '0')) > 0 else D(lot.get('minQty', '0')),
             "tickSize": D(pricef['tickSize']),
-            "minNotional": D(notional_f['minNotional']) if notional_f else D('0'),
-            "applyToMarket": notional_f.get('applyToMarket', True) if notional_f else True,
+            "minNotional": D(notional_f.get('minNotional', '0')) if notional_f else D('0'),
+            "applyToMarket": bool(notional_f.get('applyToMarket', True)) if notional_f else True,
             "baseAsset": info['baseAsset'],
             "quoteAsset": info['quoteAsset'],
         }
@@ -270,7 +270,7 @@ def min_quote_for_market(symbol, price: Decimal) -> Decimal:
     return (min_q * Decimal('1.01')).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
 def safe_get_ticker(symbol):
     try:
-        ticker = retry(lambda: client.ticker_24hr(symbol), tries=3, base_delay=0.5)
+        ticker = retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5, exceptions=(Exception,))
         if ticker and float(ticker.get('lastPrice', 0)) <= 0:
             logger.info(f"Precio inválido (cero) para {symbol}")
             return None
@@ -280,7 +280,9 @@ def safe_get_ticker(symbol):
         return None
 def safe_get_balance(asset):
     try:
-        b = retry(lambda: client.asset_balance(asset), tries=3, base_delay=0.5)
+        b = retry(lambda: client.get_asset_balance(asset=asset), tries=3, base_delay=0.5)
+        if b is None:
+            return 0.0
         return float(b.get('free', 0))
     except Exception as e:
         logger.error(f"Error obteniendo balance para {asset}: {e}")
@@ -334,16 +336,16 @@ def consultar_grok(prompt):
 def precio_medio_si_hay(symbol, lookback_days=30):
     try:
         since = int((now_tz() - timedelta(days=lookback_days)).timestamp() * 1000)
-        trades = retry(lambda: client.my_trades(symbol, startTime=since), tries=2, base_delay=0.6)
-        buys = [t for t in trades if t['isBuyer']]
+        trades = retry(lambda: client.get_my_trades(symbol=symbol, startTime=since), tries=2, base_delay=0.6)
+        buys = [t for t in trades if t.get('isBuyer')]
         if not buys:
             return None
         qty_sum = Decimal('0')
         cost_sum = Decimal('0')
         for t in buys:
-            qty = Decimal(str(t['qty']))
-            price = Decimal(str(t['price']))
-            commission = Decimal(str(t['commission'])) if t['commissionAsset'] == MONEDA_BASE else Decimal('0')
+            qty = Decimal(t['qty'])
+            price = Decimal(t['price'])
+            commission = Decimal(t['commission']) if t['commissionAsset'] == MONEDA_BASE else Decimal('0')
             cost_sum += qty * price + commission
             qty_sum += qty
         if qty_sum > 0:
@@ -355,7 +357,7 @@ def inicializar_registro():
     with LOCK:
         registro = cargar_json(REGISTRO_FILE)
         try:
-            cuenta = retry(lambda: client.account())
+            cuenta = retry(lambda: client.get_account())
             for b in cuenta['balances']:
                 asset = b['asset']
                 free = float(b['free'])
@@ -385,7 +387,7 @@ def inicializar_registro():
                     except Exception:
                         continue
             guardar_json(registro, REGISTRO_FILE)
-        except ClientError as e:
+        except BinanceAPIException as e:
             logger.error(f"Error inicializando registro: {e}")
 # ──────────────────────────────────────────────────────────────────────────────
 # Nueva: Liquidar cartera al inicio
@@ -418,8 +420,8 @@ def liquidar_cartera():
                     if notional_est < meta["minNotional"]:
                         dust_positions.append(symbol)
                         continue
-                # Fuerza venta
-                orden = retry(lambda: client.new_order(symbol=symbol, side='SELL', type='MARKET', quantity=float(qty)), tries=2, base_delay=0.6)
+                # Fuerza venta, usa str(format(qty, 'f')) para evitar scientific notation
+                orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=format(qty, 'f')), tries=2, base_delay=0.6)
                 logger.info(f"Orden de liquidación: {orden}")
                 precio_compra = Decimal(str(data["precio_compra"]))
                 ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
@@ -440,14 +442,17 @@ def liquidar_cartera():
 # ──────────────────────────────────────────────────────────────────────────────
 def mejores_criptos(max_candidates=10):
     try:
-        tickers = retry(lambda: client.ticker_24hr())
+        tickers = retry(lambda: client.get_ticker())
         candidates = [
-            t for t in tickers if t.get("symbol") in ALLOWED_SYMBOLS and float(t.get("quoteVolume", 0)) > MIN_VOLUME and t["symbol"] not in INVALID_SYMBOL_CACHE
+            t for t in tickers
+            if t["symbol"] in ALLOWED_SYMBOLS  # Solo top
+            and float(t.get("quoteVolume", 0)) > MIN_VOLUME
+            and t["symbol"] not in INVALID_SYMBOL_CACHE
         ]
         filtered = []
         for t in candidates[:max_candidates]:
             symbol = t["symbol"]
-            klines = retry(lambda: client.klines(symbol, '1h', limit=15))
+            klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
             closes = [float(k[4]) for k in klines]
             if len(closes) < 15:
                 continue
@@ -461,7 +466,7 @@ def mejores_criptos(max_candidates=10):
                 t['rsi'] = rsi
                 filtered.append(t)
         return sorted(filtered, key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)  # Por volumen
-    except ClientError as e:
+    except BinanceAPIException as e:
         logger.error(f"Error obteniendo tickers: {e}")
         return []
 # ──────────────────────────────────────────────────────────────────────────────
@@ -537,10 +542,10 @@ def comprar():
                 ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
                 if rsi < RSI_BUY_MAX and ganancia_neta > MIN_NET_GAIN_ABS:
                     orden = retry(
-                        lambda: client.new_order(
+                        lambda: client.create_order(
                             symbol=symbol,
-                            side='BUY',
-                            type='MARKET',
+                            side="BUY",
+                            type="MARKET",
                             quoteOrderQty=float(quote_to_spend)
                         ),
                         tries=2, base_delay=0.6
@@ -560,7 +565,7 @@ def comprar():
                     ULTIMAS_OPERACIONES.append(now_ts)
                 else:
                     logger.info(f"No se compra {symbol}: RSI {rsi:.2f}, Ganancia neta {ganancia_neta:.4f}")
-            except ClientError as e:
+            except BinanceAPIException as e:
                 logger.error(f"Error comprando {symbol}: {e}")
                 continue
             except Exception as e:
@@ -585,7 +590,7 @@ def vender_y_convertir():
                     continue
                 precio_actual = Decimal(str(ticker["lastPrice"]))
                 cambio = (precio_actual - precio_compra) / precio_compra
-                klines = retry(lambda: client.klines(symbol, '1h', limit=15))
+                klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
                 closes = [float(k[4]) for k in klines]
                 rsi = calculate_rsi(closes)
                 meta = load_symbol_info(symbol)
@@ -617,7 +622,7 @@ def vender_y_convertir():
                 vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN) and ganancia_neta > MIN_NET_GAIN_ABS
                 if vender_por_stop or vender_por_profit:
                     try:
-                        orden = retry(lambda: client.new_order(symbol=symbol, side='SELL', type='MARKET', quantity=float(qty)), tries=2, base_delay=0.6)
+                        orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=float(qty)), tries=2, base_delay=0.6)
                         logger.info(f"Orden de venta: {orden}")
                         total_hoy = actualizar_pnl_diario(ganancia_neta)
                         motivo = "Stop-loss" if vender_por_stop else "Take-profit/RSI"
@@ -626,7 +631,7 @@ def vender_y_convertir():
                             f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
                             f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}"
                         )
-                    except ClientError as e:
+                    except BinanceAPIException as e:
                         logger.error(f"Error vendiendo {symbol}: {e}")
                         dust_positions.append(symbol)
                         continue
@@ -661,7 +666,7 @@ def vender_y_convertir():
                         price = float(ticker['lastPrice'])
                         buy_price = data['precio_compra']
                         change = (price - buy_price) / buy_price
-                        klines = retry(lambda: client.klines(sym, '1h', limit=15))
+                        klines = retry(lambda: client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
                         closes = [float(k[4]) for k in klines]
                         rsi = calculate_rsi(closes)
                         qty = data['cantidad']
@@ -685,7 +690,7 @@ def vender_y_convertir():
                                     del limpio[worst_sym]
                                     guardar_json(limpio, REGISTRO_FILE)
                                     return
-                                orden = retry(lambda: client.new_order(worst_sym, 'SELL', 'MARKET', quantity=float(qty)))
+                                orden = retry(lambda: client.order_market_sell(symbol=worst_sym, quantity=float(qty)))
                                 logger.info(f"Orden de venta por rotación: {orden}")
                                 total_hoy = actualizar_pnl_diario(worst_net)
                                 enviar_telegram(f"🔄 Vendido {worst_sym} por rotación - PnL: {worst_net:.2f} {MONEDA_BASE}. RSI: {worst_rsi:.2f}. Para comprar {best_symbol}.")
@@ -696,7 +701,7 @@ def vender_y_convertir():
         manage_savings()  # Después de vender, manejar excess
 def resumen_diario():
     try:
-        cuenta = retry(lambda: client.account())
+        cuenta = retry(lambda: client.get_account())
         saldo_savings = get_savings_balance()
         pnl_data = cargar_json(PNL_DIARIO_FILE)
         today = get_current_date()
@@ -711,7 +716,7 @@ def resumen_diario():
         seven_days_ago = (now_tz() - timedelta(days=7)).date().isoformat()
         pnl_data = {k: v for k, v in pnl_data.items() if k >= seven_days_ago}
         guardar_json(pnl_data, PNL_DIARIO_FILE)
-    except ClientError as e:
+    except BinanceAPIException as e:
         logger.error(f"Error en resumen diario: {e}")
 # ──────────────────────────────────────────────────────────────────────────────
 # Inicio
