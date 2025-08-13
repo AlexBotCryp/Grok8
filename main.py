@@ -146,8 +146,8 @@ def get_usdc_flexible_product_id():
     global USDC_PRODUCT_ID
     if USDC_PRODUCT_ID is None:
         try:
-            products = retry(lambda: client.get_simple_earn_flexible_product_list(asset=MONEDA_BASE, status='ALL', featured='ALL', size=5))
-            for product in products['rows']:
+            products = retry(lambda: client.get_savings_flexible_product_list(asset=MONEDA_BASE, status='ALL', featured='ALL', size=5))
+            for product in products:
                 if product['asset'] == MONEDA_BASE:
                     USDC_PRODUCT_ID = product['productId']
                     break
@@ -162,8 +162,8 @@ def get_savings_balance():
         product_id = get_usdc_flexible_product_id()
         if product_id is None:
             return 0.0
-        positions = retry(lambda: client.get_simple_earn_flexible_position(asset=MONEDA_BASE))
-        for pos in positions['rows']:
+        positions = retry(lambda: client.get_savings_flexible_product_position(asset=MONEDA_BASE))
+        for pos in positions:
             if pos['productId'] == product_id:
                 return float(pos['totalAmount'])
         return 0.0
@@ -178,7 +178,7 @@ def subscribe_to_savings(amount: float):
         product_id = get_usdc_flexible_product_id()
         if product_id is None:
             return
-        retry(lambda: client.simple_earn_flexible_subscribe(productId=product_id, amount=amount))
+        retry(lambda: client.savings_purchase_flexible(product_id=product_id, amount=amount))
         logger.info(f"Subscrito {amount:.2f} {MONEDA_BASE} a Flexible Savings.")
         enviar_telegram(f"💰 Subscrito {amount:.2f} {MONEDA_BASE} a yield (Flexible Savings).")
     except Exception as e:
@@ -191,7 +191,7 @@ def redeem_from_savings(amount: float, redeem_type='FAST'):
         product_id = get_usdc_flexible_product_id()
         if product_id is None:
             return
-        retry(lambda: client.simple_earn_flexible_redeem(productId=product_id, amount=amount, type=redeem_type))
+        retry(lambda: client.savings_flexible_redeem(product_id=product_id, amount=amount, type=redeem_type))
         logger.info(f"Redimido {amount:.2f} {MONEDA_BASE} de Flexible Savings ({redeem_type}).")
         enviar_telegram(f"💸 Redimido {amount:.2f} {MONEDA_BASE} de yield para trading.")
         time.sleep(5)  # Espera para que se refleje en balance spot
