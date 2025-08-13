@@ -408,4 +408,336 @@ def liquidar_cartera():
                 meta = load_symbol_info(symbol)
                 if not meta:
                     continue
-                asset = symbol.replace(M
+                asset = symbol.replace(MONEDA_BASE, '')
+                cantidad_wallet = Decimal(str(safe_get_balance(asset)))
+                if cantidad_wallet <= 0:
+                    dust_positions.append(symbol)
+                    continue
+                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
+                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
+                    dust_positions.append(symbol)
+                    continue
+                if meta["applyToMarket"] and meta["minNotional"] > 0:
+                    notional_est = qty * precio_actual
+                    if notional_est < meta["minNotional"]:
+                        dust_positions.append(symbol)
+                        continue
+                # Fuerza venta, usa str(format(qty, 'f')) para evitar scientific notation
+                orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=format(qty, 'f')), tries=2, base_delay=0.6)
+                logger.info(f"Orden de liquidación: {orden}")
+                precio_compra = Decimal(str(data["precio_compra"]))
+                ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
+                comision_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
+                comision_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
+                ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+                total_hoy = actualizar_pnl_diario(ganancia_neta)
+                enviar_telegram(f"🔥 Liquidado {symbol} - PnL: {ganancia_neta:.2f} {MONEDA_BASE}. PnL hoy: {total_hoy:.2f}")
+            except Exception as e:
+                logger.error(f"Error liquidando {symbol}: {e}")
+                dust_positions.append(symbol)
+        limpio = {sym: d for sym, d in registro.items() if sym not in dust_positions}
+        guardar_json(limpio, REGISTRO_FILE)
+        if dust_positions:
+            enviar_telegram(f"🧹 Dust liquidado: {', '.join(dust_positions)}")
+# ──────────────────────────────────────────────────────────────────────────────
+# Selección de criptos (filtrado a top, orden por volumen)
+# ──────────────────────────────────────────────────────────────────────────────
+def mejores_criptos(max_candidates=10):
+    try:
+        tickers = retry(lambda: client.get_ticker())
+        candidates = [
+            t for t in tickers
+            if t["symbol"] in ALLOWED_SYMBOLS  # Solo top
+            and float(t.get("quoteVolume", 0)) > MIN_VOLUME
+            and t["symbol"] not in INVALID_SYMBOL_CACHE
+        ]
+        filtered = []
+        for t in candidates[:max_candidates]:
+            symbol = t["symbol"]
+            klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
+            closes = [float(k[4]) for k in klines]
+            if len(closes) < 15:
+                continue
+            rsi = calculate_rsi(closes)
+            precio = float(t["lastPrice"])
+            ganancia_bruta = precio * TAKE_PROFIT
+            comision_compra = precio * COMMISSION_RATE
+            comision_venta = (precio * (1 + TAKE_PROFIT)) * COMMISSION_RATE
+            ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
+            if ganancia_neta > 0:
+                t['rsi'] = rsi
+                filtered.append(t)
+        return sorted(filtered, key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)  # Por volumen
+    except BinanceAPIException as e:
+        logger.error(f"Error obteniendo tickers: {e}")
+        return []
+# ──────────────────────────────────────────────────────────────────────────────
+# Trading
+# ──────────────────────────────────────────────────────────────────────────────
+def comprar():
+    if not puede_comprar():
+        logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
+        return
+    try:
+        saldo_spot = safe_get_balance(MONEDA_BASE)
+        saldo_savings = get_savings_balance()
+        saldo_total = saldo_spot + saldo_savings
+        logger.info(f"Saldo total {MONEDA_BASE} (spot + savings): {saldo_total:.2f}")
+        if saldo_total < MIN_SALDO_COMPRA:
+            logger.info("Saldo total insuficiente para comprar.")
+            return
+        cantidad_usdc = saldo_total * PORCENTAJE_USDC
+        if saldo_spot < cantidad_usdc:
+            to_redeem = cantidad_usdc - saldo_spot
+            if saldo_savings >= to_redeem:
+                redeem_from_savings(to_redeem)
+                saldo_spot = safe_get_balance(MONEDA_BASE)  # Actualizar
+            else:
+                cantidad_usdc = saldo_spot  # Usar lo disponible en spot
+        criptos = mejores_criptos()
+        registro = cargar_json(REGISTRO_FILE)
+        if len(registro) >= MAX_POSICIONES:
+            logger.info("Máximo de posiciones abiertas alcanzado. No se comprará más.")
+            return
+        compradas = 0
+        now_ts = time.time()
+        global ULTIMAS_OPERACIONES
+        ULTIMAS_OPERACIONES = [t for t in ULTIMAS_OPERACIONES if now_ts - t < 3600]
+        if len(ULTIMAS_OPERACIONES) >= MAX_TRADES_PER_HOUR:
+            logger.info("Tope de operaciones por hora alcanzado. No se compra en este ciclo.")
+            return
+        for cripto in criptos:
+            if compradas >= 1:
+                break
+            symbol = cripto["symbol"]
+            if symbol in registro:
+                continue
+            last = ULTIMA_COMPRA.get(symbol, 0)
+            if now_ts - last < TRADE_COOLDOWN_SEC:
+                logger.info(f"{symbol}: en cooldown de compra.")
+                continue
+            try:
+                ticker = safe_get_ticker(symbol)
+                if not ticker:
+                    continue
+                precio = Decimal(str(ticker["lastPrice"]))
+                if precio <= 0:
+                    logger.info(f"{symbol}: precio inválido ({float(precio):.6f}). Saltando.")
+                    continue
+                rsi = cripto.get("rsi", 50)
+                meta = load_symbol_info(symbol)
+                if not meta:
+                    continue
+                min_quote = min_quote_for_market(symbol, precio)
+                quote_to_spend = Decimal(str(cantidad_usdc))
+                if quote_to_spend < min_quote:
+                    if Decimal(str(saldo_spot)) >= min_quote:
+                        quote_to_spend = min_quote
+                    else:
+                        logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}). Saltando.")
+                        continue
+                quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
+                cantidad = float(quote_to_spend) / float(precio)
+                ganancia_bruta = float(precio) * cantidad * TAKE_PROFIT
+                comision_compra = float(precio) * cantidad * COMMISSION_RATE
+                comision_venta = float(precio) * (1 + TAKE_PROFIT) * cantidad * COMMISSION_RATE
+                ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
+                if rsi < RSI_BUY_MAX and ganancia_neta > MIN_NET_GAIN_ABS:
+                    orden = retry(
+                        lambda: client.create_order(
+                            symbol=symbol,
+                            side="BUY",
+                            type="MARKET",
+                            quoteOrderQty=format(quote_to_spend, 'f')
+                        ),
+                        tries=2, base_delay=0.6
+                    )
+                    logger.info(f"Orden de compra: {orden}")
+                    with LOCK:
+                        registro = cargar_json(REGISTRO_FILE)
+                        registro[symbol] = {
+                            "cantidad": cantidad,
+                            "precio_compra": float(precio),
+                            "timestamp": now_tz().isoformat()
+                        }
+                        guardar_json(registro, REGISTRO_FILE)
+                    enviar_telegram(f"🟢 Comprado {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE} a ~{float(precio):.6f}. RSI: {rsi:.2f}")
+                    compradas += 1
+                    ULTIMA_COMPRA[symbol] = now_ts
+                    ULTIMAS_OPERACIONES.append(now_ts)
+                else:
+                    logger.info(f"No se compra {symbol}: RSI {rsi:.2f}, Ganancia neta {ganancia_neta:.4f}")
+            except BinanceAPIException as e:
+                logger.error(f"Error comprando {symbol}: {e}")
+                continue
+            except Exception as e:
+                logger.error(f"Error inesperado comprando {symbol}: {e}")
+                continue
+        manage_savings()  # Después de comprar, manejar excess
+    except Exception as e:
+        logger.error(f"Error general en compra: {e}")
+def vender_y_convertir():
+    with LOCK:
+        registro = cargar_json(REGISTRO_FILE)
+        nuevos_registro = {}
+        dust_positions = []
+        saldo_usdc_antes = safe_get_balance(MONEDA_BASE)
+        logger.info(f"Saldo {MONEDA_BASE} antes de vender: {saldo_usdc_antes:.2f}")
+        for symbol, data in list(registro.items()):
+            try:
+                precio_compra = Decimal(str(data["precio_compra"]))
+                ticker = safe_get_ticker(symbol)
+                if not ticker:
+                    nuevos_registro[symbol] = data
+                    continue
+                precio_actual = Decimal(str(ticker["lastPrice"]))
+                cambio = (precio_actual - precio_compra) / precio_compra
+                klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
+                closes = [float(k[4]) for k in klines]
+                rsi = calculate_rsi(closes)
+                meta = load_symbol_info(symbol)
+                if not meta:
+                    nuevos_registro[symbol] = data
+                    continue
+                asset = symbol.replace(MONEDA_BASE, '')
+                cantidad_wallet = Decimal(str(safe_get_balance(asset)))
+                if cantidad_wallet <= 0:
+                    logger.info(f"{symbol}: saldo disponible {float(cantidad_wallet):.8f}. Dust, saltando.")
+                    dust_positions.append(symbol)
+                    continue
+                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
+                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
+                    logger.info(f"{symbol}: cantidad {float(qty):.8f} < marketMinQty {float(meta['marketMinQty']):.8f}. Dust, saltando.")
+                    dust_positions.append(symbol)
+                    continue
+                if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_actual > 0:
+                    notional_est = qty * precio_actual
+                    if notional_est < meta["minNotional"] or float(notional_est) < DUST_THRESHOLD:
+                        logger.info(f"{symbol}: notional {float(notional_est):.6f} < threshold. Dust.")
+                        dust_positions.append(symbol)
+                        continue
+                ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
+                comision_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
+                comision_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
+                ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+                vender_por_stop = float(cambio) <= STOP_LOSS
+                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN) and ganancia_neta > MIN_NET_GAIN_ABS
+                if vender_por_stop or vender_por_profit:
+                    try:
+                        orden = retry(lambda: client.order_market_sell(symbol=symbol, quantity=format(qty, 'f')), tries=2, base_delay=0.6)
+                        logger.info(f"Orden de venta: {orden}")
+                        total_hoy = actualizar_pnl_diario(ganancia_neta)
+                        motivo = "Stop-loss" if vender_por_stop else "Take-profit/RSI"
+                        enviar_telegram(
+                            f"🔴 Vendido {symbol} - {float(qty):.8f} a ~{float(precio_actual):.6f} "
+                            f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
+                            f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}"
+                        )
+                    except BinanceAPIException as e:
+                        logger.error(f"Error vendiendo {symbol}: {e}")
+                        dust_positions.append(symbol)
+                        continue
+                else:
+                    nuevos_registro[symbol] = data
+                    logger.info(f"No se vende {symbol}: RSI {rsi:.2f}, Ganancia neta {ganancia_neta:.4f}")
+            except Exception as e:
+                logger.error(f"Error vendiendo {symbol}: {e}")
+                nuevos_registro[symbol] = data
+        limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
+        guardar_json(limpio, REGISTRO_FILE)
+        if dust_positions:
+            enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
+        # Rotación con Grok si saldo bajo
+        saldo_spot = safe_get_balance(MONEDA_BASE)
+        saldo_savings = get_savings_balance()
+        saldo_total = saldo_spot + saldo_savings
+        if saldo_total < MIN_SALDO_COMPRA:
+            criptos = mejores_criptos()
+            if criptos:
+                candidates = [c for c in criptos if c['symbol'] not in limpio]
+                if candidates:
+                    best = candidates[0]
+                    best_symbol = best['symbol']
+                    best_rsi = best['rsi']
+                    best_change = best.get('priceChangePercent', '0')
+                    pos_perfs = []
+                    for sym, data in limpio.items():
+                        ticker = safe_get_ticker(sym)
+                        if not ticker:
+                            continue
+                        price = float(ticker['lastPrice'])
+                        buy_price = data['precio_compra']
+                        change = (price - buy_price) / buy_price
+                        klines = retry(lambda: client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
+                        closes = [float(k[4]) for k in klines]
+                        rsi = calculate_rsi(closes)
+                        qty = data['cantidad']
+                        ganancia_bruta = qty * (price - buy_price)
+                        comision_compra = buy_price * qty * COMMISSION_RATE
+                        comision_venta = price * qty * COMMISSION_RATE
+                        ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+                        pos_perfs.append((sym, change, rsi, ganancia_neta))
+                    if pos_perfs:
+                        pos_perfs.sort(key=lambda x: x[1])  # Peor primero
+                        worst_sym, worst_change, worst_rsi, worst_net = pos_perfs[0]
+                        prompt = f"Debo vender {worst_sym} con RSI {worst_rsi:.2f}, ganancia neta {worst_net:.4f} para liberar fondos y comprar {best_symbol} con RSI {best_rsi:.2f} y cambio {best_change}%? Responde solo con 'si' o 'no'."
+                        respuesta = consultar_grok(prompt)
+                        if 'si' in respuesta:
+                            try:
+                                meta = load_symbol_info(worst_sym)
+                                asset = worst_sym.replace(MONEDA_BASE, '')
+                                cantidad_wallet = Decimal(str(safe_get_balance(asset)))
+                                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
+                                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
+                                    del limpio[worst_sym]
+                                    guardar_json(limpio, REGISTRO_FILE)
+                                    return
+                                orden = retry(lambda: client.order_market_sell(symbol=worst_sym, quantity=format(qty, 'f')))
+                                logger.info(f"Orden de venta por rotación: {orden}")
+                                total_hoy = actualizar_pnl_diario(worst_net)
+                                enviar_telegram(f"🔄 Vendido {worst_sym} por rotación - PnL: {worst_net:.2f} {MONEDA_BASE}. RSI: {worst_rsi:.2f}. Para comprar {best_symbol}.")
+                                del limpio[worst_sym]
+                                guardar_json(limpio, REGISTRO_FILE)
+                            except Exception as e:
+                                logger.error(f"Error en venta por rotación {worst_sym}: {e}")
+        manage_savings()  # Después de vender, manejar excess
+def resumen_diario():
+    try:
+        cuenta = retry(lambda: client.get_account())
+        saldo_savings = get_savings_balance()
+        pnl_data = cargar_json(PNL_DIARIO_FILE)
+        today = get_current_date()
+        pnl_hoy_v = pnl_data.get(today, 0)
+        mensaje = f"📊 Resumen diario ({today}):\nPNL hoy: {pnl_hoy_v:.2f} {MONEDA_BASE} (fees estimadas incluidas)\nBalances:\n"
+        for b in cuenta["balances"]:
+            total = float(b["free"]) + float(b["locked"])
+            if total > 0.001:
+                mensaje += f"{b['asset']}: {total:.6f}\n"
+        mensaje += f"{MONEDA_BASE} in Savings: {saldo_savings:.2f}\n"
+        enviar_telegram(mensaje)
+        seven_days_ago = (now_tz() - timedelta(days=7)).date().isoformat()
+        pnl_data = {k: v for k, v in pnl_data.items() if k >= seven_days_ago}
+        guardar_json(pnl_data, PNL_DIARIO_FILE)
+    except BinanceAPIException as e:
+        logger.error(f"Error en resumen diario: {e}")
+# ──────────────────────────────────────────────────────────────────────────────
+# Inicio
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    inicializar_registro()
+    liquidar_cartera()  # Vende todo al inicio
+    manage_savings()  # Inicializar savings
+    enviar_telegram("🤖 Bot IA mejorado: Más movimiento, yield en USDC idle via Flexible Savings (~11-12% APR), liquidación inicial completada.")
+    scheduler = BackgroundScheduler(timezone=TZ_MADRID)
+    scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")
+    scheduler.add_job(vender_y_convertir, 'interval', minutes=10, id="vender")
+    scheduler.add_job(manage_savings, 'interval', minutes=10, id="manage_savings")
+    scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
+    scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
+    scheduler.start()
+    try:
+        while True:
+            time.sleep(10)
+    except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown()
+        logger.info("Bot detenido.")
