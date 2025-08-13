@@ -146,7 +146,7 @@ def get_usdc_flexible_product_id():
     global USDC_PRODUCT_ID
     if USDC_PRODUCT_ID is None:
         try:
-            products = retry(lambda: client.savings_flexible_product_list(asset=MONEDA_BASE, status='ALL', featured='ALL', size=5))
+            products = retry(lambda: client.get_simple_earn_flexible_product_list(asset=MONEDA_BASE, status='ALL', featured='ALL', size=5))
             for product in products:
                 if product['asset'] == MONEDA_BASE:
                     USDC_PRODUCT_ID = product['productId']
@@ -162,7 +162,7 @@ def get_savings_balance():
         product_id = get_usdc_flexible_product_id()
         if product_id is None:
             return 0.0
-        positions = retry(lambda: client.savings_flexible_product_position(asset=MONEDA_BASE))
+        positions = retry(lambda: client.get_simple_earn_flexible_position(asset=MONEDA_BASE))
         for pos in positions:
             if pos['productId'] == product_id:
                 return float(pos['totalAmount'])
@@ -178,7 +178,7 @@ def subscribe_to_savings(amount: float):
         product_id = get_usdc_flexible_product_id()
         if product_id is None:
             return
-        retry(lambda: client.savings_purchase_flexible(productId=product_id, amount=str(amount)))
+        retry(lambda: client.post_simple_earn_flexible_subscription(productId=product_id, amount=str(amount)))
         logger.info(f"Subscrito {amount:.2f} {MONEDA_BASE} a Flexible Savings.")
         enviar_telegram(f"💰 Subscrito {amount:.2f} {MONEDA_BASE} a yield (Flexible Savings).")
     except Exception as e:
@@ -191,7 +191,7 @@ def redeem_from_savings(amount: float, redeem_type='FAST'):
         product_id = get_usdc_flexible_product_id()
         if product_id is None:
             return
-        retry(lambda: client.savings_flexible_redeem(productId=product_id, amount=str(amount), type=redeem_type))
+        retry(lambda: client.post_simple_earn_flexible_redemption(productId=product_id, amount=str(amount), type=redeem_type))
         logger.info(f"Redimido {amount:.2f} {MONEDA_BASE} de Flexible Savings ({redeem_type}).")
         enviar_telegram(f"💸 Redimido {amount:.2f} {MONEDA_BASE} de yield para trading.")
         time.sleep(5)  # Espera para que se refleje en balance spot
@@ -725,7 +725,7 @@ if __name__ == "__main__":
     inicializar_registro()
     liquidar_cartera()  # Vende todo al inicio
     manage_savings()  # Inicializar savings
-    enviar_telegram("🤖 Bot IA mejorado: Más movimiento, yield en USDC idle via Flexible Savings (~11-12% APR), liquidación inicial completada.")
+    enviar_telegram("🤖 Bot IA mejorado: Más movimiento, yield en USDC idle via Flexible Savings (up to 12% APR), liquidación inicial completada.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=10, id="vender")
