@@ -39,7 +39,8 @@ logger = logging.getLogger("bot-ia")
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+# Soporta ambas variables para Telegram
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 
 GROK_API_KEY = os.getenv("GROK_API_KEY") or ""
@@ -88,6 +89,7 @@ _LAST_GROK_TS = 0
 # Yield on idle USDC (Simple Earn)
 MIN_RESERVE_USDC = 100
 USDC_PRODUCT_ID = None
+PRODUCT_RULES = {"min": None, "precision": 6}  # reglas opcionales del producto
 
 # Estado y clientes
 client = Client(API_KEY, API_SECRET)
@@ -164,24 +166,58 @@ def retry(fn, tries=3, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
 BINANCE_BASE_URL = "https://api.binance.com"  # SAPI v1
 
 def _sapi_request(method: str, path: str, params: dict | None = None, api_key: str = API_KEY, api_secret: str = API_SECRET):
+    """
+    GET: firma + params en query.
+    POST: firma + params en BODY (form-encoded). ← evita 400 'amount' missing.
+    """
     if params is None:
         params = {}
     params["timestamp"] = int(time.time() * 1000)
     params.setdefault("recvWindow", 5000)
+
     query = urlencode(params, doseq=True)
     signature = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
-    url = f"{BINANCE_BASE_URL}{path}?{query}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
 
     if method.upper() == "GET":
+        url = f"{BINANCE_BASE_URL}{path}?{query}&signature={signature}"
         r = requests.get(url, headers=headers, timeout=10)
     elif method.upper() == "POST":
-        r = requests.post(url, headers=headers, timeout=10)
+        url = f"{BINANCE_BASE_URL}{path}"
+        payload = query + "&signature=" + signature
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        r = requests.post(url, headers=headers, data=payload, timeout=10)
     else:
         raise ValueError("Método HTTP no soportado.")
+
     if r.status_code >= 400:
         raise Exception(f"SAPI error {r.status_code}: {r.text}")
     return r.json()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers de Decimal / formateo de amount
+# ──────────────────────────────────────────────────────────────────────────────
+def dec(x: str) -> Decimal:
+    try:
+        return Decimal(x)
+    except (InvalidOperation, TypeError):
+        return Decimal('0')
+
+def fmt_amount_with_rules(x) -> str:
+    """
+    Aplica precisión del producto (si está disponible) y mínimo.
+    Evita notación científica. Recorta ceros finales.
+    """
+    prec = PRODUCT_RULES.get("precision", 6) or 6
+    q = "1" if prec == 0 else "0." + "0" * (prec - 1) + "1"
+    d = Decimal(str(x)).quantize(Decimal(q), rounding=ROUND_DOWN)
+    mn = PRODUCT_RULES.get("min")
+    if isinstance(mn, Decimal) and mn > 0 and d < mn:
+        d = mn
+    s = format(d.normalize(), 'f')
+    if '.' in s:
+        s = s.rstrip('0').rstrip('.') or '0'
+    return s
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PnL diario / Riesgo
@@ -214,8 +250,10 @@ def reset_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 # Simple Earn (vía SAPI)
 # ──────────────────────────────────────────────────────────────────────────────
+USDC_PRODUCT_ID = None
+
 def get_usdc_flexible_product_id():
-    global USDC_PRODUCT_ID
+    global USDC_PRODUCT_ID, PRODUCT_RULES
     if USDC_PRODUCT_ID is not None:
         return USDC_PRODUCT_ID
     try:
@@ -228,6 +266,15 @@ def get_usdc_flexible_product_id():
         for p in rows:
             if p.get("asset") == MONEDA_BASE:
                 USDC_PRODUCT_ID = p.get("productId")
+                # guarda reglas si existen
+                try:
+                    PRODUCT_RULES["min"] = dec(str(p.get("minPurchaseAmount", "0") or "0"))
+                except Exception:
+                    PRODUCT_RULES["min"] = None
+                try:
+                    PRODUCT_RULES["precision"] = int(p.get("purchaseAmountPrecision", 6) or 6)
+                except Exception:
+                    PRODUCT_RULES["precision"] = 6
                 break
         if not USDC_PRODUCT_ID:
             logger.warning("No se encontró producto Flexible Savings para USDC.")
@@ -262,10 +309,13 @@ def subscribe_to_savings(amount: float):
         retry(lambda: _sapi_request(
             "POST",
             "/sapi/v1/simple-earn/flexible/subscribe",
-            {"productId": pid, "amount": str(amount)}
+            {
+                "productId": pid,
+                "amount": fmt_amount_with_rules(amount)
+            }
         ))
-        logger.info(f"Subscrito {amount:.2f} {MONEDA_BASE} a Flexible Savings.")
-        enviar_telegram(f"💰 Subscrito {amount:.2f} {MONEDA_BASE} a yield (Flexible Savings).")
+        logger.info(f"Subscrito {float(amount):.6f} {MONEDA_BASE} a Flexible Savings.")
+        enviar_telegram(f"💰 Subscrito {float(amount):.2f} {MONEDA_BASE} a yield (Flexible Savings).")
     except Exception as e:
         logger.warning(f"Error subscribiendo a savings: {e}")
 
@@ -279,10 +329,13 @@ def redeem_from_savings(amount: float, redeem_type="FAST"):
         retry(lambda: _sapi_request(
             "POST",
             "/sapi/v1/simple-earn/flexible/redeem",
-            {"productId": pid, "amount": str(amount)}
+            {
+                "productId": pid,
+                "amount": fmt_amount_with_rules(amount)
+            }
         ))
-        logger.info(f"Redimido {amount:.2f} {MONEDA_BASE} de Flexible Savings.")
-        enviar_telegram(f"💸 Redimido {amount:.2f} {MONEDA_BASE} de yield para trading.")
+        logger.info(f"Redimido {float(amount):.6f} {MONEDA_BASE} de Flexible Savings.")
+        enviar_telegram(f"💸 Redimido {float(amount):.2f} {MONEDA_BASE} de yield para trading.")
         time.sleep(5)
     except Exception as e:
         logger.warning(f"Error redimiendo de savings: {e}")
@@ -303,12 +356,6 @@ def manage_savings():
 # ──────────────────────────────────────────────────────────────────────────────
 # Mercado: info símbolos y precisión
 # ──────────────────────────────────────────────────────────────────────────────
-def dec(x: str) -> Decimal:
-    try:
-        return Decimal(x)
-    except (InvalidOperation, TypeError):
-        return Decimal('0')
-
 def load_symbol_info(symbol):
     if symbol in INVALID_SYMBOL_CACHE:
         return None
@@ -907,7 +954,7 @@ if __name__ == "__main__":
     inicializar_registro()
     liquidar_cartera()
     manage_savings()
-    enviar_telegram("🤖 Bot IA mejorado: robusto (cuantización, fallback LOT_SIZE, Simple Earn vía SAPI firmada) y yield en USDC idle.")
+    enviar_telegram("🤖 Bot IA mejorado: robusto (cuantización, fallback LOT_SIZE, Simple Earn vía SAPI firmada con body form) y yield en USDC idle.")
 
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")
