@@ -101,6 +101,22 @@ ULTIMA_COMPRA = {}
 ULTIMAS_OPERACIONES = []
 DUST_THRESHOLD = 0.5  # Baja para limpiar más dust
 
+# Nuevo: Cache para tickers para evitar bans por rate limit
+TICKERS_CACHE = {}  # {symbol: {'data': ticker, 'ts': time}}
+
+def get_cached_ticker(symbol):
+    now = time.time()
+    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 60:  # Cache 1 min
+        return TICKERS_CACHE[symbol]['data']
+    try:
+        t = retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5)
+        if t and float(t.get('lastPrice', 0)) > 0:
+            TICKERS_CACHE[symbol] = {'data': t, 'ts': now}
+            return t
+    except Exception as e:
+        logger.error(f"Error cache ticker {symbol}: {e}")
+    return None
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilidades generales (sin cambios mayores)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -248,18 +264,7 @@ def min_quote_for_market(symbol) -> Decimal:
     return (meta["minNotional"] * Decimal('1.01')).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
 
 def safe_get_ticker(symbol):
-    try:
-        t = retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5)
-        if not t:
-            return None
-        lp = float(t.get('lastPrice', 0) or 0)
-        if lp <= 0:
-            logger.info(f"Precio inválido para {symbol}")
-            return None
-        return t
-    except Exception as e:
-        logger.error(f"Error obteniendo ticker {symbol}: {e}")
-        return None
+    return get_cached_ticker(symbol)  # Usar cache
 
 def safe_get_balance(asset):
     try:
@@ -438,19 +443,22 @@ def executed_qty_from_order(order_resp) -> float:
     return 0.0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Selección de criptos — añadido check EMA
+# Selección de criptos — optimizado con cache para evitar rate limits
 # ──────────────────────────────────────────────────────────────────────────────
 def mejores_criptos(max_candidates=15):  # +5 candidates
     try:
-        tickers = retry(lambda: client.get_ticker())
-        candidates = [
-            t for t in tickers
-            if t.get("symbol") in ALLOWED_SYMBOLS
-            and float(t.get("quoteVolume", 0) or 0) > MIN_VOLUME
-            and t.get("symbol") not in INVALID_SYMBOL_CACHE
-        ]
+        candidates = []
+        for sym in ALLOWED_SYMBOLS:
+            if sym in INVALID_SYMBOL_CACHE:
+                continue
+            t = get_cached_ticker(sym)
+            if not t:
+                continue
+            vol = float(t.get("quoteVolume", 0) or 0)
+            if vol > MIN_VOLUME:
+                candidates.append(t)
         filtered = []
-        for t in candidates[:max_candidates]:
+        for t in sorted(candidates, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:max_candidates]:
             symbol = t["symbol"]
             klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=20))  # +5 para EMA
             closes = [float(k[4]) for k in klines]
@@ -469,6 +477,7 @@ def mejores_criptos(max_candidates=15):  # +5 candidates
                 t['rsi'] = rsi
                 t['ema5'] = ema5
                 filtered.append(t)
+            time.sleep(0.2)  # Pequeño delay para rate limits
         return sorted(filtered, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
     except BinanceAPIException as e:
         logger.error(f"Error obteniendo tickers: {e}")
@@ -647,4 +656,127 @@ def vender_y_convertir():
                             f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
                             f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}"
                         )
-                    except BinanceAPIException as e
+                    except BinanceAPIException as e:
+                        logger.error(f"Error vendiendo {symbol}: {e}")
+                        dust_positions.append(symbol)
+                        continue
+                else:
+                    nuevos_registro[symbol] = data
+                    logger.info(f"No se vende {symbol}: RSI {rsi:.2f}, Ganancia neta {ganancia_neta:.4f}")
+            except Exception as e:
+                logger.error(f"Error vendiendo {symbol}: {e}")
+                nuevos_registro[symbol] = data
+
+        limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
+        guardar_json(limpio, REGISTRO_FILE)
+        if dust_positions:
+            enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
+
+        # Rotación — más agresiva con Grok
+        if ENABLE_GROK_ROTATION:
+            try:
+                registro = cargar_json(REGISTRO_FILE)
+                if not registro:
+                    return
+                criptos = mejores_criptos()
+                if criptos:
+                    candidates = [c for c in criptos if c['symbol'] not in registro]
+                    if candidates:
+                        best = candidates[0]
+                        best_symbol = best['symbol']
+                        best_rsi = best.get('rsi', 50)
+                        pos_perfs = []
+                        for sym, data in registro.items():
+                            ticker = safe_get_ticker(sym)
+                            if not ticker:
+                                continue
+                            price = float(ticker['lastPrice'])
+                            buy_price = data['precio_compra']
+                            change = (price - buy_price) / buy_price if buy_price else 0
+                            klines = retry(lambda: client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
+                            closes = [float(k[4]) for k in klines]
+                            rsi = calculate_rsi(closes)
+                            qty = data['cantidad']
+                            ganancia_bruta = qty * (price - buy_price)
+                            comision_compra = buy_price * qty * COMMISSION_RATE
+                            comision_venta = price * qty * COMMISSION_RATE
+                            ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+                            pos_perfs.append((sym, change, rsi, ganancia_neta))
+                        if pos_perfs:
+                            pos_perfs.sort(key=lambda x: x[1])  # peor primero
+                            worst_sym, worst_change, worst_rsi, worst_net = pos_perfs[0]
+                            prompt = (
+                                f"Debo rotar vendiendo {worst_sym} (cambio {worst_change*100:.2f}%, RSI {worst_rsi:.2f}, net {worst_net:.4f}) "
+                                f"a {best_symbol} (RSI {best_rsi:.2f}, volumen alto)? Sé atrevido, responde 'si' o 'no'."
+                            )
+                            respuesta = consultar_grok(prompt)
+                            if 'si' in respuesta:
+                                try:
+                                    meta = load_symbol_info(worst_sym)
+                                    asset = base_from_symbol(worst_sym)
+                                    cantidad_wallet = dec(str(safe_get_balance(asset)))
+                                    qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
+                                    if qty < meta["marketMinQty"] or qty <= Decimal('0'):
+                                        del registro[worst_sym]
+                                        guardar_json(registro, REGISTRO_FILE)
+                                        return
+                                    orden = market_sell_with_fallback(worst_sym, qty, meta)
+                                    logger.info(f"Rotación: vendido {worst_sym}: {orden}")
+                                    total_hoy = actualizar_pnl_diario(worst_net)
+                                    enviar_telegram(f"🔄 Rotación atrevida: vendido {worst_sym} (PnL neto {worst_net:.2f}). Para {best_symbol}. Grok: sí")
+                                    del registro[worst_sym]
+                                    guardar_json(registro, REGISTRO_FILE)
+                                except Exception as e:
+                                    logger.error(f"Error en venta por rotación {worst_sym}: {e}")
+            except Exception as e:
+                logger.error(f"Error en bloque de rotación: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resumen diario — añadido más detalles PNL
+# ──────────────────────────────────────────────────────────────────────────────
+def resumen_diario():
+    try:
+        cuenta = retry(lambda: client.get_account())
+        pnl_data = cargar_json(PNL_DIARIO_FILE)
+        today = get_current_date()
+        pnl_hoy_v = pnl_data.get(today, 0)
+        mensaje = f"📊 Resumen diario ({today}):\nPNL hoy: {pnl_hoy_v:.2f} {MONEDA_BASE}\nBalances:\n"
+        total_value = 0
+        for b in cuenta["balances"]:
+            total = float(b["free"]) + float(b["locked"])
+            if total > 0.001:
+                mensaje += f"{b['asset']}: {total:.6f}\n"
+                if b['asset'] != MONEDA_BASE:
+                    symbol = b['asset'] + MONEDA_BASE
+                    ticker = safe_get_ticker(symbol)
+                    if ticker:
+                        total_value += total * float(ticker['lastPrice'])
+                else:
+                    total_value += total
+        mensaje += f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}"
+        enviar_telegram(mensaje)
+        seven_days_ago = (now_tz() - timedelta(days=7)).date().isoformat()
+        pnl_data = {k: v for k, v in pnl_data.items() if k >= seven_days_ago}
+        guardar_json(pnl_data, PNL_DIARIO_FILE)
+    except BinanceAPIException as e:
+        logger.error(f"Error en resumen diario: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Inicio (sin cambios)
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    inicializar_registro()
+    enviar_telegram("🤖 Bot IA activo y más atrevido: RSI/TP/SL optimizados, trailing, Grok más usado. Cartera inicial conservada.")
+
+    scheduler = BackgroundScheduler(timezone=TZ_MADRID)
+    scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")
+    scheduler.add_job(vender_y_convertir, 'interval', minutes=5, id="vender")  # Más frecuente (cada 5 min)
+    scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
+    scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
+    scheduler.start()
+    try:
+        while True:
+            time.sleep(10)
+    except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown()
+        logger.info("Bot detenido.")
