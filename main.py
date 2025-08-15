@@ -714,7 +714,7 @@ def vender_y_convertir():
                 vender_por_stop = float(cambio) <= STOP_LOSS or trailing_trigger
                 vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN) and ganancia_neta > MIN_NET_GAIN_ABS
 
-                if vender_por_stop or vender_por_profit:
+                if vender_por_stop o=vender_por_profit:
                     # Confirmar con Grok si la ganancia neta es baja
                     grok_ok = True
                     if ganancia_neta < 1:
@@ -791,7 +791,7 @@ def vender_y_convertir():
                                 f"a {best_symbol} (RSI {best_rsi:.2f}, volumen alto)? Sé atrevido, responde 'si' o 'no'."
                             )
                             respuesta = consultar_grok(prompt)
-                            if 'si' in respuesta or not ENABLE_GROK_ROTATION:
+                            if 'si' in respuesta o=not ENABLE_GROK_ROTATION:
                                 try:
                                     meta = load_symbol_info(worst_sym)
                                     asset = base_from_symbol(worst_sym)
