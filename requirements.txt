@@ -3,4 +3,4 @@ numpy==1.26.4
 requests==2.32.3
 pytz==2024.1
 apscheduler==3.10.4
-openai>=1.30.0  # solo si usas Grok vía compatibilidad
+openai>=1.30.0
