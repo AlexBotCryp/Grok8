@@ -1,24 +1,3 @@
-The error you’re seeing from the Binance API (code -1003) means your IP has been temporarily banned due to exceeding the request weight limits (too many API calls in a short time). This is common with polling-based bots like this one, especially if there are many symbols, frequent jobs, or retries that amplify calls.
-When the ban ends:
-Based on the timestamp in the error (1755283850443, which is in milliseconds), the ban lifts at 2025-08-15 18:50:50 UTC. That’s today—wait about 45 minutes from now (assuming your log time of ~18:05). After that, the script should resume normal API access. If you’re on Render, restarting the service won’t help during the ban, as it’s IP-based.
-Why it happened:
-	•	The script makes calls to get_ticker, get_klines, etc., for multiple symbols every 5-10 minutes.
-	•	Binance limits: ~1200 weight/minute for spot API; calls like get_klines cost 1-2 weight, but looping over 10+ symbols + retries can exceed this quickly.
-	•	No WebSockets: The error suggests using streams for live updates, but this script polls (which is simpler but less efficient).
-How to prevent future bans:
-	•	Wait out the current ban: Don’t run the script until after 18:50 UTC.
-	•	Optimize the script (changes I’ve made below):
-	◦	Reduced max_candidates to 5 (fewer klines calls).
-	◦	Increased sleep in loops to 1 second.
-	◦	Reduced job frequency: comprar every 15 min, vender_y_convertir every 10 min.
-	◦	If bans persist, consider implementing Binance WebSockets for prices (more advanced; I can help rewrite if needed).
-	•	On Render: Set a cron or env var to limit runs. Use a VPN/proxy if bans recur (but that’s against Binance TOS).
-	•	Test in sandbox: Use Binance testnet API keys to test without real limits.
-Telegram not sending:
-	•	This logs “[TELEGRAM DESACTIVADO]” if TELEGRAM_TOKEN or TELEGRAM_CHAT_ID aren’t set in your Render environment variables.
-	•	Fix: In Render dashboard > Environment > Add vars for TELEGRAM_TOKEN (your bot token) and TELEGRAM_CHAT_ID (your chat ID). Restart the service.
-	•	If set but still failing, check logs for “Telegram falló” errors (e.g., invalid token or network issue).
-Here’s the complete, fixed script with optimizations to reduce API calls. Copy-paste it into your main.py on GitHub/Render.
 # -*- coding: utf-8 -*-
 import os
 import time
@@ -478,6 +457,7 @@ def mejores_criptos(max_candidates=5):  # Reducido a 5 para menos calls
             vol = float(t.get("quoteVolume", 0) or 0)
             if vol > MIN_VOLUME:
                 candidates.append(t)
+            time.sleep(0.5)  # Delay por symbol para rate
         filtered = []
         for t in sorted(candidates, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:max_candidates]:
             symbol = t["symbol"]
@@ -602,6 +582,7 @@ def comprar():
                     logger.info(f"Grok dice no a {symbol}")
             else:
                 logger.info(f"No se compra {symbol}: RSI {rsi:.2f} > {RSI_BUY_MAX}")
+            time.sleep(1)  # Delay en loop
     except Exception as e:
         logger.error(f"Error general en compra: {e}")
 
@@ -687,6 +668,7 @@ def vender_y_convertir():
             except Exception as e:
                 logger.error(f"Error vendiendo {symbol}: {e}")
                 nuevos_registro[symbol] = data
+            time.sleep(1)  # Delay en loop
 
         limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
         guardar_json(limpio, REGISTRO_FILE)
@@ -723,6 +705,7 @@ def vender_y_convertir():
                             comision_venta = price * qty * COMMISSION_RATE
                             ganancia_neta = ganancia_bruta - comision_compra - comision_venta
                             pos_perfs.append((sym, change, rsi, ganancia_neta))
+                            time.sleep(1)  # Delay en loop
                         if pos_perfs:
                             pos_perfs.sort(key=lambda x: x[1])  # peor primero
                             worst_sym, worst_change, worst_rsi, worst_net = pos_perfs[0]
@@ -774,6 +757,7 @@ def resumen_diario():
                         total_value += total * float(ticker['lastPrice'])
                 else:
                     total_value += total
+            time.sleep(0.5)  # Delay en loop
         mensaje += f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}"
         enviar_telegram(mensaje)
         seven_days_ago = (now_tz() - timedelta(days=7)).date().isoformat()
