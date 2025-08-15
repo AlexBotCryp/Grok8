@@ -1,12 +1,4 @@
- """
-Bloque seguro (evita SyntaxError por comillas tipográficas).
-Si alguna vez pegas arriba del archivo un texto con comillas “curvas”, al estar dentro
-de este docstring no romperá el parser de Python.
-
-Además, este bot implementa un backoff robusto para evitar errores -1003 (rate limit) de Binance.
-"""
-
-# -*- coding: utf-8 -*-
+-*- coding: utf-8 -*-
 import os
 import time
 import json
