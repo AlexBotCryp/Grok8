@@ -1,3 +1,24 @@
+The error you’re seeing from the Binance API (code -1003) means your IP has been temporarily banned due to exceeding the request weight limits (too many API calls in a short time). This is common with polling-based bots like this one, especially if there are many symbols, frequent jobs, or retries that amplify calls.
+When the ban ends:
+Based on the timestamp in the error (1755283850443, which is in milliseconds), the ban lifts at 2025-08-15 18:50:50 UTC. That’s today—wait about 45 minutes from now (assuming your log time of ~18:05). After that, the script should resume normal API access. If you’re on Render, restarting the service won’t help during the ban, as it’s IP-based.
+Why it happened:
+	•	The script makes calls to get_ticker, get_klines, etc., for multiple symbols every 5-10 minutes.
+	•	Binance limits: ~1200 weight/minute for spot API; calls like get_klines cost 1-2 weight, but looping over 10+ symbols + retries can exceed this quickly.
+	•	No WebSockets: The error suggests using streams for live updates, but this script polls (which is simpler but less efficient).
+How to prevent future bans:
+	•	Wait out the current ban: Don’t run the script until after 18:50 UTC.
+	•	Optimize the script (changes I’ve made below):
+	◦	Reduced max_candidates to 5 (fewer klines calls).
+	◦	Increased sleep in loops to 1 second.
+	◦	Reduced job frequency: comprar every 15 min, vender_y_convertir every 10 min.
+	◦	If bans persist, consider implementing Binance WebSockets for prices (more advanced; I can help rewrite if needed).
+	•	On Render: Set a cron or env var to limit runs. Use a VPN/proxy if bans recur (but that’s against Binance TOS).
+	•	Test in sandbox: Use Binance testnet API keys to test without real limits.
+Telegram not sending:
+	•	This logs “[TELEGRAM DESACTIVADO]” if TELEGRAM_TOKEN or TELEGRAM_CHAT_ID aren’t set in your Render environment variables.
+	•	Fix: In Render dashboard > Environment > Add vars for TELEGRAM_TOKEN (your bot token) and TELEGRAM_CHAT_ID (your chat ID). Restart the service.
+	•	If set but still failing, check logs for “Telegram falló” errors (e.g., invalid token or network issue).
+Here’s the complete, fixed script with optimizations to reduce API calls. Copy-paste it into your main.py on GitHub/Render.
 # -*- coding: utf-8 -*-
 import os
 import time
@@ -445,7 +466,7 @@ def executed_qty_from_order(order_resp) -> float:
 # ──────────────────────────────────────────────────────────────────────────────
 # Selección de criptos — optimizado con cache para evitar rate limits
 # ──────────────────────────────────────────────────────────────────────────────
-def mejores_criptos(max_candidates=15):  # +5 candidates
+def mejores_criptos(max_candidates=5):  # Reducido a 5 para menos calls
     try:
         candidates = []
         for sym in ALLOWED_SYMBOLS:
@@ -477,7 +498,7 @@ def mejores_criptos(max_candidates=15):  # +5 candidates
                 t['rsi'] = rsi
                 t['ema5'] = ema5
                 filtered.append(t)
-            time.sleep(0.2)  # Pequeño delay para rate limits
+            time.sleep(1)  # Aumentado delay para rate limits
         return sorted(filtered, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
     except BinanceAPIException as e:
         logger.error(f"Error obteniendo tickers: {e}")
@@ -769,8 +790,8 @@ if __name__ == "__main__":
     enviar_telegram("🤖 Bot IA activo y más atrevido: RSI/TP/SL optimizados, trailing, Grok más usado. Cartera inicial conservada.")
 
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")
-    scheduler.add_job(vender_y_convertir, 'interval', minutes=5, id="vender")  # Más frecuente (cada 5 min)
+    scheduler.add_job(comprar, 'interval', minutes=15, id="comprar")  # Reducido frecuencia
+    scheduler.add_job(vender_y_convertir, 'interval', minutes=10, id="vender")  # Reducido frecuencia
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
