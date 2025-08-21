@@ -13,9 +13,6 @@ from datetime import datetime, timedelta
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
-import sys
-
-sys.setrecursionlimit(1500)  # Increase recursion limit to avoid depth errors
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -35,36 +32,36 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 # xAI / Grok (OpenAI-compatible)
 XAI_API_KEY = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY") or ""
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-4-0709").strip()
-GROK_MINUTES = int(os.getenv("GROK_MINUTES", "3"))  # reducido para más uso, pero cauto
+GROK_MINUTES = int(os.getenv("GROK_MINUTES", "15"))  # aumentado para menos consultas y cautela
 
 # Mercado / símbolos
 MONEDA_BASE = os.getenv("MONEDA_BASE", "USDC").upper()
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "50000"))  # reducido para más candidatos
-MAX_POSICIONES = int(os.getenv("MAX_POSICIONES", "1"))  # 1 para rotación con 100% saldo, alto riesgo
-MIN_SALDO_COMPRA = float(os.getenv("MIN_SALDO_COMPRA", "5"))  # reducido para usar casi todo
-PORCENTAJE_USDC = float(os.getenv("PORCENTAJE_USDC", "1.0"))  # 100% para meter todo el saldo
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "1000000"))  # aumentado para activos líquidos y menos fees implícitos
+MAX_POSICIONES = int(os.getenv("MAX_POSICIONES", "2"))  # limitado para menos exposición
+MIN_SALDO_COMPRA = float(os.getenv("MIN_SALDO_COMPRA", "100"))  # aumentado para trades más grandes, menos fees relativos
+PORCENTAJE_USDC = float(os.getenv("PORCENTAJE_USDC", "0.4"))  # menos % por trade para diversificar
 ALLOWED_SYMBOLS = [
     s.strip().upper() for s in os.getenv(
         "ALLOWED_SYMBOLS",
-        "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,XRPUSDC,DOGEUSDC,ADAUSDC,PEPEUSDC,TONUSDC,SHIBUSDC,AVAXUSDC,DOTUSDC,LINKUSDC,TRXUSDC,MATICUSDC,UNIUSDC,LTCUSDC,NEARUSDC,BCHUSDC,FETUSDC"
+        "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,XRPUSDC,ADAUSDC,TONUSDC,LINKUSDC"
     ).split(",") if s.strip()
-]  # más símbolos para más oportunidades y agresividad
+]  # símbolos más estables y líquidos para reducir slippage y fees
 
-# Estrategia (más agresiva y riesgosa: TP bajo, SL más amplio para permitir drawdowns)
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.4")) / 100.0      # +0.4% para ventas rápidas
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-2.0")) / 100.0         # -2.0% más riesgo, permite pérdidas mayores
-TRAILING_STOP = float(os.getenv("TRAILING_STOP", "1.0")) / 100.0  # -1.0% trailing más loose para riesgo
-COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", "0.001"))    # 0.1%
-RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "65"))               # <65, muy permisivo
-RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "45"))             # >45, muy permisivo
-MIN_NET_GAIN_ABS = float(os.getenv("MIN_NET_GAIN_ABS", "0.005"))  # umbral muy bajo
+# Estrategia (conservadora: TP alto para cubrir fees, SL estricto, min net alto)
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "1.5")) / 100.0      # +1.5% mínimo para cubrir fees round-trip (~0.2%)
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.8")) / 100.0         # -0.8% corte rápido
+TRAILING_STOP = float(os.getenv("TRAILING_STOP", "0.6")) / 100.0  # -0.6% protege ganancias
+COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", "0.001"))    # 0.1%, ajustable
+RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "45"))               # <45, sobreventa moderada
+RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "65"))             # >65, sobrecompra moderada
+MIN_NET_GAIN_ABS = float(os.getenv("MIN_NET_GAIN_ABS", "0.5"))    # umbral neto para cubrir fees + margen
 
-# Ritmo / límites (más agresivo)
-TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "30"))   # 30s cooldown
-MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "60")) # alto para más ops
+# Ritmo / límites (menos trades para menos fees)
+TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "1800")) # 30 min cooldown
+MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "2"))  # muy bajo para evitar overtrading
 
-# Riesgo diario (más riesgo)
-PERDIDA_MAXIMA_DIARIA = float(os.getenv("PERDIDA_MAXIMA_DIARIA", "500"))
+# Riesgo diario (reducido)
+PERDIDA_MAXIMA_DIARIA = float(os.getenv("PERDIDA_MAXIMA_DIARIA", "20"))
 
 # Horarios
 TZ_MADRID = pytz.timezone("Europe/Madrid")
@@ -107,20 +104,20 @@ DUST_THRESHOLD = 0.5
 
 ALL_TICKERS = {}
 ALL_TICKERS_TS = 0.0
-ALL_TICKERS_TTL = 15  # 15s para frescura
+ALL_TICKERS_TTL = 60   # 60s para menos llamadas
 
 KLINES_CACHE = {}
-KLINES_TTL = 120  # 2 min
+KLINES_TTL = 900       # 15 min
 
 _LAST_GROK_TS = 0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Backoff para Binance (ban-aware, anti -1003/429/418)
+# Backoff para Binance
 # ──────────────────────────────────────────────────────────────────────────────
 def binance_call(fn, *args, tries=6, base_delay=0.8, max_delay=300, **kwargs):
     import re
     attempt = 0
-    while attempt < tries:
+    while True:
         try:
             return fn(*args, **kwargs)
         except BinanceAPIException as e:
@@ -292,8 +289,7 @@ def load_symbol_info(symbol):
 def quantize_qty(qty: Decimal, step: Decimal) -> Decimal:
     if step <= 0: return qty
     steps = (qty / step).quantize(Decimal('1.'), rounding=ROUND_DOWN)
-    q = (steps * step).normalize()
-    return q.quantize(step, rounding=ROUND_DOWN)  # Extra quantize to ensure precision
+    return (steps * step).normalize()
 
 def quantize_quote(quote: Decimal, tick: Decimal) -> Decimal:
     if tick <= 0: return quote
@@ -370,7 +366,7 @@ def calculate_ema(closes, period=5):
     return ema
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Grok decisionador (agresivo, fallback si cooldown)
+# Grok decisionador (conservador, enfocado en net profit post-fees)
 # ──────────────────────────────────────────────────────────────────────────────
 def _grok_can_call():
     return openai_client is not None and (time.time() - _LAST_GROK_TS) >= (GROK_MINUTES * 60)
@@ -378,13 +374,13 @@ def _grok_can_call():
 def _grok_decide(kind: str, symbol: str, payload: dict):
     global _LAST_GROK_TS
     try:
-        system = "Responde 'si 0.xx [razón breve]' o 'no 0.xx [razón breve]'. Sé agresivo y permite operaciones si hay potencial de ganancia. Máx 15 palabras."
+        system = "Responde 'si 0.xx [razón breve]' o 'no 0.xx [razón breve]'. Sé conservador: solo permite si net profit > 2x fees y bajo riesgo. Máx 15 palabras."
         user = f"{kind.upper()} {symbol} datos:{json.dumps(payload, separators=(',',':'))}"
         resp = openai_client.chat.completions.create(
             model=GROK_MODEL,
             messages=[{"role":"system","content":system},{"role":"user","content":user}],
             max_tokens=25,
-            temperature=0.8  # alta para agresividad
+            temperature=0.3  # baja para decisiones prudentes
         )
         _LAST_GROK_TS = time.time()
         txt = (resp.choices[0].message.content or "").strip().lower()
@@ -401,8 +397,8 @@ def _grok_decide(kind: str, symbol: str, payload: dict):
             reason = " ".join(parts[2:])
         return (ok, conf, reason)
     except Exception as e:
-        logger.info(f"IA no disponible; fallback: {e}")
-        return (True, 0.5, "error - assuming yes")
+        logger.info(f"IA no disponible; fallback conservador: {e}")
+        return (False, 0.0, "error - assuming no")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilidades varias
@@ -475,17 +471,9 @@ def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
     q = quantize_qty(qty, meta["marketStepSize"])
     while attempts < 3 and q > Decimal('0'):
         try:
-            # Use str(q) instead of format to avoid floating point issues
-            return binance_call(client.order_market_sell, symbol=symbol, quantity=str(q))
+            return binance_call(client.order_market_sell, symbol=symbol, quantity=format(q, 'f'))
         except BinanceAPIException as e:
             last_err = e
-            if e.code == -1111:  # Precision error
-                # Reduce precision further
-                precision = len(str(meta["marketStepSize"]).split('.')[-1]) if '.' in str(meta["marketStepSize"]) else 0
-                q = q.quantize(Decimal('1e-' + str(precision)), rounding=ROUND_DOWN)
-                attempts += 1
-                logger.warning(f"{symbol}: ajustando precision qty, intento {attempts}, qty={q}")
-                continue
             if e.code == -1013:
                 q = quantize_qty(q - meta["marketStepSize"], meta["marketStepSize"])
                 attempts += 1
@@ -621,7 +609,7 @@ def comprar():
                     orden = binance_call(
                         client.create_order,
                         symbol=symbol, side="BUY", type="MARKET",
-                        quoteOrderQty=str(quote_to_spend)  # Use str for precision
+                        quoteOrderQty=format(quote_to_spend, 'f')
                     )
                     executed_qty = executed_qty_from_order(orden)
                     if executed_qty <= 0:
@@ -797,11 +785,11 @@ def safe_get_balance(asset):
 
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: Ultra agresivo, alto riesgo, 100% saldo trabajando, Grok permisivo con fallback, trades rápidos. Cartera inicial conservada.")
+    enviar_telegram("🤖 Bot IA activo: Modo conservador, enfocado en net profit post-fees, menos trades para evitar comisiones excesivas.")
 
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', minutes=3, id="comprar")           # cada 3 min
-    scheduler.add_job(vender_y_convertir, 'interval', minutes=1, id="vender") # cada 1 min
+    scheduler.add_job(comprar, 'interval', minutes=15, id="comprar")  # menos frecuente
+    scheduler.add_job(vender_y_convertir, 'interval', minutes=5, id="vender")
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
