@@ -1,24 +1,40 @@
 # -*- coding: utf-8 -*-
-import os
-import time
-import json
-import random
-import logging
-import threading
-import requests
-import pytz
-import numpy as np
+"""
+Bot spot con WebSockets (miniticker, bookTicker, kline 5m),
+gestión por ATR (SL/TP/Trailing), control de pérdidas diario por %,
+1 posición a la vez con 100% del USDC disponible.
+
+Requiere:
+  python-binance >= 1.0.17  (funciona con varias variantes de import)
+  numpy, pytz, apscheduler, requests
+"""
+import os, time, json, random, logging, threading, requests
+import pytz, numpy as np
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from datetime import datetime, timedelta
+
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+
+# Soporte de distintas firmas del TWM según versión
+TWM = None
+try:
+    from binance.streams import ThreadedWebsocketManager as _TWM
+    TWM = _TWM
+except Exception:
+    try:
+        from binance import ThreadedWebsocketManager as _TWM
+        TWM = _TWM
+    except Exception:
+        TWM = None
+
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("bot-ia")
+logger = logging.getLogger("bot-ia-ws")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config (ENV)
@@ -29,39 +45,48 @@ API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 
-# xAI / Grok (OpenAI-compatible)
+# IA consultiva (opcional)
 XAI_API_KEY = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY") or ""
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-4-0709").strip()
-GROK_MINUTES = int(os.getenv("GROK_MINUTES", "15"))  # aumentado para menos uso y cautela
+GROK_MINUTES = int(os.getenv("GROK_MINUTES", "6"))
 
 # Mercado / símbolos
 MONEDA_BASE = os.getenv("MONEDA_BASE", "USDC").upper()
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "1000000"))  # aumentado para activos más líquidos
-MAX_POSICIONES = int(os.getenv("MAX_POSICIONES", "3"))  # más posiciones para diversificar riesgo
-MIN_SALDO_COMPRA = float(os.getenv("MIN_SALDO_COMPRA", "50"))  # aumentado para trades significativos
-PORCENTAJE_USDC = float(os.getenv("PORCENTAJE_USDC", "0.3"))  # solo 30% por posición para reducir exposición
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "100000"))
+MAX_POSICIONES = int(os.getenv("MAX_POSICIONES", "1"))
+PORCENTAJE_USDC = float(os.getenv("PORCENTAJE_USDC", "1.0"))
 ALLOWED_SYMBOLS = [
     s.strip().upper() for s in os.getenv(
         "ALLOWED_SYMBOLS",
-        "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,XRPUSDC,ADAUSDC,TONUSDC,LINKUSDC"
+        "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,TONUSDC,AVAXUSDC,LINKUSDC,NEARUSDC,ADAUSDC,DOGEUSDC,TRXUSDC,MATICUSDC,OPUSDC,ARBUSDC,ATOMUSDC"
     ).split(",") if s.strip()
-]  # menos símbolos, enfocados en los más estables y líquidos
+]
 
-# Estrategia (más conservadora: TP alto, SL estricto, trailing protector)
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "2.0")) / 100.0      # +2.0% para ganancias sustanciales
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.5")) / 100.0         # -0.5% corte rápido de pérdidas
-TRAILING_STOP = float(os.getenv("TRAILING_STOP", "0.5")) / 100.0  # -0.5% protege ganancias temprano
-COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", "0.001"))    # 0.1%
-RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "40"))               # <40, comprar en sobreventa fuerte
-RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "70"))             # >70, vender en sobrecompra
-MIN_NET_GAIN_ABS = float(os.getenv("MIN_NET_GAIN_ABS", "1.0"))    # umbral neto alto para cubrir fees + margen
+# Estrategia basada en ATR
+ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.5"))
+ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", "1.0"))
+ATR_TRAIL   = float(os.getenv("ATR_TRAIL",   "1.2"))
+RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "40"))
+RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "62"))
+RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN","58"))
+MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.15"))  # ATR/price*100 mínimo
 
-# Ritmo / límites (menos agresivo)
-TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "900"))  # 15 min cooldown
-MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "4"))  # bajo para menos ops y fees
+# Spread máximo (por bookTicker) para entrar/salir
+SPREAD_MAX_PCT = float(os.getenv("SPREAD_MAX_PCT", "0.10"))
 
-# Riesgo diario (menos riesgo)
-PERDIDA_MAXIMA_DIARIA = float(os.getenv("PERDIDA_MAXIMA_DIARIA", "50"))
+# Ritmo / límites
+TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "90"))
+MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "18"))
+COOLDOWN_POST_STOP_MIN = int(os.getenv("COOLDOWN_POST_STOP_MIN", "30"))
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "6"))
+
+# Riesgo diario por equity (%)
+PERDIDA_MAXIMA_DIARIA_PCT = float(os.getenv("PERDIDA_MAXIMA_DIARIA_PCT", "3.0"))
+
+# WebSockets
+WS_ENABLE = os.getenv("WS_ENABLE", "true").lower() in ("1","true","yes","on")
+WS_SYMBOLS_MAX = int(os.getenv("WS_SYMBOLS_MAX", "20"))  # tope de símbolos con kline 5m
+WS_ONLY_POSITIONS = os.getenv("WS_ONLY_POSITIONS", "false").lower() in ("1","true","yes","on")
 
 # Horarios
 TZ_MADRID = pytz.timezone("Europe/Madrid")
@@ -69,7 +94,7 @@ RESUMEN_HORA = int(os.getenv("RESUMEN_HORA", "23"))
 
 # Archivos
 REGISTRO_FILE = "registro.json"
-PNL_DIARIO_FILE = "pnl_diario.json"
+STATE_FILE    = "state.json"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Clientes
@@ -81,16 +106,14 @@ for var, name in [(API_KEY, "BINANCE_API_KEY"), (API_SECRET, "BINANCE_API_SECRET
 client = Client(API_KEY, API_SECRET)
 
 openai_client = None
+_LAST_GROK_TS = 0
 if XAI_API_KEY and GROK_MODEL:
     try:
         from openai import OpenAI
         openai_client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
-        logger.info(f"Grok activado con modelo {GROK_MODEL}")
+        logger.info(f"Grok consultivo activo: {GROK_MODEL}")
     except Exception as e:
-        logger.warning(f"No se pudo inicializar Grok: {e}; se continúa sin IA.")
-        openai_client = None
-else:
-    logger.info("Grok desactivado (falta XAI_API_KEY/GROK_API_KEY o GROK_MODEL).")
+        logger.warning(f"No se pudo iniciar Grok: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Locks / caches / estados
@@ -98,180 +121,127 @@ else:
 LOCK = threading.RLock()
 SYMBOL_CACHE = {}
 INVALID_SYMBOL_CACHE = set()
-ULTIMA_COMPRA = {}
-ULTIMAS_OPERACIONES = []
-DUST_THRESHOLD = 0.5
 
+DUST_THRESHOLD = 0.5
+ULTIMAS_OPERACIONES = []
+ULTIMA_COMPRA = {}
+POST_STOP_BAN = {}
+
+# Caches por WS
+PRICE_CACHE = {}         # symbol -> {"last":float,"bid":float,"ask":float,"t":int}
+CANDLES_5M = {}          # symbol -> list of kline dicts (close time asc)
+K_MAX = 200              # máximo de velas guardadas por símbolo
+
+# REST fallbacks
 ALL_TICKERS = {}
 ALL_TICKERS_TS = 0.0
-ALL_TICKERS_TTL = 60  # 1 min para menos llamadas API
-
+ALL_TICKERS_TTL = 45     # más alto: WS es la fuente principal
 KLINES_CACHE = {}
-KLINES_TTL = 900  # 15 min para menos refrescos
+KLINES_TTL = 300
 
-_LAST_GROK_TS = 0
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Backoff para Binance (ban-aware, anti -1003/429/418)
-# ──────────────────────────────────────────────────────────────────────────────
-def binance_call(fn, *args, tries=6, base_delay=0.8, max_delay=300, **kwargs):
-    import re
-    attempt = 0
-    while True:
-        try:
-            return fn(*args, **kwargs)
-        except BinanceAPIException as e:
-            msg = str(e)
-            code = getattr(e, "code", None)
-            status = getattr(e, "status_code", None)
-
-            # Ban con timestamp exacto
-            m = re.search(r"IP banned until\s+(\d{13})", msg)
-            if m:
-                ban_until_ms = int(m.group(1))
-                now_ms = int(time.time() * 1000)
-                wait_s = max(0, (ban_until_ms - now_ms) / 1000.0) + 1.0
-                logger.warning(f"[BAN] IP baneada hasta {ban_until_ms} (epoch ms). Durmiendo {wait_s:.1f}s.")
-                time.sleep(min(wait_s, 900))  # dormir como máx 15 min por ciclo
-                attempt = 0
-                continue
-
-            # Rate-limit
-            if code in (-1003, -1003.0) or status in (418, 429) or "Too many requests" in msg:
-                attempt += 1
-                if attempt > tries:
-                    logger.error(f"Rate limit persistente tras {tries} intentos: {msg}")
-                    raise
-                # Retry-After si está disponible
-                ra = None
-                try:
-                    h = getattr(e, "response", None)
-                    if h is not None:
-                        ra = h.headers.get("Retry-After")
-                except Exception:
-                    pass
-                delay = min(max_delay, (float(ra) if ra else (2 ** attempt) * base_delay) + random.random())
-                logger.warning(f"[RATE] {msg} -> backoff {delay:.1f}s (intento {attempt}/{tries})")
-                time.sleep(delay)
-                continue
-
-            # Otros errores transitorios
-            attempt += 1
-            if attempt <= tries:
-                delay = min(max_delay, (1.7 ** attempt) * base_delay + random.random())
-                logger.warning(f"[API] {msg} -> reintento en {delay:.1f}s (intento {attempt}/{tries})")
-                time.sleep(delay)
-                continue
-            raise
-        except requests.exceptions.RequestException as e:
-            attempt += 1
-            if attempt <= tries:
-                delay = min(max_delay, (1.7 ** attempt) * base_delay + random.random())
-                logger.warning(f"[NET] {e} -> reintento en {delay:.1f}s (intento {attempt}/{tries})")
-                time.sleep(delay)
-                continue
-            raise
+# WS manager
+twm = None
+ws_started = False
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilidades generales
+# Utilidades
 # ──────────────────────────────────────────────────────────────────────────────
 def now_tz(): return datetime.now(TZ_MADRID)
-def get_current_date(): return now_tz().date().isoformat()
+def today_key(): return now_tz().date().isoformat()
 
-def cargar_json(file):
+def load_json(file, default=None):
     if os.path.exists(file):
         try:
             with open(file, "r") as f:
                 return json.load(f)
         except Exception as e:
             logger.error(f"Error leyendo {file}: {e}")
-    return {}
+    return {} if default is None else default
 
-def atomic_write_json(data, file):
+def save_json(data, file):
     tmp = file + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, file)
 
-def guardar_json(data, file): atomic_write_json(data, file)
-
 def enviar_telegram(mensaje: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.info(f"[TELEGRAM DESACTIVADO] {mensaje}")
+        logger.info(f"[TG OFF] {mensaje}")
         return
     try:
-        def _send():
-            resp = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": mensaje[:4000]}
-            )
-            resp.raise_for_status()
-        tries = 0
-        while True:
-            try:
-                _send(); break
-            except Exception:
-                tries += 1
-                if tries >= 3: raise
-                time.sleep(min(10, 1.5 ** tries + random.random()))
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": mensaje[:4000]}
+        )
+        resp.raise_for_status()
     except Exception as e:
         logger.error(f"Telegram falló: {e}")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PnL diario / Riesgo
-# ──────────────────────────────────────────────────────────────────────────────
-def actualizar_pnl_diario(realized_pnl, fees=0.1):
-    with LOCK:
-        pnl_data = cargar_json(PNL_DIARIO_FILE)
-        today = get_current_date()
-        pnl_data[today] = pnl_data.get(today, 0) + float(realized_pnl) - fees
-        guardar_json(pnl_data, PNL_DIARIO_FILE)
-        return pnl_data[today]
-
-def pnl_hoy():
-    pnl = cargar_json(PNL_DIARIO_FILE)
-    return pnl.get(get_current_date(), 0)
-
-def puede_comprar():
-    hoy = pnl_hoy()
-    return hoy > -PERDIDA_MAXIMA_DIARIA if hoy <= 0 else hoy > -(PERDIDA_MAXIMA_DIARIA * 1.5)
-
-def reset_diario():
-    with LOCK:
-        pnl = cargar_json(PNL_DIARIO_FILE)
-        hoy = get_current_date()
-        if hoy not in pnl:
-            pnl[hoy] = 0
-            guardar_json(pnl, PNL_DIARIO_FILE)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Mercado: info símbolos y precisión
-# ──────────────────────────────────────────────────────────────────────────────
 def dec(x: str) -> Decimal:
     try:
         return Decimal(x)
     except (InvalidOperation, TypeError):
         return Decimal('0')
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Binance helpers (backoff)
+# ──────────────────────────────────────────────────────────────────────────────
+def binance_call(fn, *args, tries=5, base_delay=0.9, max_delay=240, **kwargs):
+    import re
+    attempt = 0
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except BinanceAPIException as e:
+            msg = str(e); code = getattr(e,"code",None); status = getattr(e,"status_code",None)
+            m = re.search(r"IP banned until\s+(\d{13})", msg)
+            if m:
+                ban_until_ms = int(m.group(1))
+                now_ms = int(time.time()*1000)
+                wait_s = max(0, (ban_until_ms - now_ms)/1000.0) + 2.0
+                logger.warning(f"[BAN] durmiendo {wait_s:.1f}s")
+                time.sleep(min(wait_s, 900)); attempt = 0; continue
+            if code in (-1003,) or status in (418,429) or "Too many requests" in msg:
+                attempt += 1
+                if attempt > tries: raise
+                delay = min(max_delay, (2.0**attempt)*base_delay + random.random())
+                logger.warning(f"[RATE] backoff {delay:.1f}s (try {attempt}/{tries})")
+                time.sleep(delay); continue
+            attempt += 1
+            if attempt <= tries:
+                delay = min(max_delay, (1.7**attempt)*base_delay + random.random())
+                logger.warning(f"[API] reintento {delay:.1f}s (try {attempt}/{tries})")
+                time.sleep(delay); continue
+            raise
+        except requests.exceptions.RequestException as e:
+            attempt += 1
+            if attempt <= tries:
+                delay = min(max_delay, (1.7**attempt)*base_delay + random.random())
+                logger.warning(f"[NET] reintento {delay:.1f}s")
+                time.sleep(delay); continue
+            raise
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mercado: info símbolos y precisión
+# ──────────────────────────────────────────────────────────────────────────────
 def load_symbol_info(symbol):
     if symbol in INVALID_SYMBOL_CACHE: return None
     if symbol in SYMBOL_CACHE: return SYMBOL_CACHE[symbol]
     try:
         info = binance_call(client.get_symbol_info, symbol=symbol)
         if info is None:
-            INVALID_SYMBOL_CACHE.add(symbol)
-            return None
+            INVALID_SYMBOL_CACHE.add(symbol); return None
         lot = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
         market_lot = next((f for f in info['filters'] if f['filterType'] == 'MARKET_LOT_SIZE'), None)
         pricef = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
         notional_f = next((f for f in info['filters'] if f['filterType'] in ('NOTIONAL','MIN_NOTIONAL')), None)
         meta = {
-            "stepSize": dec(lot.get('stepSize', '0')),
-            "minQty": dec(lot.get('minQty', '0')),
-            "marketStepSize": dec(market_lot.get('stepSize', '0')) if market_lot else dec(lot.get('stepSize','0')),
-            "marketMinQty": dec(market_lot.get('minQty', '0')) if market_lot else dec(lot.get('minQty','0')),
-            "tickSize": dec(pricef.get('tickSize', '0')),
-            "minNotional": dec(notional_f.get('minNotional', '0')) if notional_f else dec('0'),
+            "stepSize": dec(lot.get('stepSize','0')),
+            "minQty": dec(lot.get('minQty','0')),
+            "marketStepSize": dec(market_lot.get('stepSize','0')) if market_lot else dec(lot.get('stepSize','0')),
+            "marketMinQty": dec(market_lot.get('minQty','0')) if market_lot else dec(lot.get('minQty','0')),
+            "tickSize": dec(pricef.get('tickSize','0')),
+            "minNotional": dec(notional_f.get('minNotional','0')) if notional_f else dec('0'),
             "applyToMarket": bool(notional_f.get('applyToMarket', True)) if notional_f else True,
             "baseAsset": info['baseAsset'],
             "quoteAsset": info['quoteAsset'],
@@ -282,52 +252,31 @@ def load_symbol_info(symbol):
         SYMBOL_CACHE[symbol] = meta
         return meta
     except Exception as e:
-        logger.info(f"Error cargando info de {symbol}: {e}")
-        INVALID_SYMBOL_CACHE.add(symbol)
-        return None
+        logger.info(f"Error info {symbol}: {e}")
+        INVALID_SYMBOL_CACHE.add(symbol); return None
 
 def quantize_qty(qty: Decimal, step: Decimal) -> Decimal:
     if step <= 0: return qty
     steps = (qty / step).quantize(Decimal('1.'), rounding=ROUND_DOWN)
     return (steps * step).normalize()
 
-def quantize_quote(quote: Decimal, tick: Decimal) -> Decimal:
-    if tick <= 0: return quote
-    steps = (quote / tick).quantize(Decimal('1.'), rounding=ROUND_DOWN)
-    return (steps * tick).normalize()
-
 def min_quote_for_market(symbol) -> Decimal:
     meta = load_symbol_info(symbol)
     if not meta: return Decimal('0')
-    return (meta["minNotional"] * Decimal('1.01')).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+    return (meta["minNotional"] * Decimal('1.02')).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Cache masiva de tickers
+# REST fallbacks para tickers/klines (arranque)
 # ──────────────────────────────────────────────────────────────────────────────
 def refresh_all_tickers(force=False):
     global ALL_TICKERS, ALL_TICKERS_TS
     now = time.time()
-    if not force and (now - ALL_TICKERS_TS) < ALL_TICKERS_TTL:
-        return
-    data = binance_call(client.get_ticker)  # sin symbol => 24h tickers de todos
-    tmp = {}
-    for t in data:
-        sym = t.get("symbol")
-        if sym:
-            tmp[sym] = t
-    ALL_TICKERS = tmp
+    if not force and (now - ALL_TICKERS_TS) < ALL_TICKERS_TTL: return
+    data = binance_call(client.get_ticker)
+    ALL_TICKERS = {t.get("symbol"): t for t in data if t.get("symbol")}
     ALL_TICKERS_TS = now
 
-def get_cached_ticker(symbol):
-    refresh_all_tickers()
-    return ALL_TICKERS.get(symbol)
-
-def safe_get_ticker(symbol): return get_cached_ticker(symbol)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Cache de klines
-# ──────────────────────────────────────────────────────────────────────────────
-def get_klines_cached(symbol, interval, limit=40, ttl=KLINES_TTL):
+def get_klines_cached(symbol, interval, limit=200, ttl=KLINES_TTL):
     key = (symbol, interval, limit)
     now = time.time()
     data, ts = KLINES_CACHE.get(key, (None, 0))
@@ -340,443 +289,580 @@ def get_klines_cached(symbol, interval, limit=40, ttl=KLINES_TTL):
 # ──────────────────────────────────────────────────────────────────────────────
 # Indicadores
 # ──────────────────────────────────────────────────────────────────────────────
-def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1: return 50.0
-    deltas = np.diff(closes)
-    seed = deltas[:period]
-    up = seed[seed > 0].sum() / period
-    down = -seed[seed < 0].sum() / period
-    rs = up / down if down != 0 else np.inf
-    rsi = 100 - (100 / (1 + rs))
-    upvals, downvals = up, down
-    for d in deltas[period:]:
-        upval = max(d, 0); downval = -min(d, 0)
-        upvals = (upvals * (period - 1) + upval) / period
-        downvals = (downvals * (period - 1) + downval) / period
-        rs = upvals / downvals if downvals != 0 else np.inf
-        rsi = 100 - (100 / (1 + rs))
-    return float(rsi)
+def ema(arr, period):
+    if len(arr) < period: return float(arr[-1])
+    m = 2/(period+1.0)
+    e = float(np.mean(arr[:period]))
+    for x in arr[period:]:
+        e = (x - e)*m + e
+    return e
 
-def calculate_ema(closes, period=5):
-    if len(closes) < period: return closes[-1]
-    ema = float(np.mean(closes[:period]))
-    multiplier = 2 / (period + 1)
-    for price in closes[period:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
+def rsi(arr, period=14):
+    if len(arr) < period + 1: return 50.0
+    deltas = np.diff(arr)
+    up = deltas.clip(min=0).sum()/period
+    down = -deltas.clip(max=0).sum()/period
+    rs = up/(down if down != 0 else 1e-9)
+    r = 100 - (100/(1+rs))
+    au, ad = up, down
+    for d in deltas[period:]:
+        upv = max(d,0); dnv = -min(d,0)
+        au = (au*(period-1)+upv)/period
+        ad = (ad*(period-1)+dnv)/period
+        rs = au/(ad if ad!=0 else 1e-9)
+        r = 100 - (100/(1+rs))
+    return float(r)
+
+def atr_from_ohlc(highs, lows, closes, period=14):
+    trs = []
+    for i in range(1, len(closes)):
+        hl = highs[i]-lows[i]
+        hc = abs(highs[i]-closes[i-1])
+        lc = abs(lows[i]-closes[i-1])
+        trs.append(max(hl, hc, lc))
+    if len(trs) < period:
+        return np.mean(trs) if trs else 0.0
+    atr = np.mean(trs[:period])
+    for tr in trs[period:]:
+        atr = (atr*(period-1)+tr)/period
+    return float(atr)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Grok decisionador (más conservador)
+# IA consultiva
 # ──────────────────────────────────────────────────────────────────────────────
 def _grok_can_call():
-    return openai_client is not None and (time.time() - _LAST_GROK_TS) >= (GROK_MINUTES * 60)
+    return openai_client is not None and (time.time() - _LAST_GROK_TS) >= (GROK_MINUTES*60)
 
-def _grok_decide(kind: str, symbol: str, payload: dict):
+def grok_opinion(kind: str, symbol: str, payload: dict):
     global _LAST_GROK_TS
+    if not _grok_can_call(): return ("skip", 0.0, "cooldown")
     try:
-        system = "Responde 'si 0.xx [razón breve]' o 'no 0.xx [razón breve]'. Sé prudente y solo permite operaciones si hay alto potencial de ganancia con bajo riesgo y después de considerar comisiones."
+        system = "Da consejo corto: 'buy/sell/hold 0.xx [razón breve]'. Máx 15 palabras."
         user = f"{kind.upper()} {symbol} datos:{json.dumps(payload, separators=(',',':'))}"
         resp = openai_client.chat.completions.create(
             model=GROK_MODEL,
             messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            max_tokens=25,
-            temperature=0.2  # baja para decisiones conservadoras
+            max_tokens=24, temperature=0.4
         )
         _LAST_GROK_TS = time.time()
         txt = (resp.choices[0].message.content or "").strip().lower()
-        ok = txt.startswith("si") or txt.startswith("sí")
-        conf = 0.0
-        reason = ""
         parts = txt.split(" ", 2)
-        if len(parts) > 1:
-            try:
-                conf = float(parts[1])
-            except:
-                pass
-        if len(parts) > 2:
-            reason = " ".join(parts[2:])
-        return (ok, conf, reason)
+        act, conf, reason = "hold", 0.0, ""
+        if parts: act = parts[0]
+        if len(parts)>1:
+            try: conf = float(parts[1])
+            except: pass
+        if len(parts)>2: reason = parts[2]
+        return (act, conf, reason)
     except Exception as e:
-        logger.info(f"IA no disponible; fallback conservador: {e}")
-        return (False, 0.0, "error - assuming no")
+        return ("hold", 0.0, f"ia_err:{e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilidades varias
+# Estado diario / equity
 # ──────────────────────────────────────────────────────────────────────────────
-def base_from_symbol(symbol: str) -> str:
-    if symbol.endswith(MONEDA_BASE):
-        return symbol[:-len(MONEDA_BASE)]
-    meta = load_symbol_info(symbol)
-    return meta["baseAsset"] if meta else symbol.replace(MONEDA_BASE, "")
+def init_day_state():
+    st = load_json(STATE_FILE, {})
+    tk = today_key()
+    if st.get("day") != tk:
+        st = {"day": tk, "start_equity": cartera_value_usdc(), "pnl_today": 0.0}
+        save_json(st, STATE_FILE)
+    return st
 
-def precio_medio_si_hay(symbol, lookback_days=30):
+def update_pnl_today(delta):
+    st = load_json(STATE_FILE, {})
+    st.setdefault("day", today_key())
+    st["pnl_today"] = round(st.get("pnl_today", 0.0) + float(delta), 8)
+    save_json(st, STATE_FILE)
+    return st["pnl_today"]
+
+def daily_risk_ok():
+    st = init_day_state()
+    start_eq = st.get("start_equity", 0.0) or cartera_value_usdc()
+    max_loss = start_eq * (PERDIDA_MAXIMA_DIARIA_PCT/100.0)
+    return st.get("pnl_today", 0.0) > -max_loss + 1e-6
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WS callbacks
+# ──────────────────────────────────────────────────────────────────────────────
+def _update_price(symbol, last=None, bid=None, ask=None, ts=None):
+    d = PRICE_CACHE.get(symbol, {})
+    if last is not None: d["last"] = float(last)
+    if bid is not None:  d["bid"]  = float(bid)
+    if ask is not None:  d["ask"]  = float(ask)
+    if ts is not None:   d["t"]    = int(ts)
+    PRICE_CACHE[symbol] = d
+
+def on_miniticker(msg):
+    # msg: {"e":"24hrMiniTicker","E":..,"s":"BTCUSDT","c":"last","o":"open",...}
     try:
-        since = int((now_tz() - timedelta(days=lookback_days)).timestamp() * 1000)
-        trades = binance_call(client.get_my_trades, symbol=symbol, startTime=since)
-        buys = [t for t in trades if t.get('isBuyer')]
-        if not buys: return None
-        qty_sum = Decimal('0'); cost_sum = Decimal('0')
-        for t in buys:
-            qty = dec(t['qty']); price = dec(t['price']); comm = dec(t.get('commission','0'))
-            comm_asset = t.get('commissionAsset','')
-            cost_sum += qty * price + (comm if comm_asset == MONEDA_BASE else Decimal('0'))
-            qty_sum += qty
-        if qty_sum > 0: return float(cost_sum / qty_sum)
+        symbol = msg.get("s")
+        if not symbol: return
+        _update_price(symbol, last=float(msg.get("c",0)), ts=msg.get("E"))
     except Exception as e:
-        logger.warning(f"No se pudo calcular precio medio {symbol}: {e}")
-    return None
+        logger.debug(f"miniTicker err: {e}")
 
-def inicializar_registro():
-    with LOCK:
-        registro = cargar_json(REGISTRO_FILE)
-        try:
-            cuenta = binance_call(client.get_account)
-            for b in cuenta['balances']:
-                asset = b['asset']; free = float(b['free'])
-                if asset != MONEDA_BASE and free > 0.0000001:
-                    symbol = asset + MONEDA_BASE
-                    if symbol not in ALLOWED_SYMBOLS: continue
-                    if symbol in INVALID_SYMBOL_CACHE: continue
-                    if not load_symbol_info(symbol): continue
-                    try:
-                        t = safe_get_ticker(symbol)
-                        if not t: continue
-                        precio_actual = float(t['lastPrice'])
-                        pm = precio_medio_si_hay(symbol) or precio_actual
-                        registro[symbol] = {
-                            "cantidad": float(free),
-                            "precio_compra": float(pm),
-                            "timestamp": now_tz().isoformat(),
-                            "high_since_buy": float(precio_actual),
-                            "from_cartera": True
-                        }
-                        logger.info(f"Posición inicial: {symbol} {free} a {pm} (last {precio_actual})")
-                    except Exception:
-                        continue
-            guardar_json(registro, REGISTRO_FILE)
-        except BinanceAPIException as e:
-            logger.error(f"Error inicializando registro: {e}")
-
-def quantize_amounts_for_market(symbol, quote_to_spend: Decimal):
-    meta = load_symbol_info(symbol)
-    if not meta: return None, None, None
-    min_quote = min_quote_for_market(symbol)
-    if quote_to_spend < min_quote:
-        return meta, None, min_quote
-    q_spend = quantize_quote(quote_to_spend, meta["tickSize"])
-    return meta, q_spend, min_quote
-
-def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
-    attempts = 0; last_err = None
-    q = quantize_qty(qty, meta["marketStepSize"])
-    while attempts < 3 and q > Decimal('0'):
-        try:
-            return binance_call(client.order_market_sell, symbol=symbol, quantity=format(q, 'f'))
-        except BinanceAPIException as e:
-            last_err = e
-            if e.code == -1013:
-                q = quantize_qty(q - meta["marketStepSize"], meta["marketStepSize"])
-                attempts += 1
-                logger.warning(f"{symbol}: ajustando qty por LOT_SIZE, intento {attempts}, qty={q}")
-                continue
-            raise
-    if last_err: raise last_err
-
-def executed_qty_from_order(order_resp) -> float:
+def on_book_ticker(msg):
+    # msg: {"u":..., "s":"BTCUSDC", "b":"bestBid","B":"bidQty","a":"bestAsk","A":"askQty"}
     try:
-        fills = order_resp.get('fills') or []
-        if fills: return sum(float(f.get('qty', 0)) for f in fills if f)
-    except Exception: pass
+        symbol = msg.get("s")
+        if not symbol: return
+        _update_price(symbol, bid=float(msg.get("b",0)), ask=float(msg.get("a",0)))
+    except Exception as e:
+        logger.debug(f"bookTicker err: {e}")
+
+def on_kline(msg):
+    # msg: {"e":"kline","s":"BTCUSDC","k":{"t":..., "T":..., "i":"5m", "o":"..","h":"..","l":"..","c":"..","x":true}}
     try:
-        executed_quote = float(order_resp.get('cummulativeQuoteQty', 0))
-        price = float(order_resp.get('price') or 0) or float(order_resp.get('fills', [{}])[0].get('price', 0) or 0)
-        if executed_quote and price: return executed_quote / price
-    except Exception: pass
-    return 0.0
+        symbol = msg.get("s")
+        k = msg.get("k", {})
+        if not symbol or not k: return
+        if k.get("i") not in ("5m","5min","5m "): return
+        close_time = int(k.get("T"))
+        o = float(k.get("o")); h = float(k.get("h")); l = float(k.get("l")); c = float(k.get("c"))
+        final = bool(k.get("x", False))  # si cerró vela
+        arr = CANDLES_5M.get(symbol, [])
+        if arr and arr[-1]["T"] == close_time:
+            arr[-1] = {"T":close_time,"o":o,"h":h,"l":l,"c":c,"x":final}
+        else:
+            arr.append({"T":close_time,"o":o,"h":h,"l":l,"c":c,"x":final})
+            if len(arr) > K_MAX: arr = arr[-K_MAX:]
+        CANDLES_5M[symbol] = arr
+        # actualiza last
+        _update_price(symbol, last=c, ts=close_time)
+    except Exception as e:
+        logger.debug(f"kline err: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Selección de criptos
+# WS start/stop
 # ──────────────────────────────────────────────────────────────────────────────
-def mejores_criptos(max_candidates=25):
-    try:
-        candidates = []
-        refresh_all_tickers()
-        for sym in ALLOWED_SYMBOLS:
-            if sym in INVALID_SYMBOL_CACHE: continue
-            t = ALL_TICKERS.get(sym)
-            if not t: continue
-            vol = float(t.get("quoteVolume", 0) or 0)
-            if vol > MIN_VOLUME: candidates.append(t)
-
-        filtered = []
-        top = sorted(candidates, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:max_candidates]
-        for t in top:
-            symbol = t["symbol"]
-            klines = get_klines_cached(symbol, Client.KLINE_INTERVAL_15MINUTE, limit=40)  # intervalo más largo para tendencias estables
-            closes = [float(k[4]) for k in klines]
-            if len(closes) < 20: continue
-            rsi = calculate_rsi(closes)
-            ema5 = calculate_ema(closes, 5)
-            precio = float(t.get("lastPrice", 0) or 0)
-            if precio <= 0 or precio <= ema5: continue  # solo buy si momentum positivo
-            ganancia_bruta = precio * TAKE_PROFIT
-            com_compra = precio * COMMISSION_RATE
-            com_venta = (precio * (1 + TAKE_PROFIT)) * COMMISSION_RATE
-            if (ganancia_bruta - (com_compra + com_venta)) < MIN_NET_GAIN_ABS * 2:  # margen extra para fees
-                continue
-            t['rsi'] = rsi; t['ema5'] = ema5
-            filtered.append(t)
-        return sorted(filtered, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
-    except BinanceAPIException as e:
-        logger.error(f"Error en mejores_criptos: {e}")
-        return []
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Trading
-# ──────────────────────────────────────────────────────────────────────────────
-def comprar():
-    if not puede_comprar():
-        logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
+def start_streams(symbols):
+    global twm, ws_started
+    if not WS_ENABLE or TWM is None:
+        logger.info("WebSockets desactivado o no disponible; usando REST.")
+        return
+    if ws_started:
+        logger.info("WS ya iniciado.")
         return
     try:
-        saldo_spot = safe_get_balance(MONEDA_BASE)
-        if saldo_spot < MIN_SALDO_COMPRA:
-            logger.info("Saldo USDC insuficiente para comprar.")
-            return
+        twm = TWM(api_key=API_KEY, api_secret=API_SECRET)
+        twm.start()
+        # miniTicker para TODOS (siempre uno solo)
+        try:
+            # all-market mini ticker (si está en tu versión)
+            twm.start_miniticker_socket(callback=on_miniticker)
+            logger.info("miniTicker global iniciado.")
+        except Exception:
+            # si no existe, por símbolo
+            for s in symbols:
+                twm.start_symbol_miniticker_socket(callback=on_miniticker, symbol=s)
+            logger.info("miniTicker por símbolo iniciado.")
 
-        cantidad_usdc = saldo_spot * PORCENTAJE_USDC  # solo parte del saldo
-        criptos = mejores_criptos()
-        registro = cargar_json(REGISTRO_FILE)
+        # bookTicker para mejores spreads (global si posible)
+        try:
+            twm.start_book_ticker_socket(callback=on_book_ticker)
+            logger.info("bookTicker global iniciado.")
+        except Exception:
+            for s in symbols:
+                twm.start_book_ticker_socket(callback=on_book_ticker, symbol=s)
+            logger.info("bookTicker por símbolo iniciado.")
 
-        if len(registro) >= MAX_POSICIONES:
-            logger.info("Máximo de posiciones abiertas alcanzado. No se comprará más.")
-            return
+        # kline 5m: según preferencia (solo cartera o lista limitada)
+        k_symbols = set(symbols)
+        if WS_ONLY_POSITIONS:
+            reg = registro_load()
+            k_symbols = set(reg.keys()) if reg else set()
+            if not k_symbols:
+                # arrancar al menos BTC/ETH para “calentar” buffers
+                k_symbols = set([x for x in symbols if x in ("BTCUSDC","ETHUSDC")])
+        else:
+            if len(k_symbols) > WS_SYMBOLS_MAX:
+                k_symbols = set(list(symbols)[:WS_SYMBOLS_MAX])
 
-        now_ts = time.time()
-        global ULTIMAS_OPERACIONES
-        ULTIMAS_OPERACIONES = [t for t in ULTIMAS_OPERACIONES if now_ts - t < 3600]
-        if len(ULTIMAS_OPERACIONES) >= MAX_TRADES_PER_HOUR:
-            logger.info("Tope de operaciones por hora alcanzado. No se compra en este ciclo.")
-            return
-
-        compradas = 0
-        for cripto in criptos:
-            if compradas >= 1: break
-            symbol = cripto["symbol"]
-            if symbol in registro: continue
-            last = ULTIMA_COMPRA.get(symbol, 0)
-            if now_ts - last < TRADE_COOLDOWN_SEC: continue
-
-            t = safe_get_ticker(symbol)
-            if not t: continue
-            precio = dec(str(t.get("lastPrice", "0")))
-            if precio <= 0: continue
-            rsi = cripto.get("rsi", 50.0)
-
-            meta, quote_to_spend, min_quote = quantize_amounts_for_market(symbol, dec(str(cantidad_usdc)))
-            if quote_to_spend is None:
-                logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
-                continue
-
-            base_signal = rsi < RSI_BUY_MAX
-
-            ok_grok, conf, reason = (False, 0.0, "")
-            if base_signal:
-                payload = {
-                    "rsi": round(float(rsi),2),
-                    "price": round(float(precio),8),
-                    "tp": TAKE_PROFIT,
-                    "sl": STOP_LOSS,
-                    "vol": float(t.get("quoteVolume",0) or 0),
-                    "chg24h": float(t.get("priceChangePercent",0) or 0),
-                    "comm_rate": COMMISSION_RATE
-                }
-                ok_grok, conf, reason = _grok_decide("buy", symbol, payload)
-
-            if base_signal and ok_grok and conf >= 0.7:  # require high confidence
-                try:
-                    orden = binance_call(
-                        client.create_order,
-                        symbol=symbol, side="BUY", type="MARKET",
-                        quoteOrderQty=format(quote_to_spend, 'f')
-                    )
-                    executed_qty = executed_qty_from_order(orden)
-                    if executed_qty <= 0:
-                        executed_qty = float(quote_to_spend) / float(precio)
-
-                    with LOCK:
-                        registro = cargar_json(REGISTRO_FILE)
-                        registro[symbol] = {
-                            "cantidad": executed_qty,
-                            "precio_compra": float(precio),
-                            "timestamp": now_tz().isoformat(),
-                            "high_since_buy": float(precio)
-                        }
-                        guardar_json(registro, REGISTRO_FILE)
-
-                    enviar_telegram(f"🟢 BUY {symbol} ~{float(quote_to_spend):.2f} {MONEDA_BASE} @ ~{float(precio):.6f} (RSI {rsi:.1f}, IA {conf:.2f} {reason})")
-                    compradas += 1
-                    ULTIMA_COMPRA[symbol] = now_ts
-                    ULTIMAS_OPERACIONES.append(now_ts)
-                except BinanceAPIException as e:
-                    logger.error(f"Error comprando {symbol}: {e}")
-                except Exception as e:
-                    logger.error(f"Error inesperado comprando {symbol}: {e}")
-            else:
-                logger.info(f"No se compra {symbol}: base={base_signal}, IA={conf:.2f} {reason}")
+        for s in k_symbols:
+            twm.start_kline_socket(callback=on_kline, symbol=s, interval=Client.KLINE_INTERVAL_5MINUTE)
+        logger.info(f"kline 5m iniciado para: {', '.join(sorted(k_symbols))}")
+        ws_started = True
     except Exception as e:
-        logger.error(f"Error general en compra: {e}")
+        logger.warning(f"No se pudieron iniciar WS: {e}")
 
-def vender_y_convertir():
-    with LOCK:
-        registro = cargar_json(REGISTRO_FILE)
-        nuevos_registro = {}
-        dust_positions = []
-
-        for symbol, data in list(registro.items()):
-            try:
-                precio_compra = dec(str(data["precio_compra"]))
-                high_since_buy = dec(str(data.get("high_since_buy", data["precio_compra"])))
-
-                t = safe_get_ticker(symbol)
-                if not t:
-                    nuevos_registro[symbol] = data; continue
-                precio_actual = dec(str(t.get("lastPrice", "0")))
-                if precio_actual <= 0:
-                    nuevos_registro[symbol] = data; continue
-
-                cambio = (precio_actual - precio_compra) / (precio_compra if precio_compra != 0 else Decimal('1'))
-
-                klines = get_klines_cached(symbol, Client.KLINE_INTERVAL_15MINUTE, limit=40)  # intervalo más largo
-                closes = [float(k[4]) for k in klines]
-                rsi = calculate_rsi(closes)
-                meta = load_symbol_info(symbol)
-                if not meta:
-                    nuevos_registro[symbol] = data; continue
-
-                if precio_actual > high_since_buy:
-                    data["high_since_buy"] = float(precio_actual)
-                    guardar_json(registro, REGISTRO_FILE)
-                    high_since_buy = precio_actual
-
-                asset = base_from_symbol(symbol)
-                cantidad_wallet = dec(str(safe_get_balance(asset)))
-                if cantidad_wallet <= 0:
-                    dust_positions.append(symbol); continue
-
-                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
-                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
-                    dust_positions.append(symbol); continue
-
-                if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_actual > 0:
-                    notional_est = qty * precio_actual
-                    if notional_est < meta["minNotional"] or float(notional_est) < DUST_THRESHOLD:
-                        dust_positions.append(symbol); continue
-
-                ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
-                com_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
-                com_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
-                ganancia_neta = ganancia_bruta - com_compra - com_venta
-
-                trailing_trigger = (float(precio_actual) - float(high_since_buy)) / float(high_since_buy) <= -TRAILING_STOP
-                vender_por_stop = float(cambio) <= STOP_LOSS or trailing_trigger
-                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN) and ganancia_neta > MIN_NET_GAIN_ABS
-
-                ok_grok, conf, reason = (True, 1.0, "")
-                if openai_client is not None and (vender_por_stop or vender_por_profit):
-                    payload = {
-                        "chg": round(float(cambio),5),
-                        "rsi": round(float(rsi),2),
-                        "tp": TAKE_PROFIT, "sl": STOP_LOSS,
-                        "trail": TRAILING_STOP,
-                        "net": round(ganancia_neta,4),
-                        "comm_rate": COMMISSION_RATE
-                    }
-                    ok_grok, conf, reason = _grok_decide("sell", symbol, payload)
-                    if vender_por_profit and ganancia_neta < MIN_NET_GAIN_ABS * 1.5 and conf < 0.7:
-                        ok_grok = False
-
-                if vender_por_stop or (vender_por_profit and ok_grok):
-                    try:
-                        orden = market_sell_with_fallback(symbol, qty, meta)
-                        total_hoy = actualizar_pnl_diario(ganancia_neta)
-                        motivo = "SL/Trailing" if vender_por_stop else "TP/RSI"
-                        enviar_telegram(
-                            f"🔴 SELL {symbol} {float(qty):.8f} @ ~{float(precio_actual):.6f} "
-                            f"(Δ {float(cambio)*100:.2f}%) PnL≈{ganancia_neta:.2f} {MONEDA_BASE}. "
-                            f"{motivo}. IA {conf:.2f} {reason}. PnL hoy {total_hoy:.2f}"
-                        )
-                    except BinanceAPIException as e:
-                        logger.error(f"Error vendiendo {symbol}: {e}")
-                        dust_positions.append(symbol); continue
-                else:
-                    nuevos_registro[symbol] = data
-                    logger.info(f"No se vende {symbol}: Δ{float(cambio)*100:.2f}%, RSI {rsi:.1f}, net {ganancia_neta:.4f}")
-            except Exception as e:
-                logger.error(f"Error vendiendo {symbol}: {e}")
-                nuevos_registro[symbol] = data
-
-        limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
-        guardar_json(limpio, REGISTRO_FILE)
-        if dust_positions:
-            enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Resumen diario
-# ──────────────────────────────────────────────────────────────────────────────
-def resumen_diario():
+def stop_streams():
+    global twm, ws_started
     try:
-        cuenta = binance_call(client.get_account)
-        pnl_data = cargar_json(PNL_DIARIO_FILE)
-        today = get_current_date()
-        pnl_hoy_v = pnl_data.get(today, 0)
-        mensaje = f"📊 Resumen diario ({today}):\nPNL hoy: {pnl_hoy_v:.2f} {MONEDA_BASE}\nBalances:\n"
-        total_value = 0
-        refresh_all_tickers()
-        for b in cuenta["balances"]:
-            total = float(b["free"]) + float(b["locked"])
-            if total > 0.001:
-                mensaje += f"{b['asset']}: {total:.6f}\n"
-                if b['asset'] != MONEDA_BASE:
-                    sym = b['asset'] + MONEDA_BASE
-                    t = ALL_TICKERS.get(sym)
-                    if t:
-                        total_value += total * float(t.get('lastPrice', 0) or 0)
-                else:
-                    total_value += total
-        mensaje += f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}"
-        enviar_telegram(mensaje)
-        seven_days_ago = (now_tz() - timedelta(days=7)).date().isoformat()
-        pnl_data = {k: v for k, v in pnl_data.items() if k >= seven_days_ago}
-        guardar_json(pnl_data, PNL_DIARIO_FILE)
-    except BinanceAPIException as e:
-        logger.error(f"Error en resumen diario: {e}")
+        if twm:
+            twm.stop()
+        ws_started = False
+    except Exception:
+        pass
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Inicio
+# Valoración de cartera con cache
 # ──────────────────────────────────────────────────────────────────────────────
+def cartera_value_usdc():
+    try:
+        acct = binance_call(client.get_account)
+        total = 0.0
+        for b in acct['balances']:
+            asset = b['asset']
+            qty = float(b['free']) + float(b['locked'])
+            if qty <= 0: continue
+            if asset == MONEDA_BASE:
+                total += qty
+            else:
+                sym = asset + MONEDA_BASE
+                px = PRICE_CACHE.get(sym, {}).get("last")
+                if px is None:
+                    refresh_all_tickers()
+                    t = ALL_TICKERS.get(sym)
+                    px = float(t.get('lastPrice',0) or 0) if t else 0
+                total += qty*float(px or 0)
+        return total
+    except Exception:
+        return 0.0
+
 def safe_get_balance(asset):
     try:
         b = binance_call(client.get_asset_balance, asset=asset)
         if not b: return 0.0
         return float(b.get('free', 0))
     except Exception as e:
-        logger.error(f"Error obteniendo balance {asset}: {e}")
+        logger.error(f"Error balance {asset}: {e}")
         return 0.0
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Registro posiciones
+# ──────────────────────────────────────────────────────────────────────────────
+def registro_load(): return load_json(REGISTRO_FILE, {})
+def registro_save(r):  save_json(r, REGISTRO_FILE)
+
+def inicializar_registro():
+    with LOCK:
+        reg = registro_load()
+        acct = binance_call(client.get_account)
+        # precalienta precios vía REST la primera vez
+        refresh_all_tickers(force=True)
+        for b in acct['balances']:
+            asset = b['asset']; free = float(b['free'])
+            if asset != MONEDA_BASE and free > 1e-8:
+                sym = asset + MONEDA_BASE
+                if sym in INVALID_SYMBOL_CACHE: continue
+                if not load_symbol_info(sym): continue
+                last = PRICE_CACHE.get(sym, {}).get("last")
+                if last is None:
+                    t = ALL_TICKERS.get(sym)
+                    last = float(t.get("lastPrice",0) or 0) if t else 0
+                if last <= 0: continue
+                if sym not in reg:
+                    reg[sym] = {
+                        "cantidad": free,
+                        "precio_compra": last,
+                        "timestamp": now_tz().isoformat(),
+                        "high_since_buy": last,
+                        "sl": None, "tp": None, "be": None
+                    }
+                    logger.info(f"Detectada posición inicial: {sym} {free} @ ~{last}")
+        registro_save(reg)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Señales con datos WS (o REST si no hay cache)
+# ──────────────────────────────────────────────────────────────────────────────
+def get_indicators(symbol):
+    """Devuelve dict con {price, ema50, ema200, rsi14, atr, atr_pct, spread_pct} usando cache WS si es posible."""
+    # precio y spread
+    pr = PRICE_CACHE.get(symbol, {})
+    last = pr.get("last")
+    bid, ask = pr.get("bid"), pr.get("ask")
+    spread_pct = None
+    if bid and ask and ask > 0:
+        spread_pct = (ask - bid) / ask * 100.0
+
+    # velas 5m
+    k = CANDLES_5M.get(symbol)
+    if not k or len(k) < 60 or not k[-1].get("x", True):
+        # fallback REST si no hay suficientes velas finalizadas
+        ks = get_klines_cached(symbol, Client.KLINE_INTERVAL_5MINUTE, limit=200)
+        closes = np.array([float(x[4]) for x in ks], dtype=float)
+        highs  = np.array([float(x[2]) for x in ks], dtype=float)
+        lows   = np.array([float(x[3]) for x in ks], dtype=float)
+        price = float(closes[-1])
+    else:
+        closes = np.array([x["c"] for x in k if x.get("x", True)], dtype=float)
+        highs  = np.array([x["h"] for x in k if x.get("x", True)], dtype=float)
+        lows   = np.array([x["l"] for x in k if x.get("x", True)], dtype=float)
+        price = float(closes[-1])
+
+    ema50 = ema(closes, 50)
+    ema200= ema(closes, 200)
+    r = rsi(closes, 14)
+    atr = atr_from_ohlc(highs, lows, closes, 14)
+    atr_pct = (atr/price)*100.0 if price>0 else 0.0
+    if last is None: last = price
+    return {
+        "price": float(last),
+        "ema50": float(ema50),
+        "ema200": float(ema200),
+        "rsi": float(r),
+        "atr": float(atr),
+        "atr_pct": float(atr_pct),
+        "spread_pct": float(spread_pct) if spread_pct is not None else None
+    }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Selección y entradas
+# ──────────────────────────────────────────────────────────────────────────────
+def mejores_criptos(max_candidates=20):
+    # usa precios del WS si existen; si no, REST
+    vols = []
+    try:
+        # en ausencia de WS de volumen en vivo, usamos 24h (REST)
+        refresh_all_tickers()
+        for sym in ALLOWED_SYMBOLS:
+            t = ALL_TICKERS.get(sym)
+            if not t: continue
+            vol = float(t.get("quoteVolume",0) or 0)
+            last = PRICE_CACHE.get(sym, {}).get("last")
+            if last is None:
+                last = float(t.get("lastPrice",0) or 0)
+            if vol >= MIN_VOLUME and last > 0 and last >= 0.00002:
+                vols.append((sym, vol))
+    except Exception:
+        pass
+    vols.sort(key=lambda x: x[1], reverse=True)
+    return [s for s,_ in vols[:max_candidates]]
+
+def cooling_off(symbol):
+    until = POST_STOP_BAN.get(symbol, 0)
+    return time.time() < until
+
+def comprar():
+    if not daily_risk_ok():
+        logger.info("Límite de pérdida diaria alcanzado.")
+        return
+    reg = registro_load()
+    if len(reg) >= MAX_POSICIONES:
+        logger.info("Máximo de posiciones abiertas.")
+        return
+
+    usdc = safe_get_balance(MONEDA_BASE)
+    if usdc <= 5:
+        logger.info("USDC insuficiente.")
+        return
+
+    now_ts = time.time()
+    global ULTIMAS_OPERACIONES
+    ULTIMAS_OPERACIONES = [t for t in ULTIMAS_OPERACIONES if now_ts - t < 3600]
+    if len(ULTIMAS_OPERACIONES) >= MAX_TRADES_PER_HOUR:
+        logger.info("Límite de trades/hora.")
+        return
+
+    for symbol in mejores_criptos():
+        if symbol in reg or cooling_off(symbol): continue
+        last_buy = ULTIMA_COMPRA.get(symbol, 0)
+        if now_ts - last_buy < TRADE_COOLDOWN_SEC: continue
+
+        try:
+            ind = get_indicators(symbol)
+            price, ema50, ema200 = ind["price"], ind["ema50"], ind["ema200"]
+            r, atr, atr_pct, spread = ind["rsi"], ind["atr"], ind["atr_pct"], ind["spread_pct"]
+
+            if not (ema50 > ema200 and price > ema50):  # tendencia
+                continue
+            if not (RSI_BUY_MIN <= r <= RSI_BUY_MAX):
+                continue
+            if atr_pct < MIN_ATR_PCT:
+                continue
+            if spread is not None and spread > SPREAD_MAX_PCT:
+                continue
+
+            meta = load_symbol_info(symbol)
+            if not meta: continue
+            min_notional = float(min_quote_for_market(symbol))
+            quote_to_spend = max(min_notional, usdc*PORCENTAJE_USDC)
+
+            order = binance_call(
+                client.create_order,
+                symbol=symbol, side="BUY", type="MARKET",
+                quoteOrderQty=f"{quote_to_spend:.8f}"
+            )
+            # precio de ejecución
+            fills = order.get('fills') or []
+            exec_price = price
+            if fills:
+                q = sum(float(f['qty']) for f in fills)
+                c = sum(float(f['price'])*float(f['qty']) for f in fills)
+                exec_price = c/q if q>0 else price
+            qty = sum(float(f['qty']) for f in fills) if fills else float(quote_to_spend/price)
+
+            sl = exec_price - ATR_MULT_SL*atr
+            tp = exec_price + ATR_MULT_TP*atr
+
+            with LOCK:
+                reg = registro_load()
+                reg[symbol] = {
+                    "cantidad": qty,
+                    "precio_compra": float(exec_price),
+                    "timestamp": now_tz().isoformat(),
+                    "high_since_buy": float(exec_price),
+                    "sl": float(sl), "tp": float(tp), "be": None
+                }
+                registro_save(reg)
+
+            act, conf, reason = ("skip",0,"")
+            if openai_client:
+                act, conf, reason = grok_opinion("buy", symbol, {"rsi":round(r,1),"atr_pct":round(atr_pct,3),"spread":spread})
+
+            enviar_telegram(f"🟢 BUY {symbol} ~{quote_to_spend:.2f} {MONEDA_BASE} @ {exec_price:.6f} | RSI {r:.1f} ATR% {atr_pct:.2f} Spread {spread if spread is not None else '-'}% | IA {act} {conf:.2f} {reason}")
+            ULTIMA_COMPRA[symbol] = now_ts
+            ULTIMAS_OPERACIONES.append(now_ts)
+            break  # solo 1 compra por ciclo
+        except BinanceAPIException as e:
+            logger.error(f"Error comprando {symbol}: {e}")
+        except Exception as e:
+            logger.error(f"Error compra {symbol}: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gestión de salidas
+# ──────────────────────────────────────────────────────────────────────────────
+def market_sell(symbol, qty, meta):
+    q = quantize_qty(Decimal(str(qty)), meta["marketStepSize"])
+    if q <= 0: return None
+    return binance_call(client.order_market_sell, symbol=symbol, quantity=f"{q:.12f}")
+
+def gestionar_posiciones():
+    with LOCK:
+        reg = registro_load()
+    if not reg: return
+
+    nuevos = {}
+    to_clean = []
+
+    for symbol, data in reg.items():
+        try:
+            ind = get_indicators(symbol)
+            price, r, atr = ind["price"], ind["rsi"], ind["atr"]
+            spread = ind["spread_pct"]
+
+            if price <= 0:
+                nuevos[symbol] = data; continue
+            if spread is not None and spread > SPREAD_MAX_PCT:
+                # si spread alto, evitamos salir con mala ejecución salvo SL
+                pass
+
+            qty = float(data.get("cantidad", 0))
+            if qty <= 0:
+                to_clean.append(symbol); continue
+
+            entry = float(data["precio_compra"])
+            high  = float(data.get("high_since_buy", entry))
+            sl = data.get("sl"); tp = data.get("tp"); be = data.get("be")
+
+            # actualiza high
+            if price > high:
+                high = price
+
+            # activa BE al alcanzar +0.75R
+            if be is None and price >= (entry + 0.75*ATR_MULT_TP*atr):
+                be = max(entry, entry + 0.05*atr)
+
+            # trailing
+            trail = max((high - ATR_TRAIL*atr), (be if be else -1e9))
+
+            # condiciones
+            hit_sl = price <= (sl if sl is not None else entry - ATR_MULT_SL*atr)
+            hit_tp = price >= (tp if tp is not None else entry + ATR_MULT_TP*atr)
+            hit_trail = price <= trail
+
+            # tiempo máximo
+            ts_open = datetime.fromisoformat(data["timestamp"])
+            open_secs = (now_tz() - ts_open.replace(tzinfo=TZ_MADRID)).total_seconds()
+            too_long = open_secs >= MAX_HOLD_HOURS*3600
+
+            # RSI over para tomar beneficios
+            take_rsi = (r >= RSI_SELL_MIN) and price > entry
+
+            reason = None
+            if hit_sl or hit_trail or too_long:
+                reason = "SL" if hit_sl else ("TRAIL" if hit_trail else "TIME")
+            elif hit_tp or take_rsi:
+                reason = "TP/RSI"
+
+            if reason:
+                meta = load_symbol_info(symbol)
+                if not meta:
+                    nuevos[symbol] = data; continue
+                before_val = qty*price
+                order = market_sell(symbol, qty, meta)
+                if order is None:
+                    nuevos[symbol] = data; continue
+
+                fills = order.get('fills') or []
+                exec_p = price
+                if fills:
+                    qf = sum(float(f['qty']) for f in fills)
+                    cf = sum(float(f['price'])*float(f['qty']) for f in fills)
+                    exec_p = cf/qf if qf>0 else price
+
+                pnl = (exec_p - entry)*qty
+                total = update_pnl_today(pnl)
+                enviar_telegram(f"🔴 SELL {symbol} {qty:.8f} @ {exec_p:.6f} | motivo {reason} | PnL {pnl:.2f} {MONEDA_BASE} | PnL hoy {total:.2f}")
+
+                if reason in ("SL","TRAIL"):
+                    POST_STOP_BAN[symbol] = time.time() + COOLDOWN_POST_STOP_MIN*60
+                to_clean.append(symbol)
+            else:
+                data["high_since_buy"] = high
+                data["sl"] = float(entry - ATR_MULT_SL*atr) if sl is None else float(sl)
+                data["tp"] = float(entry + ATR_MULT_TP*atr) if tp is None else float(tp)
+                data["be"] = be
+                nuevos[symbol] = data
+        except Exception as e:
+            logger.error(f"Gestión {symbol} error: {e}")
+            nuevos[symbol] = data
+
+    for s in to_clean:
+        if s in nuevos: del nuevos[s]
+    with LOCK:
+        registro_save(nuevos)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resumen diario
+# ──────────────────────────────────────────────────────────────────────────────
+def resumen_diario():
+    try:
+        st = init_day_state()
+        total_value = cartera_value_usdc()
+        pnl_hoy = st.get("pnl_today", 0.0)
+        enviar_telegram(f"📊 Resumen ({today_key()}): PNL hoy {pnl_hoy:.2f} {MONEDA_BASE} | Equity {total_value:.2f} | Inicio {st.get('start_equity',0):.2f}")
+    except Exception as e:
+        logger.error(f"Resumen diario error: {e}")
+
+def reset_diario():
+    init_day_state()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    init_day_state()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: Modo conservador activado, bajo riesgo, diversificación, focus en net profit post-fees.")
+    # Inicia WS (miniTicker/bookTicker siempre; kline 5m según flags)
+    start_streams(ALLOWED_SYMBOLS)
+
+    enviar_telegram("🤖 Bot IA WS activo: 5m tendencia + ATR, trailing dinámico, 100% USDC, control diario %, spread-check, WS en vivo.")
 
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', minutes=15, id="comprar")  # menos frecuente
-    scheduler.add_job(vender_y_convertir, 'interval', minutes=5, id="vender")
+    scheduler.add_job(comprar, 'interval', minutes=4, id="comprar")
+    scheduler.add_job(gestionar_posiciones, 'interval', minutes=1, id="gestionar")
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
-    scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
+    scheduler.add_job(reset_diario, 'cron', hour=0, minute=3, id="reset")
     scheduler.start()
+
     try:
         while True:
             time.sleep(10)
     except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+        try:
+            scheduler.shutdown()
+        except Exception:
+            pass
+        stop_streams()
         logger.info("Bot detenido.")
