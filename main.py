@@ -32,36 +32,36 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 # xAI / Grok (OpenAI-compatible)
 XAI_API_KEY = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY") or ""
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-4-0709").strip()
-GROK_MINUTES = int(os.getenv("GROK_MINUTES", "10"))  # cadencia mínima de consultas IA, reducido para más movimiento
+GROK_MINUTES = int(os.getenv("GROK_MINUTES", "5"))  # cadencia mínima de consultas IA, reducido para más uso
 
 # Mercado / símbolos
 MONEDA_BASE = os.getenv("MONEDA_BASE", "USDC").upper()
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "500000"))  # reducido para más candidatos
-MAX_POSICIONES = int(os.getenv("MAX_POSICIONES", "8"))  # aumentado para más posiciones
-MIN_SALDO_COMPRA = float(os.getenv("MIN_SALDO_COMPRA", "30"))  # reducido
-PORCENTAJE_USDC = float(os.getenv("PORCENTAJE_USDC", "0.6"))  # aumentado para trades más grandes
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "100000"))  # reducido para más candidatos
+MAX_POSICIONES = int(os.getenv("MAX_POSICIONES", "15"))  # aumentado para más posiciones y riesgo
+MIN_SALDO_COMPRA = float(os.getenv("MIN_SALDO_COMPRA", "10"))  # reducido para usar más saldo
+PORCENTAJE_USDC = float(os.getenv("PORCENTAJE_USDC", "1.0"))  # 100% para meter todo el saldo a trabajar
 ALLOWED_SYMBOLS = [
     s.strip().upper() for s in os.getenv(
         "ALLOWED_SYMBOLS",
-        "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,XRPUSDC,DOGEUSDC,ADAUSDC,PEPEUSDC,TONUSDC,SHIBUSDC,AVAXUSDC,DOTUSDC,LINKUSDC"
+        "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,XRPUSDC,DOGEUSDC,ADAUSDC,PEPEUSDC,TONUSDC,SHIBUSDC,AVAXUSDC,DOTUSDC,LINKUSDC,TRXUSDC,MATICUSDC,UNIUSDC,LTCUSDC,NEARUSDC"
     ).split(",") if s.strip()
-]  # más símbolos para más oportunidades
+]  # más símbolos para más oportunidades y agresividad
 
-# Estrategia (más agresiva para más movimiento, pero con Grok para inteligencia)
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.7")) / 100.0      # +0.7% reducido para ventas más rápidas
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.5")) / 100.0         # -0.5% menos estricto
-TRAILING_STOP = float(os.getenv("TRAILING_STOP", "0.4")) / 100.0  # -0.4% para trailing más sensible
+# Estrategia (más agresiva: umbrales más bajos para trades rápidos)
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.3")) / 100.0      # +0.3% para ventas ultra rápidas
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.3")) / 100.0         # -0.3% más riesgo
+TRAILING_STOP = float(os.getenv("TRAILING_STOP", "0.2")) / 100.0  # -0.2% trailing muy sensible
 COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", "0.001"))    # 0.1%
-RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "48"))               # <48, menos estricto para más buys
-RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "62"))             # >62, menos estricto para más sells
-MIN_NET_GAIN_ABS = float(os.getenv("MIN_NET_GAIN_ABS", "0.1"))    # umbral neto más bajo
+RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "60"))               # <60, muy permisivo para más buys
+RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "50"))             # >50, muy permisivo para más sells
+MIN_NET_GAIN_ABS = float(os.getenv("MIN_NET_GAIN_ABS", "0.01"))   # umbral neto mínimo
 
-# Ritmo / límites (más frecuentes para más movimiento)
-TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "180"))  # 3 min cooldown
-MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "12")) # aumentado
+# Ritmo / límites (más agresivo: más trades)
+TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "60"))   # 1 min cooldown
+MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "30")) # muy aumentado para más operaciones
 
-# Riesgo diario (un poco más permisivo)
-PERDIDA_MAXIMA_DIARIA = float(os.getenv("PERDIDA_MAXIMA_DIARIA", "80"))
+# Riesgo diario (más riesgo: límite más alto)
+PERDIDA_MAXIMA_DIARIA = float(os.getenv("PERDIDA_MAXIMA_DIARIA", "200"))
 
 # Horarios
 TZ_MADRID = pytz.timezone("Europe/Madrid")
@@ -80,7 +80,7 @@ for var, name in [(API_KEY, "BINANCE_API_KEY"), (API_SECRET, "BINANCE_API_SECRET
 
 client = Client(API_KEY, API_SECRET)
 
-# Grok vía SDK OpenAI-compatible de xAI (token-frugal, pero más inteligente)
+# Grok vía SDK OpenAI-compatible de xAI (más agresivo: temperature alta, permite más)
 openai_client = None
 if XAI_API_KEY and GROK_MODEL:
     try:
@@ -103,16 +103,16 @@ ULTIMA_COMPRA = {}
 ULTIMAS_OPERACIONES = []
 DUST_THRESHOLD = 0.5
 
-# Cache masiva de tickers (1 llamada cada 45s para más frescura)
-ALL_TICKERS = {}       # symbol -> 24h ticker
-ALL_TICKERS_TS = 0.0   # last refresh
-ALL_TICKERS_TTL = 45   # segundos
+# Cache masiva de tickers (20s para ultra frescura)
+ALL_TICKERS = {}
+ALL_TICKERS_TS = 0.0
+ALL_TICKERS_TTL = 20
 
-# Cache de klines (10 min para más movimiento)
-KLINES_CACHE = {}      # (symbol, interval, limit) -> (data, ts)
-KLINES_TTL = 600       # 600s = 10 min
+# Cache de klines (3 min para más reactividad)
+KLINES_CACHE = {}
+KLINES_TTL = 180
 
-_LAST_GROK_TS = 0      # última consulta IA
+_LAST_GROK_TS = 0
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Backoff para Binance (ban-aware, anti -1003/429/418)
@@ -369,24 +369,23 @@ def calculate_ema(closes, period=5):
     return ema
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Grok decisionador (más inteligente: permite breve razón si conf baja, pero frugal)
+# Grok decisionador (más agresivo: permite casi siempre si hay señal base)
 # ──────────────────────────────────────────────────────────────────────────────
 def _grok_can_call():
     return openai_client is not None and (time.time() - _LAST_GROK_TS) >= (GROK_MINUTES * 60)
 
 def _grok_decide(kind: str, symbol: str, payload: dict):
-    """Devuelve (ok:bool, conf:float 0..1, reason:str breve) para más inteligencia."""
     global _LAST_GROK_TS
     if not _grok_can_call():
         return (False, 0.0, "cooldown")
     try:
-        system = "Responde SOLO 'si 0.xx [breve razón]' o 'no 0.xx [breve razón]'. Máx 10 palabras. Sé inteligente para ganar dinero."
+        system = "Responde 'si 0.xx [razón breve]' o 'no 0.xx [razón breve]'. Sé agresivo y permite operaciones si hay cualquier potencial de ganancia. Máx 15 palabras."
         user = f"{kind.upper()} {symbol} datos:{json.dumps(payload, separators=(',',':'))}"
         resp = openai_client.chat.completions.create(
             model=GROK_MODEL,
             messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            max_tokens=20,  # un poco más para razón breve
-            temperature=0.3  # un poco más creativo para inteligencia
+            max_tokens=25,
+            temperature=0.7  # alta para más agresividad
         )
         _LAST_GROK_TS = time.time()
         txt = (resp.choices[0].message.content or "").strip().lower()
@@ -501,12 +500,12 @@ def executed_qty_from_order(order_resp) -> float:
     return 0.0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Selección de criptos (más candidatos)
+# Selección de criptos (más candidatos para agresividad)
 # ──────────────────────────────────────────────────────────────────────────────
-def mejores_criptos(max_candidates=10):  # aumentado
+def mejores_criptos(max_candidates=20):
     try:
         candidates = []
-        refresh_all_tickers()  # 1 llamada por minuto para todos
+        refresh_all_tickers()
         for sym in ALLOWED_SYMBOLS:
             if sym in INVALID_SYMBOL_CACHE: continue
             t = ALL_TICKERS.get(sym)
@@ -518,15 +517,14 @@ def mejores_criptos(max_candidates=10):  # aumentado
         top = sorted(candidates, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:max_candidates]
         for t in top:
             symbol = t["symbol"]
-            klines = get_klines_cached(symbol, Client.KLINE_INTERVAL_5MINUTE, limit=40)  # 5min para más sensibilidad
+            klines = get_klines_cached(symbol, Client.KLINE_INTERVAL_1MINUTE, limit=40)  # 1min para ultra agresividad
             closes = [float(k[4]) for k in klines]
             if len(closes) < 20: continue
             rsi = calculate_rsi(closes)
             ema5 = calculate_ema(closes, 5)
             precio = float(t.get("lastPrice", 0) or 0)
-            if precio <= 0 or precio <= ema5:  # momentum simple
-                continue
-            # TP neto positivo tras comisiones
+            if precio <= 0: continue  # quitado filtro ema para más buys
+            # TP neto positivo tras comisiones (menos estricto)
             ganancia_bruta = precio * TAKE_PROFIT
             com_compra = precio * COMMISSION_RATE
             com_venta = (precio * (1 + TAKE_PROFIT)) * COMMISSION_RATE
@@ -540,7 +538,7 @@ def mejores_criptos(max_candidates=10):  # aumentado
         return []
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Trading (más agresivo, con rotación implícita al vender y comprar otro)
+# Trading (más agresivo: más buys por ciclo, conf baja)
 # ──────────────────────────────────────────────────────────────────────────────
 def comprar():
     if not puede_comprar():
@@ -552,7 +550,7 @@ def comprar():
             logger.info("Saldo USDC insuficiente para comprar.")
             return
 
-        cantidad_usdc = saldo_spot * PORCENTAJE_USDC
+        cantidad_usdc = saldo_spot * PORCENTAJE_USDC  # 100% del saldo
         criptos = mejores_criptos()
         registro = cargar_json(REGISTRO_FILE)
 
@@ -569,7 +567,7 @@ def comprar():
 
         compradas = 0
         for cripto in criptos:
-            if compradas >= 2: break  # permite hasta 2 buys por ciclo para más movimiento
+            if compradas >= 3: break  # hasta 3 buys por ciclo para más agresividad
             symbol = cripto["symbol"]
             if symbol in registro: continue
             last = ULTIMA_COMPRA.get(symbol, 0)
@@ -581,12 +579,11 @@ def comprar():
             if precio <= 0: continue
             rsi = cripto.get("rsi", 50.0)
 
-            meta, quote_to_spend, min_quote = quantize_amounts_for_market(symbol, dec(str(cantidad_usdc)))
+            meta, quote_to_spend, min_quote = quantize_amounts_for_market(symbol, dec(str(cantidad_usdc / (MAX_POSICIONES - len(registro)))))  # dividir saldo para múltiples posiciones
             if quote_to_spend is None:
                 logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
                 continue
 
-            # Señal base: RSI bajo + momentum
             base_signal = rsi < RSI_BUY_MAX
 
             ok_grok, conf, reason = (False, 0.0, "")
@@ -601,7 +598,7 @@ def comprar():
                 }
                 ok_grok, conf, reason = _grok_decide("buy", symbol, payload)
 
-            if base_signal and (openai_client is None or ok_grok or conf >= 0.5):  # conf más baja para más trades
+            if base_signal and (openai_client is None or ok_grok or conf >= 0.3):  # conf muy baja para más trades
                 try:
                     orden = binance_call(
                         client.create_order,
@@ -655,14 +652,13 @@ def vender_y_convertir():
 
                 cambio = (precio_actual - precio_compra) / (precio_compra if precio_compra != 0 else Decimal('1'))
 
-                klines = get_klines_cached(symbol, Client.KLINE_INTERVAL_5MINUTE, limit=40)  # 5min
+                klines = get_klines_cached(symbol, Client.KLINE_INTERVAL_1MINUTE, limit=40)
                 closes = [float(k[4]) for k in klines]
                 rsi = calculate_rsi(closes)
                 meta = load_symbol_info(symbol)
                 if not meta:
                     nuevos_registro[symbol] = data; continue
 
-                # Actualiza máximo para trailing
                 if precio_actual > high_since_buy:
                     data["high_since_buy"] = float(precio_actual)
                     guardar_json(registro, REGISTRO_FILE)
@@ -691,7 +687,7 @@ def vender_y_convertir():
                 vender_por_stop = float(cambio) <= STOP_LOSS or trailing_trigger
                 vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN) and ganancia_neta > MIN_NET_GAIN_ABS
 
-                ok_grok, conf, reason = (True, 1.0, "")  # por defecto no bloquea
+                ok_grok, conf, reason = (True, 1.0, "") 
                 if openai_client is not None and (vender_por_stop or vender_por_profit):
                     payload = {
                         "chg": round(float(cambio),5),
@@ -701,8 +697,7 @@ def vender_y_convertir():
                         "net": round(ganancia_neta,4)
                     }
                     ok_grok, conf, reason = _grok_decide("sell", symbol, payload)
-                    # si TP con ganancia neta muy pequeña y baja confianza, aplaza
-                    if vender_por_profit and ganancia_neta < 0.5 and conf < 0.4:
+                    if vender_por_profit and ganancia_neta < 0.2 and conf < 0.2:
                         ok_grok = False
 
                 if vender_por_stop or vender_por_profit:
@@ -779,12 +774,11 @@ def safe_get_balance(asset):
 
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA activo: Más movimiento, Grok inteligente/frugal, RSI/momentum ajustado, rotación implícita. Cartera inicial conservada.")
+    enviar_telegram("🤖 Bot IA activo: Ultra agresivo, alto riesgo, 100% saldo trabajando, Grok permisivo, trades rápidos. Cartera inicial conservada.")
 
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    # Ritmos más frecuentes para más movimiento
-    scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")          # cada 10 min
-    scheduler.add_job(vender_y_convertir, 'interval', minutes=5, id="vender") # cada 5 min
+    scheduler.add_job(comprar, 'interval', minutes=5, id="comprar")           # cada 5 min
+    scheduler.add_job(vender_y_convertir, 'interval', minutes=2, id="vender") # cada 2 min
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
