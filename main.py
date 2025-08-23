@@ -56,10 +56,10 @@ MIN_SALDO_COMPRA = 50
 TAKE_PROFIT = 0.03  # 3%
 STOP_LOSS = -0.03  # -3%
 COMMISSION_RATE = 0.001  # 0.1% por operación
-TRAILING_STOP = 0.015  # 1.5% trailing
 RSI_BUY_MAX = 35
 RSI_SELL_MIN = 70
 MIN_NET_GAIN_ABS = 0.5
+TRAILING_STOP = 0.015  # 1.5% trailing
 TRADE_COOLDOWN_SEC = 300
 MAX_TRADES_PER_HOUR = 6
 PERDIDA_MAXIMA_DIARIA = 50
@@ -94,6 +94,19 @@ if ENABLE_GROK_ROTATION and OpenAI is not None:
 else:
     logger.info("Grok desactivado: falta GROK_API_KEY o biblioteca OpenAI.")
     ENABLE_GROK_ROTATION = False
+# Cache para tickers, extendido a 2 min
+def get_cached_ticker(symbol):
+    now = time.time()
+    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 120:  # Cache 2 min
+        return TICKERS_CACHE[symbol]['data']
+    try:
+        t = retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5)
+        if t and float(t.get('lastPrice', 0)) > 0:
+            TICKERS_CACHE[symbol] = {'data': t, 'ts': now}
+            return t
+    except Exception as e:
+        logger.error(f"Error cache ticker {symbol}: {e}")
+    return None
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilidades generales
 # ──────────────────────────────────────────────────────────────────────────────
