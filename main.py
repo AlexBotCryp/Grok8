@@ -72,11 +72,16 @@ client = Client(API_KEY, API_SECRET)
 client_openai = None
 if ENABLE_GROK_ROTATION and GROK_API_KEY and OpenAI is not None:
     try:
-        client_openai = OpenAI(api_key=GROK_API_KEY, base_url=GROK_BASE_URL)
+        client_openai = OpenAI(
+            api_key=GROK_API_KEY,
+            base_url=GROK_BASE_URL
+        )
+        logger.info("Grok inicializado correctamente.")
     except Exception as e:
         logger.warning(f"No se pudo inicializar Grok: {e}")
         client_openai = None
 else:
+    logger.info("Grok desactivado: falta GROK_API_KEY o biblioteca OpenAI.")
     ENABLE_GROK_ROTATION = False
 # Locks / caches / rate controls
 LOCK = threading.RLock()
