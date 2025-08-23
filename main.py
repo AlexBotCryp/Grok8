@@ -1,4 +1,3 @@
-```python
 # -*- coding: utf-8 -*-
 import os
 import time
@@ -41,18 +40,18 @@ consulta_contador = 0
 _LAST_GROK_TS = 0
 for var, name in [(API_KEY, "BINANCE_API_KEY"), (API_SECRET, "BINANCE_API_SECRET")]:
     if not var:
-        raise ValueError(f"Falta variable de entorno: {name}")
+        raise ValueValueError(f"Falta variable de entorno: {name}")
 # Mercado — removidos ultra-volátiles para menos pérdidas
 MONEDA_BASE = "USDC"
 MIN_VOLUME = 1_000_000
-MAX_POSICIONES = 5
+MAX_POSICIONES = 1 # Cambiado a 1 para usar 100% de la cartera en una sola cripto
 MIN_SALDO_COMPRA = 50
-PORCENTAJE_USDC = 1.0  # Cambiado a 1.0 para usar 100% del saldo disponible en compras
+PORCENTAJE_USDC = 1.0  # Usa 100% del saldo disponible en compras
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC']  # Menos volátiles
 # Estrategia — simétrica para mejor R:R
 TAKE_PROFIT = 0.03  # 3%
 STOP_LOSS = -0.03  # -3%
-COMMISSION_RATE = 0.001
+COMMISSION_RATE = 0.001  # 0.1% por operación (compra y venta)
 RSI_BUY_MAX = 35  # Más estricto para buys en oversold
 RSI_SELL_MIN = 70  # Más overbought para sells
 MIN_NET_GAIN_ABS = 0.5  # Aumentado para evitar trades pequeños
@@ -495,7 +494,7 @@ def comprar():
             if not meta:
                 continue
             min_quote = min_quote_for_market(symbol)
-            quote_to_spend = dec(str(cantidad_usdc))
+            quote_to_spend = dec(str(cantidad_usdc)) * (1 - COMMISSION_RATE)  # Ajuste por comisión
             if quote_to_spend < min_quote:
                 logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
                 continue
@@ -608,6 +607,8 @@ def vender_y_convertir():
                                 f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
                                 f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}. Grok: {grok_resp}"
                             )
+                            # Intentar comprar la mejor cripto inmediatamente después de vender
+                            comprar()
                         except BinanceAPIException as e:
                             logger.error(f"Error vendiendo {symbol}: {e}")
                             dust_positions.append(symbol)
@@ -665,7 +666,7 @@ def vender_y_convertir():
                                 f"Debo rotar vendiendo {worst_sym} (cambio {worst_change*100:.2f}%, RSI {worst_rsi:.2f}, net {worst_net:.4f}) "
                                 f"a {best_symbol} (RSI {best_rsi:.2f}, volumen alto)? Sé conservador, responde 'si' o 'no'."
                             )
-                            respuesta = consultar_grok(prompt) if use_grok else "no"
+                            respuesta = consultar_grok(prompt) if use_grok else "si"
                             if 'si' in respuesta:
                                 try:
                                     meta = load_symbol_info(worst_sym)
@@ -682,6 +683,8 @@ def vender_y_convertir():
                                     enviar_telegram(f"🔄 Rotación: vendido {worst_sym} (PnL neto {worst_net:.2f}). Para {best_symbol}. Grok: sí")
                                     del registro[worst_sym]
                                     guardar_json(registro, REGISTRO_FILE)
+                                    # Intentar comprar la mejor cripto después de rotar
+                                    comprar()
                                 except Exception as e:
                                     logger.error(f"Error en venta por rotación {worst_sym}: {e}")
             except Exception as e:
@@ -734,4 +737,3 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
         logger.info("Bot detenido.")
-```
