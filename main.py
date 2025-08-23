@@ -52,13 +52,13 @@ ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEU
 MIN_VOLUME = 1_000_000
 MAX_POSICIONES = 1  # Una sola posición para 100% de la cartera
 PORCENTAJE_USDC = 1.0  # Usa 100% del saldo disponible
-MIN_SALDO_COMPRA = 50
+MIN_SALDO_COMPRA = 20  # Reducido para permitir trades pequeños
 TAKE_PROFIT = 0.03  # 3%
 STOP_LOSS = -0.03  # -3%
 COMMISSION_RATE = 0.001  # 0.1% por operación
-RSI_BUY_MAX = 35
+RSI_BUY_MAX = 30  # Reducido para más oportunidades
 RSI_SELL_MIN = 70
-MIN_NET_GAIN_ABS = 0.5
+MIN_NET_GAIN_ABS = 0.2  # Reducido para aceptar ganancias pequeñas
 TRAILING_STOP = 0.015  # 1.5% trailing
 TRADE_COOLDOWN_SEC = 300
 MAX_TRADES_PER_HOUR = 6
@@ -278,7 +278,7 @@ def calculate_ema(closes, period=5):
         ema = (price - ema) * multiplier + ema
     return ema
 # ──────────────────────────────────────────────────────────────────────────────
-# Grok helper — solo para casos borderline
+# Grok helper — solo para rotaciones borderline
 # ──────────────────────────────────────────────────────────────────────────────
 def consultar_grok(prompt):
     global consulta_contador, _LAST_GROK_TS
@@ -423,10 +423,13 @@ def mejores_criptos(max_candidates=5):
                 continue
             t = get_cached_ticker(sym)
             if not t:
+                logger.info(f"No se obtuvo ticker para {sym}")
                 continue
             vol = float(t.get("quoteVolume", 0) or 0)
             if vol > MIN_VOLUME:
                 candidates.append(t)
+            else:
+                logger.info(f"{sym} descartado: volumen {vol} < {MIN_VOLUME}")
             time.sleep(0.5)
         filtered = []
         for t in sorted(candidates, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:max_candidates]:
@@ -434,6 +437,7 @@ def mejores_criptos(max_candidates=5):
             klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=215))
             closes = [float(k[4]) for k in klines]
             if len(closes) < 215:
+                logger.info(f"{symbol} descartado: datos insuficientes")
                 continue
             rsi = calculate_rsi(closes[-15:])
             ema5 = calculate_ema(closes[-20:], 5)
@@ -443,17 +447,21 @@ def mejores_criptos(max_candidates=5):
                 logger.info(f"{symbol} skip: precio {precio} <= EMA200 {ema200}")
                 continue
             if precio <= ema5:
+                logger.info(f"{symbol} skip: precio {precio} <= EMA5 {ema5}")
                 continue
             ganancia_bruta = precio * TAKE_PROFIT
             comision_compra = precio * COMMISSION_RATE
             comision_venta = (precio * (1 + TAKE_PROFIT)) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-            if ganancia_neta > 0:
+            if ganancia_neta > MIN_NET_GAIN_ABS:
                 t['rsi'] = rsi
                 t['ema5'] = ema5
                 t['ema200'] = ema200
                 filtered.append(t)
+            else:
+                logger.info(f"{symbol} descartado: ganancia neta {ganancia_neta} <= {MIN_NET_GAIN_ABS}")
             time.sleep(1)
+        logger.info(f"Criptos filtradas: {[t['symbol'] for t in filtered]}")
         return sorted(filtered, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
     except BinanceAPIException as e:
         logger.error(f"Error obteniendo tickers: {e}")
@@ -466,13 +474,20 @@ def comprar():
         logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
         return
     try:
+        logger.info("Iniciando función comprar")
         saldo_spot = safe_get_balance(MONEDA_BASE)
+        logger.info(f"Saldo USDC disponible: {saldo_spot}")
         if saldo_spot < MIN_SALDO_COMPRA:
-            logger.info("Saldo USDC insuficiente para comprar.")
+            logger.info(f"Saldo USDC insuficiente: {saldo_spot} < {MIN_SALDO_COMPRA}")
             return
         cantidad_usdc = saldo_spot * PORCENTAJE_USDC
+        logger.info(f"Cantidad a usar: {cantidad_usdc} USDC")
         criptos = mejores_criptos()
+        if not criptos:
+            logger.info("No hay criptos candidatas para comprar")
+            return
         registro = cargar_json(REGISTRO_FILE)
+        logger.info(f"Posiciones abiertas: {list(registro.keys())}")
         if len(registro) >= MAX_POSICIONES:
             logger.info("Máximo de posiciones abiertas alcanzado. No se comprará más.")
             return
@@ -488,63 +503,64 @@ def comprar():
                 break
             symbol = cripto["symbol"]
             if symbol in registro:
+                logger.info(f"{symbol} ya en cartera, saltando")
                 continue
             last = ULTIMA_COMPRA.get(symbol, 0)
             if now_ts - last < TRADE_COOLDOWN_SEC:
+                logger.info(f"{symbol} en cooldown, espera {TRADE_COOLDOWN_SEC - (now_ts - last)} segundos")
                 continue
             ticker = safe_get_ticker(symbol)
             if not ticker:
+                logger.info(f"No se obtuvo ticker para {symbol}")
                 continue
             precio = dec(str(ticker["lastPrice"]))
             if precio <= 0:
+                logger.info(f"{symbol} precio inválido: {precio}")
                 continue
             rsi = cripto.get("rsi", 50)
             meta = load_symbol_info(symbol)
             if not meta:
+                logger.info(f"No se obtuvo info de {symbol}")
                 continue
             min_quote = min_quote_for_market(symbol)
             quote_to_spend = dec(str(cantidad_usdc)) * (1 - COMMISSION_RATE)
             if quote_to_spend < min_quote:
-                logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
+                logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE})")
                 continue
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
             if rsi < RSI_BUY_MAX:
-                use_grok = rsi > 30
-                prompt_buy = f"¿Comprar {symbol} ahora? RSI {rsi:.2f}, precio {float(precio):.6f}, volumen alto. Responde 'si' o 'no'."
-                grok_resp = consultar_grok(prompt_buy) if use_grok else "si"
-                if 'si' in grok_resp:
-                    try:
-                        orden = retry(
-                            lambda: client.create_order(
-                                symbol=symbol,
-                                side="BUY",
-                                type="MARKET",
-                                quoteOrderQty=format(quote_to_spend, 'f')
-                            ),
-                            tries=2, base_delay=0.6
-                        )
-                        executed_qty = executed_qty_from_order(orden)
-                        if executed_qty <= 0:
-                            executed_qty = float(quote_to_spend) / float(precio)
-                        with LOCK:
-                            registro = cargar_json(REGISTRO_FILE)
-                            registro[symbol] = {
-                                "cantidad": executed_qty,
-                                "precio_compra": float(precio),
-                                "timestamp": now_tz().isoformat(),
-                                "high_since_buy": float(precio)
-                            }
-                            guardar_json(registro, REGISTRO_FILE)
-                        enviar_telegram(f"🟢 Comprado {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE} a ~{float(precio):.6f}. RSI: {rsi:.2f}. Grok: {grok_resp}")
-                        compradas += 1
-                        ULTIMA_COMPRA[symbol] = now_ts
-                        ULTIMAS_OPERACIONES.append(now_ts)
-                    except BinanceAPIException as e:
-                        logger.error(f"Error comprando {symbol}: {e}")
-                    except Exception as e:
-                        logger.error(f"Error inesperado comprando {symbol}: {e}")
-                else:
-                    logger.info(f"Grok dice no a {symbol} (RSI borderline)")
+                logger.info(f"{symbol} cumple RSI: {rsi:.2f} < {RSI_BUY_MAX}")
+                try:
+                    orden = retry(
+                        lambda: client.create_order(
+                            symbol=symbol,
+                            side="BUY",
+                            type="MARKET",
+                            quoteOrderQty=format(quote_to_spend, 'f')
+                        ),
+                        tries=2, base_delay=0.6
+                    )
+                    executed_qty = executed_qty_from_order(orden)
+                    if executed_qty <= 0:
+                        executed_qty = float(quote_to_spend) / float(precio)
+                    with LOCK:
+                        registro = cargar_json(REGISTRO_FILE)
+                        registro[symbol] = {
+                            "cantidad": executed_qty,
+                            "precio_compra": float(precio),
+                            "timestamp": now_tz().isoformat(),
+                            "high_since_buy": float(precio)
+                        }
+                        guardar_json(registro, REGISTRO_FILE)
+                    enviar_telegram(f"🟢 Comprado {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE} a ~{float(precio):.6f}. RSI: {rsi:.2f}.")
+                    compradas += 1
+                    ULTIMA_COMPRA[symbol] = now_ts
+                    ULTIMAS_OPERACIONES.append(now_ts)
+                    logger.info(f"Compra exitosa: {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE}")
+                except BinanceAPIException as e:
+                    logger.error(f"Error comprando {symbol}: {e}")
+                except Exception as e:
+                    logger.error(f"Error inesperado comprando {symbol}: {e}")
             else:
                 logger.info(f"No se compra {symbol}: RSI {rsi:.2f} > {RSI_BUY_MAX}")
             time.sleep(1)
@@ -555,6 +571,7 @@ def vender_y_convertir():
         registro = cargar_json(REGISTRO_FILE)
         nuevos_registro = {}
         dust_positions = []
+        logger.info(f"Posiciones en cartera: {list(registro.keys())}")
         for symbol, data in list(registro.items()):
             try:
                 precio_compra = dec(str(data["precio_compra"]))
@@ -562,6 +579,7 @@ def vender_y_convertir():
                 ticker = safe_get_ticker(symbol)
                 if not ticker:
                     nuevos_registro[symbol] = data
+                    logger.info(f"No se obtuvo ticker para {symbol}, manteniendo posición")
                     continue
                 precio_actual = dec(str(ticker["lastPrice"]))
                 cambio = (precio_actual - precio_compra) / (precio_compra if precio_compra != 0 else Decimal('1'))
@@ -571,6 +589,7 @@ def vender_y_convertir():
                 meta = load_symbol_info(symbol)
                 if not meta:
                     nuevos_registro[symbol] = data
+                    logger.info(f"No se obtuvo info para {symbol}, manteniendo posición")
                     continue
                 if precio_actual > high_since_buy:
                     data["high_since_buy"] = float(precio_actual)
@@ -580,15 +599,18 @@ def vender_y_convertir():
                 cantidad_wallet = dec(str(safe_get_balance(asset)))
                 if cantidad_wallet <= 0:
                     dust_positions.append(symbol)
+                    logger.info(f"{symbol} sin cantidad en wallet, marcando como dust")
                     continue
                 qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
                 if qty < meta["marketMinQty"] or qty <= Decimal('0'):
                     dust_positions.append(symbol)
+                    logger.info(f"{symbol} cantidad {qty} menor a minQty {meta['marketMinQty']}, marcando como dust")
                     continue
                 if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_actual > 0:
                     notional_est = qty * precio_actual
                     if notional_est < meta["minNotional"] or float(notional_est) < DUST_THRESHOLD:
                         dust_positions.append(symbol)
+                        logger.info(f"{symbol} notional {notional_est} menor a minNotional {meta['minNotional']}, marcando como dust")
                         continue
                 ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
                 comision_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
@@ -634,6 +656,7 @@ def vender_y_convertir():
             try:
                 registro = cargar_json(REGISTRO_FILE)
                 if not registro:
+                    logger.info("No hay posiciones para rotar")
                     return
                 criptos = mejores_criptos()
                 if criptos:
@@ -678,6 +701,7 @@ def vender_y_convertir():
                                     if qty < meta["marketMinQty"] or qty <= Decimal('0'):
                                         del registro[worst_sym]
                                         guardar_json(registro, REGISTRO_FILE)
+                                        logger.info(f"{worst_sym} eliminado por cantidad insuficiente")
                                         return
                                     orden = market_sell_with_fallback(worst_sym, qty, meta)
                                     logger.info(f"Rotación: vendido {worst_sym}: {orden}")
