@@ -1,3 +1,4 @@
+```python
 # -*- coding: utf-8 -*-
 import os
 import time
@@ -46,7 +47,7 @@ MONEDA_BASE = "USDC"
 MIN_VOLUME = 1_000_000
 MAX_POSICIONES = 5
 MIN_SALDO_COMPRA = 50
-PORCENTAJE_USDC = 0.2  # Reducido a 20% para menos riesgo
+PORCENTAJE_USDC = 1.0  # Cambiado a 1.0 para usar 100% del saldo disponible en compras
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC']  # Menos volátiles
 # Estrategia — simétrica para mejor R:R
 TAKE_PROFIT = 0.03  # 3%
@@ -720,7 +721,7 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA actualizado: Más rentable (R:R 1:1, menos riesgo, EMA trend filter). Grok usado sparingly. Cartera inicial conservada.")
+    enviar_telegram("🤖 Bot IA actualizado: Usa 100% del saldo, rotación fluida con comisiones consideradas. Cartera inicial conservada.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")  # Más frecuente para opportunities
     scheduler.add_job(vender_y_convertir, 'interval', minutes=5, id="vender")  # Más check para sells rápidos
@@ -733,3 +734,4 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
         logger.info("Bot detenido.")
+```
