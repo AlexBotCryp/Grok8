@@ -13,8 +13,9 @@ import numpy as np
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
+import httpx
 # ──────────────────────────────────────────────────────────────────────────────
-# Opcional: Grok (x.ai) — usado sparingly para decisiones clave
+# Grok (x.ai) — usado sparingly para decisiones clave
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from openai import OpenAI
@@ -35,7 +36,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 GROK_API_KEY = os.getenv("GROK_API_KEY") or ""
 GROK_BASE_URL = "https://api.x.ai/v1"
 ENABLE_GROK_ROTATION = True  # Activo, pero sparingly
-GROK_CONSULTA_FRECUENCIA_MIN = 30  # Aumentado a 30 min para usar poco
+GROK_CONSULTA_FRECUENCIA_MIN = 30  # 30 min para usar poco
 consulta_contador = 0
 _LAST_GROK_TS = 0
 for var, name in [(API_KEY, "BINANCE_API_KEY"), (API_SECRET, "BINANCE_API_SECRET")]:
@@ -44,17 +45,17 @@ for var, name in [(API_KEY, "BINANCE_API_KEY"), (API_SECRET, "BINANCE_API_SECRET
 # Mercado — removidos ultra-volátiles para menos pérdidas
 MONEDA_BASE = "USDC"
 MIN_VOLUME = 1_000_000
-MAX_POSICIONES = 1  # Cambiado a 1 para usar 100% de la cartera en una sola cripto
+MAX_POSICIONES = 1  # Una sola posición para 100% de la cartera
 MIN_SALDO_COMPRA = 50
-PORCENTAJE_USDC = 1.0  # Usa 100% del saldo disponible en compras
-ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC']  # Menos volátiles
+PORCENTAJE_USDC = 1.0  # Usa 100% del saldo disponible
+ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC']
 # Estrategia — simétrica para mejor R:R
 TAKE_PROFIT = 0.03  # 3%
 STOP_LOSS = -0.03  # -3%
-COMMISSION_RATE = 0.001  # 0.1% por operación (compra y venta)
-RSI_BUY_MAX = 35  # Más estricto para buys en oversold
-RSI_SELL_MIN = 70  # Más overbought para sells
-MIN_NET_GAIN_ABS = 0.5  # Aumentado para evitar trades pequeños
+COMMISSION_RATE = 0.001  # 0.1% por operación
+RSI_BUY_MAX = 35
+RSI_SELL_MIN = 70
+MIN_NET_GAIN_ABS = 0.5
 TRAILING_STOP = 0.015  # 1.5% trailing
 # Ritmo / límites
 TRADE_COOLDOWN_SEC = 300
@@ -72,12 +73,12 @@ client = Client(API_KEY, API_SECRET)
 client_openai = None
 if ENABLE_GROK_ROTATION and GROK_API_KEY and OpenAI is not None:
     try:
-        # Inicialización sin proxies explícitamente
+        # Usar httpx.Client sin proxies para evitar el error
+        http_client = httpx.Client(proxies=None)
         client_openai = OpenAI(
             api_key=GROK_API_KEY,
             base_url=GROK_BASE_URL,
-            # Workaround: ignorar cualquier configuración de proxies del entorno
-            http_client=None  # Evita que openai use proxies automáticos
+            http_client=http_client
         )
         logger.info("Grok inicializado correctamente.")
     except Exception as e:
@@ -425,7 +426,7 @@ def mejores_criptos(max_candidates=5):
         filtered = []
         for t in sorted(candidates, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:max_candidates]:
             symbol = t["symbol"]
-            klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=215))  # Para EMA200 + RSI
+            klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=215))
             closes = [float(k[4]) for k in klines]
             if len(closes) < 215:
                 continue
@@ -433,7 +434,7 @@ def mejores_criptos(max_candidates=5):
             ema5 = calculate_ema(closes[-20:], 5)
             ema200 = calculate_ema(closes, 200)
             precio = float(t["lastPrice"])
-            if precio <= ema200:  # Trend filter: no buy en downtrend
+            if precio <= ema200:
                 logger.info(f"{symbol} skip: precio {precio} <= EMA200 {ema200}")
                 continue
             if precio <= ema5:
@@ -497,13 +498,12 @@ def comprar():
             if not meta:
                 continue
             min_quote = min_quote_for_market(symbol)
-            quote_to_spend = dec(str(cantidad_usdc)) * (1 - COMMISSION_RATE)  # Ajuste por comisión
+            quote_to_spend = dec(str(cantidad_usdc)) * (1 - COMMISSION_RATE)
             if quote_to_spend < min_quote:
                 logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
                 continue
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
             if rsi < RSI_BUY_MAX:
-                # Grok solo si RSI borderline (30-35)
                 use_grok = rsi > 30
                 prompt_buy = f"¿Comprar {symbol} ahora? RSI {rsi:.2f}, precio {float(precio):.6f}, volumen alto. Responde 'si' o 'no'."
                 grok_resp = consultar_grok(prompt_buy) if use_grok else "si"
@@ -567,7 +567,6 @@ def vender_y_convertir():
                 if not meta:
                     nuevos_registro[symbol] = data
                     continue
-                # Update high for trailing
                 if precio_actual > high_since_buy:
                     data["high_since_buy"] = float(precio_actual)
                     guardar_json(registro, REGISTRO_FILE)
@@ -590,12 +589,10 @@ def vender_y_convertir():
                 comision_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
                 comision_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
                 ganancia_neta = ganancia_bruta - comision_compra - comision_venta
-                # Trailing stop
                 trailing_trigger = (precio_actual - high_since_buy) / high_since_buy <= -TRAILING_STOP
                 vender_por_stop = float(cambio) <= STOP_LOSS or trailing_trigger
                 vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN) and ganancia_neta > MIN_NET_GAIN_ABS
                 if vender_por_stop or vender_por_profit:
-                    # Grok solo si PNL neto bajo (<1)
                     use_grok = ganancia_neta < 1
                     prompt_sell = f"¿Vender {symbol} ahora? Cambio {float(cambio)*100:.2f}%, RSI {rsi:.2f}. Responde 'si' o 'no'."
                     grok_resp = consultar_grok(prompt_sell) if use_grok else "si"
@@ -610,7 +607,6 @@ def vender_y_convertir():
                                 f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
                                 f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}. Grok: {grok_resp}"
                             )
-                            # Intentar comprar la mejor cripto inmediatamente después de vender
                             comprar()
                         except BinanceAPIException as e:
                             logger.error(f"Error vendiendo {symbol}: {e}")
@@ -629,7 +625,6 @@ def vender_y_convertir():
         guardar_json(limpio, REGISTRO_FILE)
         if dust_positions:
             enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
-        # Rotación — con Grok sparingly
         if ENABLE_GROK_ROTATION:
             try:
                 registro = cargar_json(REGISTRO_FILE)
@@ -661,9 +656,8 @@ def vender_y_convertir():
                             pos_perfs.append((sym, change, rsi, ganancia_neta))
                             time.sleep(1)
                         if pos_perfs:
-                            pos_perfs.sort(key=lambda x: x[1])  # peor primero
+                            pos_perfs.sort(key=lambda x: x[1])
                             worst_sym, worst_change, worst_rsi, worst_net = pos_perfs[0]
-                            # Grok solo si worst_net <1
                             use_grok = worst_net < 1
                             prompt = (
                                 f"Debo rotar vendiendo {worst_sym} (cambio {worst_change*100:.2f}%, RSI {worst_rsi:.2f}, net {worst_net:.4f}) "
@@ -686,7 +680,6 @@ def vender_y_convertir():
                                     enviar_telegram(f"🔄 Rotación: vendido {worst_sym} (PnL neto {worst_net:.2f}). Para {best_symbol}. Grok: sí")
                                     del registro[worst_sym]
                                     guardar_json(registro, REGISTRO_FILE)
-                                    # Intentar comprar la mejor cripto después de rotar
                                     comprar()
                                 except Exception as e:
                                     logger.error(f"Error en venta por rotación {worst_sym}: {e}")
@@ -727,10 +720,10 @@ def resumen_diario():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA actualizado: Usa 100% del saldo, rotación fluida con comisiones consideradas. Cartera inicial conservada.")
+    enviar_telegram("🤖 Bot IA actualizado: Usa 100% del saldo, rotación fluida con comisiones consideradas, Grok activo.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")  # Más frecuente para opportunities
-    scheduler.add_job(vender_y_convertir, 'interval', minutes=5, id="vender")  # Más check para sells rápidos
+    scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")
+    scheduler.add_job(vender_y_convertir, 'interval', minutes=5, id="vender")
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
