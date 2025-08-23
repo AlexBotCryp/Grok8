@@ -40,11 +40,11 @@ consulta_contador = 0
 _LAST_GROK_TS = 0
 for var, name in [(API_KEY, "BINANCE_API_KEY"), (API_SECRET, "BINANCE_API_SECRET")]:
     if not var:
-        raise ValueValueError(f"Falta variable de entorno: {name}")
+        raise ValueError(f"Falta variable de entorno: {name}")
 # Mercado — removidos ultra-volátiles para menos pérdidas
 MONEDA_BASE = "USDC"
 MIN_VOLUME = 1_000_000
-MAX_POSICIONES = 1 # Cambiado a 1 para usar 100% de la cartera en una sola cripto
+MAX_POSICIONES = 1  # Cambiado a 1 para usar 100% de la cartera en una sola cripto
 MIN_SALDO_COMPRA = 50
 PORCENTAJE_USDC = 1.0  # Usa 100% del saldo disponible en compras
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC']  # Menos volátiles
@@ -72,9 +72,12 @@ client = Client(API_KEY, API_SECRET)
 client_openai = None
 if ENABLE_GROK_ROTATION and GROK_API_KEY and OpenAI is not None:
     try:
+        # Inicialización sin proxies explícitamente
         client_openai = OpenAI(
             api_key=GROK_API_KEY,
-            base_url=GROK_BASE_URL
+            base_url=GROK_BASE_URL,
+            # Workaround: ignorar cualquier configuración de proxies del entorno
+            http_client=None  # Evita que openai use proxies automáticos
         )
         logger.info("Grok inicializado correctamente.")
     except Exception as e:
