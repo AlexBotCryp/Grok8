@@ -22,7 +22,7 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
-MIN_VOLUME = Decimal('10000')  # Reducido para más oportunidades
+MIN_VOLUME = Decimal('10000')  # Para más oportunidades
 MIN_SALDO_COMPRA = Decimal('0.5')  # Para saldos muy bajos
 PORCENTAJE_USDC = Decimal('0.05')  # ~8 USDC por trade
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'SHIBUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']
@@ -30,9 +30,10 @@ TAKE_PROFIT = Decimal('0.05')  # 5% para mayores ganancias
 STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
 TRAILING_STOP = Decimal('0.01')  # 1% para proteger subidas
-TRADE_COOLDOWN_SEC = 30  # Reducido para más trades
+TRADE_COOLDOWN_SEC = 30  # Para más trades
 PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger saldo
 CRITICAL_SALDO = Decimal('3')  # Pausar si saldo < 3 USDC
+NOTIFICATION_COOLDOWN_MIN = 5  # Enviar notificación cada 5 minutos
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
 REGISTRO_FILE = "registro.json"
@@ -46,6 +47,7 @@ ULTIMA_COMPRA = {}
 ULTIMAS_OPERACIONES = []
 DUST_THRESHOLD = Decimal('0.1')
 TICKERS_CACHE = {}
+last_no_buy_notification = 0  # Para limitar notificaciones
 
 def get_cached_ticker(symbol):
     now = time.time()
@@ -443,6 +445,7 @@ def resumen_diario():
         enviar_telegram(f"⚠️ Error en resumen diario: {e}")
 
 def comprar():
+    global last_no_buy_notification
     if not puede_comprar():
         logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
         enviar_telegram("⚠️ Límite de pérdida diaria alcanzado.")
@@ -462,7 +465,9 @@ def comprar():
         criptos = mejores_criptos()
         if not criptos:
             logger.info("No hay criptos candidatas para comprar.")
-            enviar_telegram("⚠️ No hay criptos candidatas: sin símbolos con volumen suficiente.")
+            if time.time() - last_no_buy_notification >= NOTIFICATION_COOLDOWN_MIN * 60:
+                enviar_telegram("⚠️ No hay criptos candidatas: sin símbolos con volumen suficiente (>10000 USDC).")
+                last_no_buy_notification = time.time()
             return
         registro = cargar_json(REGISTRO_FILE)
         now_ts = time.time()
@@ -540,10 +545,11 @@ def comprar():
                 logger.error(f"Error inesperado comprando {symbol}: {e}")
                 enviar_telegram(f"⚠️ Error inesperado comprando {symbol}: {e}")
             time.sleep(0.1)
-        if compradas == 0:
+        if compradas == 0 and time.time() - last_no_buy_notification >= NOTIFICATION_COOLDOWN_MIN * 60:
             razon_msg = f"Razones: {', '.join(no_compradas_razon)}" if no_compradas_razon else "Razones no especificadas"
             logger.warning(f"No se realizaron compras en este ciclo. {razon_msg}")
             enviar_telegram(f"⚠️ No se realizaron compras en este ciclo. {razon_msg}")
+            last_no_buy_notification = time.time()
     except Exception as e:
         logger.error(f"Error general en compra: {e}")
         enviar_telegram(f"⚠️ Error general en compra: {e}")
@@ -657,7 +663,7 @@ def vender_y_convertir():
                     if pos_perfs:
                         pos_perfs.sort(key=lambda x: x[1])
                         worst_sym, worst_change, worst_net, time_held = pos_perfs[0]
-                        if worst_net < 0 or time_held > 60:  # Rotar si pérdida o >60min
+                        if worst_net < 0 or time_held > 15:  # Rotar si pérdida o >15min
                             try:
                                 meta = load_symbol_info(worst_sym)
                                 asset = base_from_symbol(worst_sym)
@@ -684,7 +690,7 @@ def vender_y_convertir():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=5%, 30s checks, rotación tras 60min, no compras corregido.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=5%, 30s checks, rotación tras 15min, notificaciones limitadas.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
     scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
