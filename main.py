@@ -432,6 +432,36 @@ def executed_qty_from_order(order_resp) -> float:
         pass
     return 0.0
 
+def resumen_diario():
+    try:
+        cuenta = retry(lambda: client.get_account(), tries=15, base_delay=1.0)
+        pnl_data = cargar_json(PNL_DIARIO_FILE)
+        today = get_current_date()
+        pnl_hoy_v = pnl_data.get(today, 0)
+        mensaje = f"📊 Resumen diario ({today}):\nPNL hoy: {pnl_hoy_v:.2f} {MONEDA_BASE}\nBalances:\n"
+        total_value = Decimal('0')
+        for b in cuenta["balances"]:
+            total = Decimal(str(float(b["free"]) + float(b["locked"])))
+            if total > Decimal('0.001'):
+                mensaje += f"{b['asset']}: {total:.6f}\n"
+                if b['asset'] != MONEDA_BASE:
+                    symbol = b['asset'] + MONEDA_BASE
+                    ticker = safe_get_ticker(symbol)
+                    if ticker:
+                        total_value += total * Decimal(ticker['lastPrice'])
+                else:
+                    total_value += total
+            time.sleep(0.2)
+        mensaje += f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}"
+        enviar_telegram(mensaje)
+        logger.info(f"Resumen diario enviado: {mensaje}")
+        seven_days_ago = (now_tz() - timedelta(days=7)).date().isoformat()
+        pnl_data = {k: v for k, v in pnl_data.items() if k >= seven_days_ago}
+        guardar_json(pnl_data, PNL_DIARIO_FILE)
+    except BinanceAPIException as e:
+        logger.error(f"Error en resumen diario: {e}")
+        enviar_telegram(f"⚠️ Error en resumen diario: {e}")
+
 def comprar():
     if not puede_comprar():
         logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
@@ -667,7 +697,7 @@ def vender_y_convertir():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Balanceado: Mueve ~160 USDC con momentum (+0.5% 5min), 60s checks, max 3 posiciones, rotación pensada, menos fees.")
+    enviar_telegram("🤖 Bot IA Balanceado: Mueve ~160 USDC con momentum (+0.5% 5min), 60s checks, max 3 posiciones, rotación pensada, menos fees, NameError corregido.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=60, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', seconds=60, id="vender")
