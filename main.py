@@ -1,4 +1,3 @@
-```python
 # -*- coding: utf-8 -*-
 import os
 import time
@@ -14,60 +13,64 @@ import numpy as np
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Opcional: Grok (x.ai) — usado solo para análisis de mercado
-# ──────────────────────────────────────────────────────────────────────────────
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging — más logs para debug de balances
-# ──────────────────────────────────────────────────────────────────────────────
+
+# Logging — nivel DEBUG para rastrear balances
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("bot-ia")
-# ──────────────────────────────────────────────────────────────────────────────
-# Config — mantenido USDC como base, más símbolos, más agresivo
-# ──────────────────────────────────────────────────────────────────────────────
+
+# Config — USDC como base, parámetros agresivos para saldo pequeño
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 GROK_API_KEY = os.getenv("GROK_API_KEY") or ""
 GROK_BASE_URL = "https://api.x.ai/v1"
-ENABLE_GROK_ANALYSIS = True  # Solo para analizar mercado
+ENABLE_GROK_ANALYSIS = True
 GROK_ANALYSIS_FREQUENCY_MIN = 60
 consulta_contador = 0
 _LAST_GROK_TS = 0
 for var, name in [(API_KEY, "BINANCE_API_KEY"), (API_SECRET, "BINANCE_API_SECRET")]:
     if not var:
         raise ValueError(f"Falta variable de entorno: {name}")
+
 # Mercado
-MONEDA_BASE = "USDC"  # Corregido a USDC
-MIN_VOLUME = 300_000  # Bajado para más oportunidades
+MONEDA_BASE = "USDC"
+MIN_VOLUME = 300_000
 MAX_POSICIONES = 1
-MIN_SALDO_COMPRA = 10  # Bajado para probar con menos saldo
+MIN_SALDO_COMPRA = 10  # Bajado para tu saldo de ~160 USDC
 PORCENTAJE_USDC = 1.0
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC', 'AVAXUSDC', 'LINKUSDC', 'DOTUSDC', 'MATICUSDC', 'SHIBUSDC']
+
 # Estrategia
-TAKE_PROFIT = 0.015  # 1.5% para trades más rápidos
+TAKE_PROFIT = 0.015
 STOP_LOSS = -0.015
 COMMISSION_RATE = 0.001
-RSI_BUY_MAX = 45  # Más permisivo
+RSI_BUY_MAX = 45
 RSI_SELL_MIN = 60
-MIN_NET_GAIN_ABS = 0.2  # Bajado
-TRAILING_STOP = 0.0075  # 0.75%
+MIN_NET_GAIN_ABS = 0.2
+TRAILING_STOP = 0.0075
+
 # Ritmo
-TRADE_COOLDOWN_SEC = 30  # 30s
+TRADE_COOLDOWN_SEC = 30
 MAX_TRADES_PER_HOUR = 20
+
 # Riesgo
-PERDIDA_MAXIMA_DIARIA = 150  # Aumentado
+PERDIDA_MAXIMA_DIARIA = 150
+
 # Horarios
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
+
 # Archivos
 REGISTRO_FILE = "registro.json"
 PNL_DIARIO_FILE = "pnl_diario.json"
+
 # Estado y clientes
 client = Client(API_KEY, API_SECRET)
 client_openai = None
@@ -85,6 +88,7 @@ if ENABLE_GROK_ANALYSIS and GROK_API_KEY and OpenAI is not None:
 else:
     logger.info("Grok desactivado.")
     ENABLE_GROK_ANALYSIS = False
+
 # Locks / caches
 LOCK = threading.RLock()
 SYMBOL_CACHE = {}
@@ -93,6 +97,7 @@ ULTIMA_COMPRA = {}
 ULTIMAS_OPERACIONES = []
 DUST_THRESHOLD = 0.5
 TICKERS_CACHE = {}
+
 def get_cached_ticker(symbol):
     now = time.time()
     if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 120:
@@ -107,13 +112,14 @@ def get_cached_ticker(symbol):
     except Exception as e:
         logger.error(f"Error cache ticker {symbol}: {e}")
     return None
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Utilidades generales
-# ──────────────────────────────────────────────────────────────────────────────
 def now_tz():
     return datetime.now(TZ_MADRID)
+
 def get_current_date():
     return now_tz().date().isoformat()
+
 def cargar_json(file):
     if os.path.exists(file):
         try:
@@ -122,13 +128,16 @@ def cargar_json(file):
         except Exception as e:
             logger.error(f"Error leyendo {file}: {e}")
     return {}
+
 def atomic_write_json(data, file):
     tmp = file + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, file)
+
 def guardar_json(data, file):
     atomic_write_json(data, file)
+
 def enviar_telegram(mensaje: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.info(f"[TELEGRAM DESACTIVADO] {mensaje}")
@@ -143,6 +152,7 @@ def enviar_telegram(mensaje: str):
         retry(_send, tries=3, base_delay=0.8)
     except Exception as e:
         logger.error(f"Telegram falló: {e}")
+
 def retry(fn, tries=3, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
     for i in range(tries):
         try:
@@ -152,9 +162,29 @@ def retry(fn, tries=3, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
             if i == tries - 1:
                 raise
             time.sleep(base_delay * (2 ** i) + random.random() * jitter)
-# ──────────────────────────────────────────────────────────────────────────────
+
+# Debug balances
+def debug_balances():
+    try:
+        cuenta = retry(lambda: client.get_account(), tries=5, base_delay=1.0)
+        logger.info("=== BALANCES EN CARTERA ===")
+        total_value = 0
+        for b in cuenta['balances']:
+            total = float(b['free']) + float(b['locked'])
+            if total > 0.0001:
+                logger.info(f"{b['asset']}: free={b['free']}, locked={b['locked']}, total={total}")
+                if b['asset'] == MONEDA_BASE:
+                    total_value += total
+                elif b['asset'] + MONEDA_BASE in ALLOWED_SYMBOLS:
+                    ticker = safe_get_ticker(b['asset'] + MONEDA_BASE)
+                    if ticker:
+                        total_value += total * float(ticker['lastPrice'])
+        logger.info(f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}")
+        enviar_telegram(f"🤖 Inicio bot - Valor total cartera: {total_value:.2f} {MONEDA_BASE}")
+    except Exception as e:
+        logger.error(f"Error debug balances: {e}")
+
 # PnL diario / Riesgo
-# ──────────────────────────────────────────────────────────────────────────────
 def actualizar_pnl_diario(realized_pnl, fees=0.1):
     with LOCK:
         pnl_data = cargar_json(PNL_DIARIO_FILE)
@@ -165,14 +195,17 @@ def actualizar_pnl_diario(realized_pnl, fees=0.1):
         guardar_json(pnl_data, PNL_DIARIO_FILE)
         logger.debug(f"PnL actualizado: {today} = {pnl_data[today]}")
         return pnl_data[today]
+
 def pnl_hoy():
     pnl_data = cargar_json(PNL_DIARIO_FILE)
     return pnl_data.get(get_current_date(), 0)
+
 def puede_comprar():
     hoy_pnl = pnl_hoy()
     can_buy = hoy_pnl > -PERDIDA_MAXIMA_DIARIA if hoy_pnl < 0 else hoy_pnl > -(PERDIDA_MAXIMA_DIARIA * 1.5)
     logger.debug(f"Puede comprar? {can_buy}, PnL hoy: {hoy_pnl}, Límite: {PERDIDA_MAXIMA_DIARIA}")
     return can_buy
+
 def reset_diario():
     with LOCK:
         pnl = cargar_json(PNL_DIARIO_FILE)
@@ -181,14 +214,14 @@ def reset_diario():
             pnl[hoy] = 0
             guardar_json(pnl, PNL_DIARIO_FILE)
             logger.info("PnL diario reseteado")
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Mercado: info símbolos y precisión
-# ──────────────────────────────────────────────────────────────────────────────
 def dec(x: str) -> Decimal:
     try:
         return Decimal(x)
     except (InvalidOperation, TypeError):
         return Decimal('0')
+
 def load_symbol_info(symbol):
     if symbol in INVALID_SYMBOL_CACHE:
         return None
@@ -225,29 +258,34 @@ def load_symbol_info(symbol):
         logger.info(f"Error cargando info de {symbol}: {e}")
         INVALID_SYMBOL_CACHE.add(symbol)
         return None
+
 def quantize_qty(qty: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
         return qty
     steps = (qty / step).quantize(Decimal('1.'), rounding=ROUND_DOWN)
     return (steps * step).normalize()
+
 def quantize_quote(quote: Decimal, tick: Decimal) -> Decimal:
     if tick <= 0:
         return quote
     steps = (quote / tick).quantize(Decimal('1.'), rounding=ROUND_DOWN)
     return (steps * tick).normalize()
+
 def min_quote_for_market(symbol) -> Decimal:
     meta = load_symbol_info(symbol)
     if not meta:
         return Decimal('0')
     return (meta["minNotional"] * Decimal('1.01')).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+
 def safe_get_ticker(symbol):
     ticker = get_cached_ticker(symbol)
     if ticker:
         logger.debug(f"Ticker {symbol}: precio={ticker['lastPrice']}, volumen={ticker.get('quoteVolume', 0)}")
     return ticker
+
 def safe_get_balance(asset):
     try:
-        b = retry(lambda: client.get_asset_balance(asset=asset), tries=5, base_delay=1.0)  # Más intentos
+        b = retry(lambda: client.get_asset_balance(asset=asset), tries=5, base_delay=1.0)
         if not b:
             logger.error(f"No se obtuvo balance para {asset}")
             return 0.0
@@ -262,9 +300,8 @@ def safe_get_balance(asset):
     except Exception as e:
         logger.error(f"Error inesperado obteniendo balance {asset}: {e}")
         return 0.0
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Indicadores — añadido MACD
-# ──────────────────────────────────────────────────────────────────────────────
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50.0
@@ -284,6 +321,7 @@ def calculate_rsi(closes, period=14):
         rs = upvals / downvals if downvals != 0 else np.inf
         rsi = 100 - (100 / (1 + rs))
     return float(rsi)
+
 def calculate_ema(closes, period=5):
     if len(closes) < period:
         return closes[-1]
@@ -292,6 +330,7 @@ def calculate_ema(closes, period=5):
     for price in closes[period:]:
         ema = (price - ema) * multiplier + ema
     return ema
+
 def calculate_macd(closes, fast=12, slow=26, signal=9):
     if len(closes) < slow + signal:
         return 0, 0, 0
@@ -301,9 +340,8 @@ def calculate_macd(closes, fast=12, slow=26, signal=9):
     macd_signal = calculate_ema(closes[-signal:], signal)
     hist = macd - macd_signal
     return macd, macd_signal, hist
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Grok helper — solo para sugerir mejor crypto
-# ──────────────────────────────────────────────────────────────────────────────
 def analizar_mercado_con_grok():
     global consulta_contador, _LAST_GROK_TS
     if not ENABLE_GROK_ANALYSIS or client_openai is None:
@@ -330,17 +368,15 @@ def analizar_mercado_con_grok():
     except Exception as e:
         logger.warning(f"Error Grok análisis: {e}")
         return None
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Utilidad: baseAsset
-# ──────────────────────────────────────────────────────────────────────────────
 def base_from_symbol(symbol: str) -> str:
     if symbol.endswith(MONEDA_BASE):
         return symbol[:-len(MONEDA_BASE)]
     meta = load_symbol_info(symbol)
     return meta["baseAsset"] if meta else symbol.replace(MONEDA_BASE, "")
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Precio medio / inicialización cartera
-# ──────────────────────────────────────────────────────────────────────────────
 def precio_medio_si_hay(symbol, lookback_days=30):
     try:
         since = int((now_tz() - timedelta(days=lookback_days)).timestamp() * 1000)
@@ -365,6 +401,7 @@ def precio_medio_si_hay(symbol, lookback_days=30):
     except Exception as e:
         logger.warning(f"No se pudo calcular precio medio {symbol}: {e}")
     return None
+
 def inicializar_registro():
     with LOCK:
         registro = cargar_json(REGISTRO_FILE)
@@ -405,9 +442,8 @@ def inicializar_registro():
             guardar_json(registro, REGISTRO_FILE)
         except BinanceAPIException as e:
             logger.error(f"Error inicializando registro: {e}")
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Helpers de orden
-# ──────────────────────────────────────────────────────────────────────────────
 def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
     attempts = 0
     last_err = None
@@ -428,6 +464,7 @@ def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
             raise
     if last_err:
         raise last_err
+
 def executed_qty_from_order(order_resp) -> float:
     try:
         fills = order_resp.get('fills') or []
@@ -447,9 +484,8 @@ def executed_qty_from_order(order_resp) -> float:
     except Exception:
         pass
     return 0.0
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Selección de criptos
-# ──────────────────────────────────────────────────────────────────────────────
 def mejores_criptos(max_candidates=5):
     grok_suggestion = analizar_mercado_con_grok()
     try:
@@ -499,9 +535,8 @@ def mejores_criptos(max_candidates=5):
     except BinanceAPIException as e:
         logger.error(f"Error obteniendo tickers: {e}")
         return []
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Trading
-# ──────────────────────────────────────────────────────────────────────────────
 def comprar():
     if not puede_comprar():
         logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
@@ -588,6 +623,7 @@ def comprar():
             time.sleep(0.5)
     except Exception as e:
         logger.error(f"Error general en compra: {e}")
+
 def vender_y_convertir():
     with LOCK:
         registro = cargar_json(REGISTRO_FILE)
@@ -718,9 +754,8 @@ def vender_y_convertir():
                                 logger.error(f"Error en venta por rotación {worst_sym}: {e}")
         except Exception as e:
             logger.error(f"Error en bloque de rotación: {e}")
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Resumen diario
-# ──────────────────────────────────────────────────────────────────────────────
 def resumen_diario():
     try:
         cuenta = retry(lambda: client.get_account(), tries=5, base_delay=1.0)
@@ -749,12 +784,12 @@ def resumen_diario():
         guardar_json(pnl_data, PNL_DIARIO_FILE)
     except BinanceAPIException as e:
         logger.error(f"Error en resumen diario: {e}")
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Inicio
-# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    debug_balances()  # Debug inicial de balances
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA corregido: USDC como base, más agresivo (TP/SL 1.5%, cooldown 30s, max trades 20/h), Grok solo para análisis, MACD, más símbolos, logs para debug de balances.")
+    enviar_telegram("🤖 Bot IA corregido: Listo para operar con ~160 USDC, syntax fix, debug balances activo.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', minutes=2, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', minutes=1, id="vender")
@@ -767,4 +802,3 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
         logger.info("Bot detenido.")
-```
