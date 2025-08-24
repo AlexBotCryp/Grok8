@@ -595,6 +595,11 @@ def comprar():
         if saldo_spot > 10:  # Alerta si hay mucho USDC ocioso
             logger.warning(f"Alerta: Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}, posiciones abiertas: {len(cargar_json(REGISTRO_FILE))}")
             enviar_telegram(f"⚠️ Alerta: Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}, posiciones abiertas: {len(cargar_json(REGISTRO_FILE))}")
+        # Ajuste dinámico del cooldown si hay saldo ocioso
+        global TRADE_COOLDOWN_SEC
+        if saldo_spot > 20 and TRADE_COOLDOWN_SEC > 15:
+            TRADE_COOLDOWN_SEC = 15
+            logger.info(f"Reduciendo TRADE_COOLDOWN_SEC a 15s por saldo ocioso alto: {saldo_spot}")
     except Exception as e:
         logger.error(f"Error general en compra: {e}")
         enviar_telegram(f"⚠️ Error general en compra: {e}")
@@ -696,4 +701,55 @@ def vender_y_convertir():
                             continue
                         price = dec(ticker['lastPrice'])
                         buy_price = dec(data['precio_compra'])
-                        change = (price - buy_price
+                        change = (price - buy_price) / buy_price if buy_price != 0 else 0
+                        qty = dec(data['cantidad'])
+                        ganancia_bruta = qty * (price - buy_price)
+                        comision_compra = buy_price * qty * COMMISSION_RATE
+                        comision_venta = price * qty * COMMISSION_RATE
+                        ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
+                        time_held = (now_tz() - datetime.fromisoformat(data['timestamp'])).total_seconds() / 60
+                        pos_perfs.append((sym, change, ganancia_neta, time_held))
+                        time.sleep(0.1)
+                    if pos_perfs:
+                        pos_perfs.sort(key=lambda x: x[1])
+                        worst_sym, worst_change, worst_net, time_held = pos_perfs[0]
+                        if worst_net < 0 or time_held > 5:  # Rotar si pérdida o >5min
+                            try:
+                                meta = load_symbol_info(worst_sym)
+                                asset = base_from_symbol(worst_sym)
+                                cantidad_wallet = dec(safe_get_balance(asset))
+                                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
+                                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
+                                    del registro[worst_sym]
+                                    guardar_json(registro, REGISTRO_FILE)
+                                    return
+                                orden = market_sell_with_fallback(worst_sym, qty, meta)
+                                logger.info(f"Rotación: vendido {worst_sym}: {orden}")
+                                total_hoy = actualizar_pnl_diario(worst_net)
+                                enviar_telegram(f"🔄 Rotación: vendido {worst_sym} (PnL neto {float(worst_net):.2f}). Para {best_symbol}.")
+                                del registro[worst_sym]
+                                guardar_json(registro, REGISTRO_FILE)
+                                comprar()
+                            except Exception as e:
+                                logger.error(f"Error en venta por rotación {worst_sym}: {e}")
+                                enviar_telegram(f"⚠️ Error en rotación: {e}")
+        except Exception as e:
+            logger.error(f"Error en bloque de rotación: {e}")
+            enviar_telegram(f"⚠️ Error en rotación: {e}")
+
+if __name__ == "__main__":
+    debug_balances()
+    inicializar_registro()
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=5%, 30s checks, rotación tras 5min, saldo ocioso minimizado.")
+    scheduler = BackgroundScheduler(timezone=TZ_MADRID)
+    scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
+    scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
+    scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen", coalesce=True, max_instances=1)
+    scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl", coalesce=True, max_instances=1)
+    scheduler.start()
+    try:
+        while True:
+            time.sleep(10)
+    except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown()
+        logger.info("Bot detenido.")
