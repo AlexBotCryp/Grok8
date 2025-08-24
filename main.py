@@ -14,7 +14,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
 # ──────────────────────────────────────────────────────────────────────────────
-# Opcional: Grok (x.ai) — usado sparingly para decisiones clave
+# Opcional: Grok (x.ai) — usado solo para análisis de mercado y oportunidades, no para bloquear operaciones
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from openai import OpenAI
@@ -26,7 +26,7 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("bot-ia")
 # ──────────────────────────────────────────────────────────────────────────────
-# Config — ajustes para rentabilidad y menos riesgo
+# Config — ajustes para más agresividad, menos bloqueos, focus en fees
 # ──────────────────────────────────────────────────────────────────────────────
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
@@ -34,33 +34,33 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 GROK_API_KEY = os.getenv("GROK_API_KEY") or ""
 GROK_BASE_URL = "https://api.x.ai/v1"
-ENABLE_GROK_ROTATION = True  # Activo, pero sparingly
-GROK_CONSULTA_FRECUENCIA_MIN = 30  # Aumentado a 30 min para usar poco
+ENABLE_GROK_ANALYSIS = True  # Solo para analizar mercado, no decisiones finales
+GROK_ANALYSIS_FREQUENCY_MIN = 60  # Cada hora para buscar oportunidades, no spamear API
 consulta_contador = 0
 _LAST_GROK_TS = 0
 for var, name in [(API_KEY, "BINANCE_API_KEY"), (API_SECRET, "BINANCE_API_SECRET")]:
     if not var:
         raise ValueError(f"Falta variable de entorno: {name}")
-# Mercado — removidos ultra-volátiles para menos pérdidas
+# Mercado — añadidos más símbolos para más oportunidades, pero filtrados por volumen
 MONEDA_BASE = "USDC"
-MIN_VOLUME = 1_000_000
-MAX_POSICIONES = 1  # Cambiado a 1 para usar 100% de la cartera en una sola cripto
+MIN_VOLUME = 500_000  # Bajado para más candidatos
+MAX_POSICIONES = 1  # Mantiene 1 para focus 100%
 MIN_SALDO_COMPRA = 50
-PORCENTAJE_USDC = 1.0  # Usa 100% del saldo disponible en compras
-ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC']  # Menos volátiles
-# Estrategia — simétrica para mejor R:R
-TAKE_PROFIT = 0.03  # 3%
-STOP_LOSS = -0.03  # -3%
-COMMISSION_RATE = 0.001  # 0.1% por operación (compra y venta)
-RSI_BUY_MAX = 35  # Más estricto para buys en oversold
-RSI_SELL_MIN = 70  # Más overbought para sells
-MIN_NET_GAIN_ABS = 0.5  # Aumentado para evitar trades pequeños
-TRAILING_STOP = 0.015  # 1.5% trailing
-# Ritmo / límites
-TRADE_COOLDOWN_SEC = 300
-MAX_TRADES_PER_HOUR = 6
-# Riesgo diario
-PERDIDA_MAXIMA_DIARIA = 50
+PORCENTAJE_USDC = 1.0  # 100% del saldo
+ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC', 'AVAXUSDC', 'LINKUSDC', 'DOTUSDC']  # Añadidos más estables
+# Estrategia — más agresiva: TP/SL más ajustados, RSI menos estricto
+TAKE_PROFIT = 0.02  # 2% para trades más rápidos
+STOP_LOSS = -0.02  # -2%
+COMMISSION_RATE = 0.001  # 0.1%
+RSI_BUY_MAX = 40  # Menos estricto
+RSI_SELL_MIN = 65  # Menos overbought para sells más agresivos
+MIN_NET_GAIN_ABS = 0.3  # Bajado para no perder oportunidades pequeñas
+TRAILING_STOP = 0.01  # 1% trailing para capturar más
+# Ritmo / límites — más agresivo: más trades, cooldown bajo
+TRADE_COOLDOWN_SEC = 60  # 1 min
+MAX_TRADES_PER_HOUR = 12  # Duplicado
+# Riesgo diario — aumentado un poco para agresividad
+PERDIDA_MAXIMA_DIARIA = 100
 # Horarios
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
@@ -70,22 +70,20 @@ PNL_DIARIO_FILE = "pnl_diario.json"
 # Estado y clientes
 client = Client(API_KEY, API_SECRET)
 client_openai = None
-if ENABLE_GROK_ROTATION and GROK_API_KEY and OpenAI is not None:
+if ENABLE_GROK_ANALYSIS and GROK_API_KEY and OpenAI is not None:
     try:
-        # Inicialización sin proxies explícitamente
         client_openai = OpenAI(
             api_key=GROK_API_KEY,
             base_url=GROK_BASE_URL,
-            # Workaround: ignorar cualquier configuración de proxies del entorno
-            http_client=None  # Evita que openai use proxies automáticos
+            http_client=None
         )
-        logger.info("Grok inicializado correctamente.")
+        logger.info("Grok inicializado para análisis.")
     except Exception as e:
         logger.warning(f"No se pudo inicializar Grok: {e}")
         client_openai = None
 else:
-    logger.info("Grok desactivado: falta GROK_API_KEY o biblioteca OpenAI.")
-    ENABLE_GROK_ROTATION = False
+    logger.info("Grok desactivado.")
+    ENABLE_GROK_ANALYSIS = False
 # Locks / caches / rate controls
 LOCK = threading.RLock()
 SYMBOL_CACHE = {}
@@ -93,11 +91,10 @@ INVALID_SYMBOL_CACHE = set()
 ULTIMA_COMPRA = {}
 ULTIMAS_OPERACIONES = []
 DUST_THRESHOLD = 0.5
-# Cache para tickers, extendido a 2 min
-TICKERS_CACHE = {}  # {symbol: {'data': ticker, 'ts': time}}
+TICKERS_CACHE = {}  # Cache extendido
 def get_cached_ticker(symbol):
     now = time.time()
-    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 120:  # Cache 2 min
+    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 120:
         return TICKERS_CACHE[symbol]['data']
     try:
         t = retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5)
@@ -108,7 +105,7 @@ def get_cached_ticker(symbol):
         logger.error(f"Error cache ticker {symbol}: {e}")
     return None
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilidades generales
+# Utilidades generales (sin cambios mayores)
 # ──────────────────────────────────────────────────────────────────────────────
 def now_tz():
     return datetime.now(TZ_MADRID)
@@ -152,7 +149,7 @@ def retry(fn, tries=3, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
                 raise
             time.sleep(base_delay * (2 ** i) + random.random() * jitter)
 # ──────────────────────────────────────────────────────────────────────────────
-# PnL diario / Riesgo
+# PnL diario / Riesgo (aumentado límite para más trades)
 # ──────────────────────────────────────────────────────────────────────────────
 def actualizar_pnl_diario(realized_pnl, fees=0.1):
     with LOCK:
@@ -179,7 +176,7 @@ def reset_diario():
             pnl[hoy] = 0
             guardar_json(pnl, PNL_DIARIO_FILE)
 # ──────────────────────────────────────────────────────────────────────────────
-# Mercado: info símbolos y precisión
+# Mercado: info símbolos y precisión (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def dec(x: str) -> Decimal:
     try:
@@ -248,7 +245,7 @@ def safe_get_balance(asset):
         logger.error(f"Error obteniendo balance {asset}: {e}")
         return 0.0
 # ──────────────────────────────────────────────────────────────────────────────
-# Indicadores — añadido EMA200 para trend filter
+# Indicadores — añadido MACD para mejor detección de momentum
 # ──────────────────────────────────────────────────────────────────────────────
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -277,31 +274,45 @@ def calculate_ema(closes, period=5):
     for price in closes[period:]:
         ema = (price - ema) * multiplier + ema
     return ema
+def calculate_macd(closes, fast=12, slow=26, signal=9):
+    if len(closes) < slow + signal:
+        return 0, 0, 0
+    ema_fast = calculate_ema(closes, fast)
+    ema_slow = calculate_ema(closes, slow)
+    macd = ema_fast - ema_slow
+    macd_signal = calculate_ema(closes[-signal:], signal)  # Aprox para signal
+    hist = macd - macd_signal
+    return macd, macd_signal, hist
 # ──────────────────────────────────────────────────────────────────────────────
-# Grok helper — solo para casos borderline, con fallback
+# Grok helper — solo para análisis de mercado, devuelve sugerencia de mejor crypto
 # ──────────────────────────────────────────────────────────────────────────────
-def consultar_grok(prompt):
+def analizar_mercado_con_grok():
     global consulta_contador, _LAST_GROK_TS
-    if not ENABLE_GROK_ROTATION or client_openai is None:
-        return "no"
+    if not ENABLE_GROK_ANALYSIS or client_openai is None:
+        return None  # No bloquea, solo no sugiere
     now = time.time()
-    if now - _LAST_GROK_TS < GROK_CONSULTA_FRECUENCIA_MIN * 60:
-        return "no"
+    if now - _LAST_GROK_TS < GROK_ANALYSIS_FREQUENCY_MIN * 60:
+        return None
     try:
         consulta_contador += 1
+        symbols_str = ', '.join([s.replace('USDC', '') for s in ALLOWED_SYMBOLS])
+        prompt = f"Analiza el mercado crypto actual y sugiere la mejor oportunidad para comprar entre {symbols_str}. Considera momentum, volumen, noticias. Sé agresivo, enfócate en upside potencial. Responde solo con el símbolo (ej: BTC) o 'ninguna' si no hay clara."
         resp = client_openai.chat.completions.create(
             model="grok-beta",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=50,
-            temperature=0.2
+            max_tokens=20,
+            temperature=0.3
         )
         _LAST_GROK_TS = time.time()
-        return (resp.choices[0].message.content or "").strip().lower()
+        suggestion = (resp.choices[0].message.content or "").strip().upper()
+        if suggestion in [s.replace('USDC', '') for s in ALLOWED_SYMBOLS]:
+            return suggestion + 'USDC'
+        return None
     except Exception as e:
-        logger.warning(f"Error Grok: {e}")
-        return "no"
+        logger.warning(f"Error Grok análisis: {e}")
+        return None
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilidad: baseAsset del símbolo
+# Utilidad: baseAsset del símbolo (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def base_from_symbol(symbol: str) -> str:
     if symbol.endswith(MONEDA_BASE):
@@ -309,7 +320,7 @@ def base_from_symbol(symbol: str) -> str:
     meta = load_symbol_info(symbol)
     return meta["baseAsset"] if meta else symbol.replace(MONEDA_BASE, "")
 # ──────────────────────────────────────────────────────────────────────────────
-# Precio medio / inicialización cartera
+# Precio medio / inicialización cartera (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def precio_medio_si_hay(symbol, lookback_days=30):
     try:
@@ -371,7 +382,7 @@ def inicializar_registro():
         except BinanceAPIException as e:
             logger.error(f"Error inicializando registro: {e}")
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers de orden
+# Helpers de orden (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
     attempts = 0
@@ -407,9 +418,10 @@ def executed_qty_from_order(order_resp) -> float:
         pass
     return 0.0
 # ──────────────────────────────────────────────────────────────────────────────
-# Selección de criptos — añadido EMA200 filter
+# Selección de criptos — añadido MACD, prioriza Grok suggestion si disponible
 # ──────────────────────────────────────────────────────────────────────────────
 def mejores_criptos(max_candidates=5):
+    grok_suggestion = analizar_mercado_con_grok()  # Solo una vez por ciclo
     try:
         candidates = []
         for sym in ALLOWED_SYMBOLS:
@@ -425,15 +437,16 @@ def mejores_criptos(max_candidates=5):
         filtered = []
         for t in sorted(candidates, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:max_candidates]:
             symbol = t["symbol"]
-            klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=215))  # Para EMA200 + RSI
+            klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=300))  # Más data para MACD/EMA
             closes = [float(k[4]) for k in klines]
-            if len(closes) < 215:
+            if len(closes) < 300:
                 continue
             rsi = calculate_rsi(closes[-15:])
             ema5 = calculate_ema(closes[-20:], 5)
             ema200 = calculate_ema(closes, 200)
+            macd, macd_signal, hist = calculate_macd(closes)
             precio = float(t["lastPrice"])
-            if precio <= ema200:  # Trend filter: no buy en downtrend
+            if precio <= ema200:  # Trend filter
                 logger.info(f"{symbol} skip: precio {precio} <= EMA200 {ema200}")
                 continue
             if precio <= ema5:
@@ -442,18 +455,21 @@ def mejores_criptos(max_candidates=5):
             comision_compra = precio * COMMISSION_RATE
             comision_venta = (precio * (1 + TAKE_PROFIT)) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-            if ganancia_neta > 0:
+            if ganancia_neta > 0 and hist > 0:  # MACD bullish
                 t['rsi'] = rsi
                 t['ema5'] = ema5
                 t['ema200'] = ema200
+                t['macd_hist'] = hist
+                # Prioriza si es Grok suggestion
+                t['score'] = float(t.get("quoteVolume", 0)) + (1000000 if symbol == grok_suggestion else 0)
                 filtered.append(t)
             time.sleep(1)
-        return sorted(filtered, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
+        return sorted(filtered, key=lambda x: x.get('score', float(x.get("quoteVolume", 0))), reverse=True)
     except BinanceAPIException as e:
         logger.error(f"Error obteniendo tickers: {e}")
         return []
 # ──────────────────────────────────────────────────────────────────────────────
-# Trading — Grok solo si borderline
+# Trading — quitado Grok de decisiones buy/sell para no bloquear, solo usa para análisis en mejores_criptos
 # ──────────────────────────────────────────────────────────────────────────────
 def comprar():
     if not puede_comprar():
@@ -497,49 +513,42 @@ def comprar():
             if not meta:
                 continue
             min_quote = min_quote_for_market(symbol)
-            quote_to_spend = dec(str(cantidad_usdc)) * (1 - COMMISSION_RATE)  # Ajuste por comisión
+            quote_to_spend = dec(str(cantidad_usdc)) * (1 - COMMISSION_RATE)
             if quote_to_spend < min_quote:
                 logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
                 continue
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
             if rsi < RSI_BUY_MAX:
-                # Grok solo si RSI borderline (30-35)
-                use_grok = rsi > 30
-                prompt_buy = f"¿Comprar {symbol} ahora? RSI {rsi:.2f}, precio {float(precio):.6f}, volumen alto. Responde 'si' o 'no'."
-                grok_resp = consultar_grok(prompt_buy) if use_grok else "si"
-                if 'si' in grok_resp:
-                    try:
-                        orden = retry(
-                            lambda: client.create_order(
-                                symbol=symbol,
-                                side="BUY",
-                                type="MARKET",
-                                quoteOrderQty=format(quote_to_spend, 'f')
-                            ),
-                            tries=2, base_delay=0.6
-                        )
-                        executed_qty = executed_qty_from_order(orden)
-                        if executed_qty <= 0:
-                            executed_qty = float(quote_to_spend) / float(precio)
-                        with LOCK:
-                            registro = cargar_json(REGISTRO_FILE)
-                            registro[symbol] = {
-                                "cantidad": executed_qty,
-                                "precio_compra": float(precio),
-                                "timestamp": now_tz().isoformat(),
-                                "high_since_buy": float(precio)
-                            }
-                            guardar_json(registro, REGISTRO_FILE)
-                        enviar_telegram(f"🟢 Comprado {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE} a ~{float(precio):.6f}. RSI: {rsi:.2f}. Grok: {grok_resp}")
-                        compradas += 1
-                        ULTIMA_COMPRA[symbol] = now_ts
-                        ULTIMAS_OPERACIONES.append(now_ts)
-                    except BinanceAPIException as e:
-                        logger.error(f"Error comprando {symbol}: {e}")
-                    except Exception as e:
-                        logger.error(f"Error inesperado comprando {symbol}: {e}")
-                else:
-                    logger.info(f"Grok dice no a {symbol} (RSI borderline)")
+                try:
+                    orden = retry(
+                        lambda: client.create_order(
+                            symbol=symbol,
+                            side="BUY",
+                            type="MARKET",
+                            quoteOrderQty=format(quote_to_spend, 'f')
+                        ),
+                        tries=2, base_delay=0.6
+                    )
+                    executed_qty = executed_qty_from_order(orden)
+                    if executed_qty <= 0:
+                        executed_qty = float(quote_to_spend) / float(precio)
+                    with LOCK:
+                        registro = cargar_json(REGISTRO_FILE)
+                        registro[symbol] = {
+                            "cantidad": executed_qty,
+                            "precio_compra": float(precio),
+                            "timestamp": now_tz().isoformat(),
+                            "high_since_buy": float(precio)
+                        }
+                        guardar_json(registro, REGISTRO_FILE)
+                    enviar_telegram(f"🟢 Comprado {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE} a ~{float(precio):.6f}. RSI: {rsi:.2f}.")
+                    compradas += 1
+                    ULTIMA_COMPRA[symbol] = now_ts
+                    ULTIMAS_OPERACIONES.append(now_ts)
+                except BinanceAPIException as e:
+                    logger.error(f"Error comprando {symbol}: {e}")
+                except Exception as e:
+                    logger.error(f"Error inesperado comprando {symbol}: {e}")
             else:
                 logger.info(f"No se compra {symbol}: RSI {rsi:.2f} > {RSI_BUY_MAX}")
             time.sleep(1)
@@ -560,9 +569,10 @@ def vender_y_convertir():
                     continue
                 precio_actual = dec(str(ticker["lastPrice"]))
                 cambio = (precio_actual - precio_compra) / (precio_compra if precio_compra != 0 else Decimal('1'))
-                klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
+                klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=40))  # Para MACD
                 closes = [float(k[4]) for k in klines]
-                rsi = calculate_rsi(closes)
+                rsi = calculate_rsi(closes[-15:])
+                _, _, hist = calculate_macd(closes)
                 meta = load_symbol_info(symbol)
                 if not meta:
                     nuevos_registro[symbol] = data
@@ -593,31 +603,24 @@ def vender_y_convertir():
                 # Trailing stop
                 trailing_trigger = (precio_actual - high_since_buy) / high_since_buy <= -TRAILING_STOP
                 vender_por_stop = float(cambio) <= STOP_LOSS or trailing_trigger
-                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN) and ganancia_neta > MIN_NET_GAIN_ABS
+                vender_por_profit = (float(cambio) >= TAKE_PROFIT or rsi > RSI_SELL_MIN or hist < 0) and ganancia_neta > MIN_NET_GAIN_ABS  # Añadido MACD bearish
                 if vender_por_stop or vender_por_profit:
-                    # Grok solo si PNL neto bajo (<1)
-                    use_grok = ganancia_neta < 1
-                    prompt_sell = f"¿Vender {symbol} ahora? Cambio {float(cambio)*100:.2f}%, RSI {rsi:.2f}. Responde 'si' o 'no'."
-                    grok_resp = consultar_grok(prompt_sell) if use_grok else "si"
-                    if 'si' in grok_resp:
-                        try:
-                            orden = market_sell_with_fallback(symbol, qty, meta)
-                            logger.info(f"Orden de venta: {orden}")
-                            total_hoy = actualizar_pnl_diario(ganancia_neta)
-                            motivo = "Stop-loss/Trailing" if vender_por_stop else "Take-profit/RSI"
-                            enviar_telegram(
-                                f"🔴 Vendido {symbol} - {float(qty):.8f} a ~{float(precio_actual):.6f} "
-                                f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
-                                f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}. Grok: {grok_resp}"
-                            )
-                            # Intentar comprar la mejor cripto inmediatamente después de vender
-                            comprar()
-                        except BinanceAPIException as e:
-                            logger.error(f"Error vendiendo {symbol}: {e}")
-                            dust_positions.append(symbol)
-                            continue
-                    else:
-                        logger.info(f"Grok dice no a sell {symbol}")
+                    try:
+                        orden = market_sell_with_fallback(symbol, qty, meta)
+                        logger.info(f"Orden de venta: {orden}")
+                        total_hoy = actualizar_pnl_diario(ganancia_neta)
+                        motivo = "Stop-loss/Trailing" if vender_por_stop else "Take-profit/RSI/MACD"
+                        enviar_telegram(
+                            f"🔴 Vendido {symbol} - {float(qty):.8f} a ~{float(precio_actual):.6f} "
+                            f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
+                            f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}."
+                        )
+                        # Comprar inmediatamente después
+                        comprar()
+                    except BinanceAPIException as e:
+                        logger.error(f"Error vendiendo {symbol}: {e}")
+                        dust_positions.append(symbol)
+                        continue
                 else:
                     nuevos_registro[symbol] = data
                     logger.info(f"No se vende {symbol}: RSI {rsi:.2f}, Ganancia neta {ganancia_neta:.4f}")
@@ -629,71 +632,66 @@ def vender_y_convertir():
         guardar_json(limpio, REGISTRO_FILE)
         if dust_positions:
             enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
-        # Rotación — con Grok sparingly
-        if ENABLE_GROK_ROTATION:
-            try:
-                registro = cargar_json(REGISTRO_FILE)
-                if not registro:
-                    return
-                criptos = mejores_criptos()
-                if criptos:
-                    candidates = [c for c in criptos if c['symbol'] not in registro]
-                    if candidates:
-                        best = candidates[0]
-                        best_symbol = best['symbol']
-                        best_rsi = best.get('rsi', 50)
-                        pos_perfs = []
-                        for sym, data in registro.items():
-                            ticker = safe_get_ticker(sym)
-                            if not ticker:
-                                continue
-                            price = float(ticker['lastPrice'])
-                            buy_price = data['precio_compra']
-                            change = (price - buy_price) / buy_price if buy_price else 0
-                            klines = retry(lambda: client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_1HOUR, limit=15))
-                            closes = [float(k[4]) for k in klines]
-                            rsi = calculate_rsi(closes)
-                            qty = data['cantidad']
-                            ganancia_bruta = qty * (price - buy_price)
-                            comision_compra = buy_price * qty * COMMISSION_RATE
-                            comision_venta = price * qty * COMMISSION_RATE
-                            ganancia_neta = ganancia_bruta - comision_compra - comision_venta
-                            pos_perfs.append((sym, change, rsi, ganancia_neta))
-                            time.sleep(1)
-                        if pos_perfs:
-                            pos_perfs.sort(key=lambda x: x[1])  # peor primero
-                            worst_sym, worst_change, worst_rsi, worst_net = pos_perfs[0]
-                            # Grok solo si worst_net <1
-                            use_grok = worst_net < 1
-                            prompt = (
-                                f"Debo rotar vendiendo {worst_sym} (cambio {worst_change*100:.2f}%, RSI {worst_rsi:.2f}, net {worst_net:.4f}) "
-                                f"a {best_symbol} (RSI {best_rsi:.2f}, volumen alto)? Sé conservador, responde 'si' o 'no'."
-                            )
-                            respuesta = consultar_grok(prompt) if use_grok else "si"
-                            if 'si' in respuesta:
-                                try:
-                                    meta = load_symbol_info(worst_sym)
-                                    asset = base_from_symbol(worst_sym)
-                                    cantidad_wallet = dec(str(safe_get_balance(asset)))
-                                    qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
-                                    if qty < meta["marketMinQty"] or qty <= Decimal('0'):
-                                        del registro[worst_sym]
-                                        guardar_json(registro, REGISTRO_FILE)
-                                        return
-                                    orden = market_sell_with_fallback(worst_sym, qty, meta)
-                                    logger.info(f"Rotación: vendido {worst_sym}: {orden}")
-                                    total_hoy = actualizar_pnl_diario(worst_net)
-                                    enviar_telegram(f"🔄 Rotación: vendido {worst_sym} (PnL neto {worst_net:.2f}). Para {best_symbol}. Grok: sí")
+        # Rotación — más agresiva, sin Grok para decisión, solo para sugerencia en mejores_criptos
+        try:
+            registro = cargar_json(REGISTRO_FILE)
+            if not registro:
+                return
+            criptos = mejores_criptos()
+            if criptos:
+                candidates = [c for c in criptos if c['symbol'] not in registro]
+                if candidates:
+                    best = candidates[0]
+                    best_symbol = best['symbol']
+                    best_rsi = best.get('rsi', 50)
+                    best_hist = best.get('macd_hist', 0)
+                    pos_perfs = []
+                    for sym, data in registro.items():
+                        ticker = safe_get_ticker(sym)
+                        if not ticker:
+                            continue
+                        price = float(ticker['lastPrice'])
+                        buy_price = data['precio_compra']
+                        change = (price - buy_price) / buy_price if buy_price else 0
+                        klines = retry(lambda: client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_1HOUR, limit=40))
+                        closes = [float(k[4]) for k in klines]
+                        rsi = calculate_rsi(closes[-15:])
+                        _, _, hist = calculate_macd(closes)
+                        qty = data['cantidad']
+                        ganancia_bruta = qty * (price - buy_price)
+                        comision_compra = buy_price * qty * COMMISSION_RATE
+                        comision_venta = price * qty * COMMISSION_RATE
+                        ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+                        pos_perfs.append((sym, change, rsi, hist, ganancia_neta))
+                        time.sleep(1)
+                    if pos_perfs:
+                        pos_perfs.sort(key=lambda x: x[1])  # Peor primero
+                        worst_sym, worst_change, worst_rsi, worst_hist, worst_net = pos_perfs[0]
+                        # Rotar si best es mejor (más hist o menor RSI), sin Grok bloqueando
+                        if best_hist > worst_hist + 0.1 or best_rsi < worst_rsi - 10 or worst_net < 0:
+                            try:
+                                meta = load_symbol_info(worst_sym)
+                                asset = base_from_symbol(worst_sym)
+                                cantidad_wallet = dec(str(safe_get_balance(asset)))
+                                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
+                                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
                                     del registro[worst_sym]
                                     guardar_json(registro, REGISTRO_FILE)
-                                    # Intentar comprar la mejor cripto después de rotar
-                                    comprar()
-                                except Exception as e:
-                                    logger.error(f"Error en venta por rotación {worst_sym}: {e}")
-            except Exception as e:
-                logger.error(f"Error en bloque de rotación: {e}")
+                                    return
+                                orden = market_sell_with_fallback(worst_sym, qty, meta)
+                                logger.info(f"Rotación: vendido {worst_sym}: {orden}")
+                                total_hoy = actualizar_pnl_diario(worst_net)
+                                enviar_telegram(f"🔄 Rotación agresiva: vendido {worst_sym} (PnL neto {worst_net:.2f}). Para {best_symbol}.")
+                                del registro[worst_sym]
+                                guardar_json(registro, REGISTRO_FILE)
+                                # Comprar después
+                                comprar()
+                            except Exception as e:
+                                logger.error(f"Error en venta por rotación {worst_sym}: {e}")
+        except Exception as e:
+            logger.error(f"Error en bloque de rotación: {e}")
 # ──────────────────────────────────────────────────────────────────────────────
-# Resumen diario
+# Resumen diario (sin cambios)
 # ──────────────────────────────────────────────────────────────────────────────
 def resumen_diario():
     try:
@@ -723,14 +721,14 @@ def resumen_diario():
     except BinanceAPIException as e:
         logger.error(f"Error en resumen diario: {e}")
 # ──────────────────────────────────────────────────────────────────────────────
-# Inicio
+# Inicio — scheduler más frecuente para agresividad
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA actualizado: Usa 100% del saldo, rotación fluida con comisiones consideradas. Cartera inicial conservada.")
+    enviar_telegram("🤖 Bot IA mejorado: Más agresivo (TP/SL 2%, cooldown 1min, max trades 12/h), Grok solo para análisis de oportunidades (no bloquea trades), añadido MACD, más símbolos. Rotación basada en razonamiento sin vetos.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', minutes=10, id="comprar")  # Más frecuente para opportunities
-    scheduler.add_job(vender_y_convertir, 'interval', minutes=5, id="vender")  # Más check para sells rápidos
+    scheduler.add_job(comprar, 'interval', minutes=5, id="comprar")  # Más frecuente
+    scheduler.add_job(vender_y_convertir, 'interval', minutes=2, id="vender")  # Checks rápidos
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
