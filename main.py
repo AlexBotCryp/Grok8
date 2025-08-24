@@ -22,18 +22,19 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
-MIN_VOLUME = Decimal('10000')  # Para más oportunidades
-MIN_SALDO_COMPRA = Decimal('0.5')  # Para saldos muy bajos
-PORCENTAJE_USDC = Decimal('0.05')  # ~8 USDC por trade
+MIN_VOLUME = Decimal('10000')  # Mínimo volumen
+MIN_SALDO_COMPRA = Decimal('0.5')  # Para saldos bajos
+PORCENTAJE_USDC = Decimal('0.9')  # ~90% del saldo por trade
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'SHIBUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']
 TAKE_PROFIT = Decimal('0.05')  # 5% para mayores ganancias
 STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
 TRAILING_STOP = Decimal('0.01')  # 1% para proteger subidas
-TRADE_COOLDOWN_SEC = 30  # Para más trades
+TRADE_COOLDOWN_SEC = 30  # Para más trades, ajustable dinámicamente
 PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger saldo
 CRITICAL_SALDO = Decimal('3')  # Pausar si saldo < 3 USDC
-NOTIFICATION_COOLDOWN_MIN = 5  # Enviar notificación cada 5 minutos
+NOTIFICATION_COOLDOWN_MIN = 5  # Notificación cada 5 minutos
+NO_BUY_CYCLES_THRESHOLD = 3  # Forzar compras tras 3 ciclos sin éxito
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
 REGISTRO_FILE = "registro.json"
@@ -48,6 +49,7 @@ ULTIMAS_OPERACIONES = []
 DUST_THRESHOLD = Decimal('0.1')
 TICKERS_CACHE = {}
 last_no_buy_notification = 0  # Para limitar notificaciones
+no_buy_cycles = 0  # Contador de ciclos sin compras
 
 def get_cached_ticker(symbol):
     now = time.time()
@@ -259,7 +261,7 @@ def safe_get_balance(asset):
         enviar_telegram(f"⚠️ Error inesperado en balance {asset}: {e}")
         return Decimal('0')
 
-def mejores_criptos(max_candidates=5):
+def mejores_criptos(max_candidates=10):
     try:
         candidates = []
         for sym in ALLOWED_SYMBOLS:
@@ -277,6 +279,9 @@ def mejores_criptos(max_candidates=5):
             else:
                 logger.debug(f"{sym} volumen bajo: {vol} < {MIN_VOLUME}")
             time.sleep(0.05)
+        if not candidates and no_buy_cycles >= NO_BUY_CYCLES_THRESHOLD:
+            logger.warning("Forzando compras tras 3 ciclos sin candidatos.")
+            return [get_cached_ticker(random.choice(ALLOWED_SYMBOLS)) for _ in range(min(5, len(ALLOWED_SYMBOLS)))]
         if not candidates:
             logger.warning("No hay criptos con volumen suficiente.")
             enviar_telegram("⚠️ No hay criptos con volumen suficiente (>10000 USDC).")
@@ -445,7 +450,7 @@ def resumen_diario():
         enviar_telegram(f"⚠️ Error en resumen diario: {e}")
 
 def comprar():
-    global last_no_buy_notification
+    global last_no_buy_notification, no_buy_cycles
     if not puede_comprar():
         logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
         enviar_telegram("⚠️ Límite de pérdida diaria alcanzado.")
@@ -464,11 +469,13 @@ def comprar():
         cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot)
         criptos = mejores_criptos()
         if not criptos:
+            no_buy_cycles += 1
             logger.info("No hay criptos candidatas para comprar.")
             if time.time() - last_no_buy_notification >= NOTIFICATION_COOLDOWN_MIN * 60:
                 enviar_telegram("⚠️ No hay criptos candidatas: sin símbolos con volumen suficiente (>10000 USDC).")
                 last_no_buy_notification = time.time()
             return
+        no_buy_cycles = 0
         registro = cargar_json(REGISTRO_FILE)
         now_ts = time.time()
         global ULTIMAS_OPERACIONES
@@ -477,10 +484,6 @@ def comprar():
         no_compradas_razon = []
         for cripto in criptos:
             symbol = cripto["symbol"]
-            if symbol in registro:
-                no_compradas_razon.append(f"{symbol}: ya en cartera")
-                logger.debug(f"{symbol} ya en cartera, saltando")
-                continue
             last = ULTIMA_COMPRA.get(symbol, 0)
             if now_ts - last < TRADE_COOLDOWN_SEC:
                 no_compradas_razon.append(f"{symbol}: en cooldown")
@@ -550,6 +553,48 @@ def comprar():
             logger.warning(f"No se realizaron compras en este ciclo. {razon_msg}")
             enviar_telegram(f"⚠️ No se realizaron compras en este ciclo. {razon_msg}")
             last_no_buy_notification = time.time()
+        elif saldo_spot > MIN_SALDO_COMPRA * 10 and compradas == 0:
+            logger.warning(f"Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}. Forzando reinversión.")
+            enviar_telegram(f"⚠️ Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}. Forzando reinversión.")
+            # Reinvertir saldo ocioso
+            cantidad_usdc = saldo_spot - MIN_SALDO_COMPRA
+            if cantidad_usdc > MIN_SALDO_COMPRA:
+                symbol = random.choice(ALLOWED_SYMBOLS)
+                ticker = safe_get_ticker(symbol)
+                if ticker and load_symbol_info(symbol):
+                    precio = dec(ticker["lastPrice"])
+                    quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
+                    quote_to_spend = quantize_quote(quote_to_spend, load_symbol_info(symbol)["tickSize"])
+                    try:
+                        orden = retry(
+                            lambda: client.create_order(
+                                symbol=symbol,
+                                side="BUY",
+                                type="MARKET",
+                                quoteOrderQty=format(quote_to_spend, 'f')
+                            ),
+                            tries=3, base_delay=0.5
+                        )
+                        executed_qty = executed_qty_from_order(orden)
+                        if executed_qty <= 0:
+                            executed_qty = float(quote_to_spend / precio)
+                        with LOCK:
+                            registro = cargar_json(REGISTRO_FILE)
+                            registro[symbol] = {
+                                "cantidad": executed_qty,
+                                "precio_compra": float(precio),
+                                "timestamp": now_tz().isoformat(),
+                                "high_since_buy": float(precio)
+                            }
+                            guardar_json(registro, REGISTRO_FILE)
+                        enviar_telegram(f"🟢 Reinversión forzada: Comprado {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE} a ~{float(precio):.6f}.")
+                        logger.info(f"Reinversión forzada: {symbol}, qty={executed_qty}, precio={precio}")
+                    except Exception as e:
+                        logger.error(f"Error en reinversión forzada {symbol}: {e}")
+                        enviar_telegram(f"⚠️ Error en reinversión forzada {symbol}: {e}")
+        if saldo_spot > 10:  # Alerta si hay mucho USDC ocioso
+            logger.warning(f"Alerta: Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}, posiciones abiertas: {len(cargar_json(REGISTRO_FILE))}")
+            enviar_telegram(f"⚠️ Alerta: Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}, posiciones abiertas: {len(cargar_json(REGISTRO_FILE))}")
     except Exception as e:
         logger.error(f"Error general en compra: {e}")
         enviar_telegram(f"⚠️ Error general en compra: {e}")
@@ -640,7 +685,7 @@ def vender_y_convertir():
                 return
             criptos = mejores_criptos()
             if criptos:
-                candidates = [c for c in criptos if c['symbol'] not in registro]
+                candidates = [c for c in criptos]
                 if candidates:
                     best = candidates[0]
                     best_symbol = best['symbol']
@@ -651,55 +696,4 @@ def vender_y_convertir():
                             continue
                         price = dec(ticker['lastPrice'])
                         buy_price = dec(data['precio_compra'])
-                        change = (price - buy_price) / buy_price if buy_price != 0 else 0
-                        qty = dec(data['cantidad'])
-                        ganancia_bruta = qty * (price - buy_price)
-                        comision_compra = buy_price * qty * COMMISSION_RATE
-                        comision_venta = price * qty * COMMISSION_RATE
-                        ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-                        time_held = (now_tz() - datetime.fromisoformat(data['timestamp'])).total_seconds() / 60
-                        pos_perfs.append((sym, change, ganancia_neta, time_held))
-                        time.sleep(0.1)
-                    if pos_perfs:
-                        pos_perfs.sort(key=lambda x: x[1])
-                        worst_sym, worst_change, worst_net, time_held = pos_perfs[0]
-                        if worst_net < 0 or time_held > 15:  # Rotar si pérdida o >15min
-                            try:
-                                meta = load_symbol_info(worst_sym)
-                                asset = base_from_symbol(worst_sym)
-                                cantidad_wallet = dec(safe_get_balance(asset))
-                                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
-                                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
-                                    del registro[worst_sym]
-                                    guardar_json(registro, REGISTRO_FILE)
-                                    return
-                                orden = market_sell_with_fallback(worst_sym, qty, meta)
-                                logger.info(f"Rotación: vendido {worst_sym}: {orden}")
-                                total_hoy = actualizar_pnl_diario(worst_net)
-                                enviar_telegram(f"🔄 Rotación: vendido {worst_sym} (PnL neto {float(worst_net):.2f}). Para {best_symbol}.")
-                                del registro[worst_sym]
-                                guardar_json(registro, REGISTRO_FILE)
-                                comprar()
-                            except Exception as e:
-                                logger.error(f"Error en venta por rotación {worst_sym}: {e}")
-                                enviar_telegram(f"⚠️ Error en rotación: {e}")
-        except Exception as e:
-            logger.error(f"Error en bloque de rotación: {e}")
-            enviar_telegram(f"⚠️ Error en rotación: {e}")
-
-if __name__ == "__main__":
-    debug_balances()
-    inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=5%, 30s checks, rotación tras 15min, notificaciones limitadas.")
-    scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
-    scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
-    scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen", coalesce=True, max_instances=1)
-    scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl", coalesce=True, max_instances=1)
-    scheduler.start()
-    try:
-        while True:
-            time.sleep(10)
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
-        logger.info("Bot detenido.")
+                        change = (price - buy_price
