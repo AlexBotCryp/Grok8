@@ -30,7 +30,7 @@ TAKE_PROFIT = Decimal('0.03')  # 3% para cubrir fees
 STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
 TRAILING_STOP = Decimal('0.01')  # 1% para aguantar subidas
-TRADE_COOLDOWN_SEC = 30  # Aumentado para evitar solapamiento
+TRADE_COOLDOWN_SEC = 30  # Para evitar solapamiento
 PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger saldo
 CRITICAL_SALDO = Decimal('5')  # Pausar si saldo < 5 USDC
 TZ_MADRID = pytz.timezone("Europe/Madrid")
@@ -167,7 +167,7 @@ def reset_diario():
         if hoy not in pnl:
             pnl[hoy] = 0
             guardar_json(pnl, PNL_DIARIO_FILE)
-            logger.info("PnL diario reseteado")
+        logger.info("PnL diario reseteado")
 
 def dec(x):
     try:
@@ -398,11 +398,8 @@ def executed_qty_from_order(order_resp) -> float:
             qty = sum(float(f.get('qty', 0)) for f in fills if f)
             logger.debug(f"Cantidad ejecutada desde fills: {qty}")
             return qty
-    except Exception:
-        pass
-    try:
         executed_quote = float(order_resp.get('cummulativeQuoteQty', 0))
-        price = float(order_resp.get('price') or 0) or float(order_resp.get('fills', [{}])[0].get('price', 0) or 0)
+        price = float(order_resp.get('price', 0)) or float(order_resp.get('fills', [{}])[0].get('price', 0) or 0)
         if executed_quote and price:
             qty = executed_quote / price
             logger.debug(f"Cantidad ejecutada desde quote: {qty}")
@@ -584,7 +581,7 @@ def vender_y_convertir():
                 ganancia_bruta = qty * (precio_actual - precio_compra)
                 comision_compra = precio_compra * qty * COMMISSION_RATE
                 comision_venta = precio_actual * qty * COMMISSION_RATE
-                ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+                ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
                 trailing_trigger = (precio_actual - high_since_buy) / high_since_buy <= -TRAILING_STOP
                 vender_por_stop = cambio <= STOP_LOSS or trailing_trigger
                 vender_por_profit = cambio >= TAKE_PROFIT
@@ -639,7 +636,7 @@ def vender_y_convertir():
                         ganancia_bruta = qty * (price - buy_price)
                         comision_compra = buy_price * qty * COMMISSION_RATE
                         comision_venta = price * qty * COMMISSION_RATE
-                        ganancia_neta = ganancia_bruta - comision_compra - comision_venta
+                        ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
                         time_held = (now_tz() - datetime.fromisoformat(data['timestamp'])).total_seconds() / 60
                         pos_perfs.append((sym, change, ganancia_neta, time_held))
                         time.sleep(0.2)
@@ -665,15 +662,15 @@ def vender_y_convertir():
                                 comprar()
                             except Exception as e:
                                 logger.error(f"Error en venta por rotación {worst_sym}: {e}")
-                                enviar_telegram(f"⚠️ Error en rotación {worst_sym}: {e}")
+                                enviar_telegram(f"⚠️ Error en rotación: {e}")
         except Exception as e:
             logger.error(f"Error en bloque de rotación: {e}")
-           Enviar_telegram(f"⚠️ Error en rotación: {e}")
+            enviar_telegram(f"⚠️ Error en rotación: {e}")
 
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=3%, 30s checks, rotación tras 30min, saldo insuficiente y solapamiento corregidos.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=3%, 30s checks, rotación tras 30min, IndentationError corregido.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
     scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
