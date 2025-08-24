@@ -31,8 +31,7 @@ TAKE_PROFIT = Decimal('0.03')  # 3% para cubrir fees
 STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
 TRAILING_STOP = Decimal('0.01')  # 1% para aguantar subidas
-TRADE_COOLDOWN_SEC = 60
-MAX_TRADES_PER_HOUR = 10  # Reducido para menos fees
+TRADE_COOLDOWN_SEC = 10
 PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger 160 USDC
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
@@ -469,10 +468,6 @@ def comprar():
         now_ts = time.time()
         global ULTIMAS_OPERACIONES
         ULTIMAS_OPERACIONES = [t for t in ULTIMAS_OPERACIONES if now_ts - t < 3600]
-        if len(ULTIMAS_OPERACIONES) >= MAX_TRADES_PER_HOUR:
-            logger.info("Tope de operaciones por hora alcanzado.")
-            enviar_telegram("⚠️ Tope de operaciones por hora.")
-            return
         compradas = 0
         for cripto in criptos:
             if compradas >= MAX_POSICIONES - len(registro):
@@ -677,10 +672,10 @@ def vender_y_convertir():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Optimizado: Mueve ~160 USDC en cualquier cripto, sin filtro de cambio, TAKE_PROFIT=3%, 60s checks, max 4 posiciones, rotación tras 30min, menos fees.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades, TAKE_PROFIT=3%, 10s checks, max 4 posiciones, rotación tras 30min.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', seconds=60, id="comprar")
-    scheduler.add_job(vender_y_convertir, 'interval', seconds=60, id="vender")
+    scheduler.add_job(comprar, 'interval', seconds=10, id="comprar")
+    scheduler.add_job(vender_y_convertir, 'interval', seconds=10, id="vender")
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
