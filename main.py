@@ -24,14 +24,14 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
 MIN_VOLUME = Decimal('50000')  # Bajo para más oportunidades
-MAX_POSICIONES = 5  # Hasta 5 criptos
+MAX_POSICIONES = 8  # Aumentado para más trades
 MIN_SALDO_COMPRA = Decimal('2')  # Para pequeñas compras
-PORCENTAJE_USDC = Decimal('0.25')  # ~40 USDC por trade
+PORCENTAJE_USDC = Decimal('0.125')  # ~20 USDC por trade
 ALLOWED_SYMBOLS = ['DOGEUSDC', 'SHIBUSDC', 'ADAUSDC', 'XRPUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC']
-TAKE_PROFIT = Decimal('0.012')  # 1.2% neto
-STOP_LOSS = Decimal('-0.01')  # -1%
+TAKE_PROFIT = Decimal('0.008')  # 0.8% neto
+STOP_LOSS = Decimal('-0.008')  # -0.8%
 COMMISSION_RATE = Decimal('0.001')
-TRAILING_STOP = Decimal('0.005')
+TRAILING_STOP = Decimal('0.004')  # 0.4%
 TRADE_COOLDOWN_SEC = 10
 MAX_TRADES_PER_HOUR = 60
 PERDIDA_MAXIMA_DIARIA = Decimal('30')
@@ -118,6 +118,10 @@ def debug_balances():
         cuenta = retry(lambda: client.get_account(), tries=15, base_delay=1.0)
         logger.info("=== BALANCES EN CARTERA ===")
         total_value = Decimal('0')
+        posiciones = cargar_json(REGISTRO_FILE)
+        mensaje = f"🤖 Inicio bot - Posiciones abiertas: {len(posiciones)}\n"
+        for sym, data in posiciones.items():
+            mensaje += f"{sym}: {data['cantidad']:.8f} @ {data['precio_compra']:.6f}\n"
         for b in cuenta['balances']:
             total = Decimal(str(float(b['free']) + float(b['locked'])))
             if total > Decimal('0.0001'):
@@ -129,7 +133,8 @@ def debug_balances():
                     if ticker:
                         total_value += total * Decimal(ticker['lastPrice'])
         logger.info(f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}")
-        enviar_telegram(f"🤖 Inicio bot - Valor total cartera: {total_value:.2f} {MONEDA_BASE}")
+        mensaje += f"Valor total cartera: {total_value:.2f} {MONEDA_BASE}"
+        enviar_telegram(mensaje)
         return total_value
     except Exception as e:
         logger.error(f"Error debug balances: {e}")
@@ -325,48 +330,6 @@ def precio_medio_si_hay(symbol, lookback_days=30):
         logger.warning(f"No se pudo calcular precio medio {symbol}: {e}")
     return None
 
-def inicializar_registro():
-    with LOCK:
-        registro = cargar_json(REGISTRO_FILE)
-        try:
-            cuenta = retry(lambda: client.get_account(), tries=15, base_delay=1.0)
-            logger.debug(f"Cuenta obtenida: {len(cuenta['balances'])} activos")
-            for b in cuenta['balances']:
-                asset = b['asset']
-                free = Decimal(str(b['free']))
-                if free > Decimal('0.0000001'):
-                    logger.debug(f"Detectado {asset}: {free} free")
-                if asset != MONEDA_BASE and free > Decimal('0.0000001'):
-                    symbol = asset + MONEDA_BASE
-                    if symbol not in ALLOWED_SYMBOLS:
-                        continue
-                    if symbol in INVALID_SYMBOL_CACHE:
-                        continue
-                    if not load_symbol_info(symbol):
-                        continue
-                    try:
-                        t = safe_get_ticker(symbol)
-                        if not t:
-                            continue
-                        precio_actual = Decimal(t['lastPrice'])
-                        pm = precio_medio_si_hay(symbol) or float(precio_actual)
-                        registro[symbol] = {
-                            "cantidad": float(free),
-                            "precio_compra": float(pm),
-                            "timestamp": now_tz().isoformat(),
-                            "from_cartera": True,
-                            "high_since_buy": float(precio_actual)
-                        }
-                        logger.info(f"Posición inicial: {symbol} {free} a {pm} (last {precio_actual})")
-                    except Exception:
-                        continue
-                elif asset == MONEDA_BASE:
-                    logger.info(f"Saldo {MONEDA_BASE}: {free}")
-            guardar_json(registro, REGISTRO_FILE)
-        except BinanceAPIException as e:
-            logger.error(f"Error inicializando registro: {e}")
-            enviar_telegram(f"⚠️ Error inicializando registro: {e}")
-
 def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
     attempts = 0
     last_err = None
@@ -428,8 +391,9 @@ def comprar():
             return
         registro = cargar_json(REGISTRO_FILE)
         if len(registro) >= MAX_POSICIONES:
-            logger.info("Máximo de posiciones abiertas alcanzado.")
-            enviar_telegram("⚠️ Máximo de posiciones abiertas.")
+            mensaje = f"⚠️ Máximo de posiciones abiertas alcanzado ({len(registro)}/{MAX_POSICIONES}). Posiciones: {list(registro.keys())}"
+            logger.info(mensaje)
+            enviar_telegram(mensaje)
             return
         now_ts = time.time()
         global ULTIMAS_OPERACIONES
@@ -614,7 +578,7 @@ def vender_y_convertir():
                     if pos_perfs:
                         pos_perfs.sort(key=lambda x: x[1])
                         worst_sym, worst_change, worst_net = pos_perfs[0]
-                        if worst_net < 0 or worst_change < 0:
+                        if worst_net < 0 or worst_change < 0 or worst_change < Decimal('0.002'):  # Forzar rotación si bajo rendimiento
                             try:
                                 meta = load_symbol_info(worst_sym)
                                 asset = base_from_symbol(worst_sym)
@@ -671,7 +635,7 @@ def resumen_diario():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin filtros, 10s checks, fee-aware, max 5 posiciones, errores de tipo corregidos.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin filtros, 10s checks, fee-aware, max 8 posiciones, rotación forzada.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=10, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', seconds=10, id="vender")
