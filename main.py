@@ -17,24 +17,24 @@ from apscheduler.schedulers.background import BackgroundScheduler
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("bot-ia")
 
-# Config — balanceado para 160 USDC
+# Config — ultra agresivo para 160 USDC
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
-MIN_VOLUME = Decimal('50000')  # Para oportunidades
-MAX_POSICIONES = 3  # Reducido para proteger saldo
+MIN_VOLUME = Decimal('50000')  # Bajo para más oportunidades
+MAX_POSICIONES = 8  # Aumentado para más trades
 MIN_SALDO_COMPRA = Decimal('2')  # Para pequeñas compras
-PORCENTAJE_USDC = Decimal('0.25')  # ~40 USDC por trade
-ALLOWED_SYMBOLS = ['DOGEUSDC', 'SHIBUSDC', 'ADAUSDC', 'XRPUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC']
-TAKE_PROFIT = Decimal('0.015')  # 1.5% neto
-STOP_LOSS = Decimal('-0.005')  # -0.5%
+PORCENTAJE_USDC = Decimal('0.125')  # ~20 USDC por trade
+ALLOWED_SYMBOLS = ['DOGEUSDC', 'SHIBUSDC', 'ADAUSDC', 'XRPUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'SOLUSDC', 'BNBUSDC', 'LINKUSDC', 'DOTUSDC']  # Añadidos más para diversidad
+TAKE_PROFIT = Decimal('0.008')  # 0.8% neto para cubrir fees
+STOP_LOSS = Decimal('-0.008')  # -0.8%
 COMMISSION_RATE = Decimal('0.001')
-TRAILING_STOP = Decimal('0.003')  # 0.3%
-TRADE_COOLDOWN_SEC = 60  # 60s para menos fees
-MAX_TRADES_PER_HOUR = 5  # Reducido para menos fees
-PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger 160 USDC
+TRAILING_STOP = Decimal('0.004')  # 0.4%
+TRADE_COOLDOWN_SEC = 10
+MAX_TRADES_PER_HOUR = 60
+PERDIDA_MAXIMA_DIARIA = Decimal('30')
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
 REGISTRO_FILE = "registro.json"
