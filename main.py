@@ -23,15 +23,16 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
 MIN_VOLUME = Decimal('50000')  # Para oportunidades
-MIN_SALDO_COMPRA = Decimal('2')  # Para pequeñas compras
-PORCENTAJE_USDC = Decimal('0.25')  # ~40 USDC por trade
+MIN_SALDO_COMPRA = Decimal('1')  # Para saldos bajos
+PORCENTAJE_USDC = Decimal('0.05')  # ~8 USDC por trade
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'SHIBUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']
 TAKE_PROFIT = Decimal('0.03')  # 3% para cubrir fees
 STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
 TRAILING_STOP = Decimal('0.01')  # 1% para aguantar subidas
-TRADE_COOLDOWN_SEC = 10
-PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger 160 USDC
+TRADE_COOLDOWN_SEC = 30  # Aumentado para evitar solapamiento
+PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger saldo
+CRITICAL_SALDO = Decimal('5')  # Pausar si saldo < 5 USDC
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
 REGISTRO_FILE = "registro.json"
@@ -452,6 +453,10 @@ def comprar():
             logger.info(f"Saldo {MONEDA_BASE} insuficiente: {saldo_spot} < {MIN_SALDO_COMPRA}")
             enviar_telegram(f"⚠️ Saldo insuficiente: {saldo_spot} {MONEDA_BASE}")
             return
+        if saldo_spot < CRITICAL_SALDO:
+            logger.info(f"Saldo crítico: {saldo_spot} < {CRITICAL_SALDO}. Pausando compras.")
+            enviar_telegram(f"⚠️ Saldo crítico: {saldo_spot} {MONEDA_BASE}. Pausando compras.")
+            return
         cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot)
         criptos = mejores_criptos()
         if not criptos:
@@ -489,6 +494,10 @@ def comprar():
             if quote_to_spend < min_quote:
                 logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
                 enviar_telegram(f"⚠️ {symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE})")
+                continue
+            if quote_to_spend > saldo_spot:
+                logger.info(f"{symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
+                enviar_telegram(f"⚠️ {symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
                 continue
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
             try:
@@ -659,17 +668,17 @@ def vender_y_convertir():
                                 enviar_telegram(f"⚠️ Error en rotación {worst_sym}: {e}")
         except Exception as e:
             logger.error(f"Error en bloque de rotación: {e}")
-            enviar_telegram(f"⚠️ Error en rotación: {e}")
+           Enviar_telegram(f"⚠️ Error en rotación: {e}")
 
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades ni posiciones, TAKE_PROFIT=3%, 10s checks, rotación tras 30min.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=3%, 30s checks, rotación tras 30min, saldo insuficiente y solapamiento corregidos.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', seconds=10, id="comprar")
-    scheduler.add_job(vender_y_convertir, 'interval', seconds=10, id="vender")
-    scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
-    scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
+    scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
+    scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
+    scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen", coalesce=True, max_instances=1)
+    scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl", coalesce=True, max_instances=1)
     scheduler.start()
     try:
         while True:
