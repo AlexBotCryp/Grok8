@@ -24,12 +24,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
 MIN_VOLUME = Decimal('10000')  # Mínimo volumen
 MIN_SALDO_COMPRA = Decimal('0.5')  # Para saldos bajos
-PORCENTAJE_USDC = Decimal('0.1')  # ~10% del saldo por trade (aumentado para probar)
+PORCENTAJE_USDC = Decimal('0.05')  # ~8 USDC por trade
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'SHIBUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']
 TAKE_PROFIT = Decimal('0.05')  # 5% para mayores ganancias
 STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
-TRAILING_STOP = Decimal('0.01')  # 1% para proteger subidas
+TRAILING_STOP = Decimal('0.01')  # 1% para aguantar subidas
 TRADE_COOLDOWN_SEC = 30  # Para más trades
 PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger saldo
 CRITICAL_SALDO = Decimal('3')  # Pausar si saldo < 3 USDC
@@ -504,16 +504,15 @@ def comprar():
                 no_compradas_razon.append(f"{symbol}: sin info de símbolo")
                 logger.debug(f"No meta para {symbol}")
                 continue
-            min_notional = min_quote_for_market(symbol)
-            quote_to_spend = max(cantidad_usdc * (Decimal('1') - COMMISSION_RATE), min_notional)  # Asegurar mínimo notional
+            quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
             if quote_to_spend > saldo_spot:
                 no_compradas_razon.append(f"{symbol}: saldo insuficiente ({quote_to_spend} > {saldo_spot})")
-                logger.info(f"{symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}, minNotional: {min_notional}")
-                enviar_telegram(f"⚠️ {symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}, minNotional: {min_notional}")
+                logger.info(f"{symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
+                enviar_telegram(f"⚠️ {symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
                 continue
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
-            logger.debug(f"Compra {symbol}: quote_to_spend={quote_to_spend}, minNotional={min_notional}")
             try:
+                logger.debug(f"Intentando comprar {symbol} con {quote_to_spend} {MONEDA_BASE}")
                 orden = retry(
                     lambda: client.create_order(
                         symbol=symbol,
