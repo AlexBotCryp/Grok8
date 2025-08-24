@@ -24,7 +24,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
 MIN_VOLUME = Decimal('50000')  # Para oportunidades
 MIN_SALDO_COMPRA = Decimal('1')  # Para saldos bajos
-PORCENTAJE_USDC = Decimal('0.05')  # ~8 USDC por trade
+PORCENTAJE_USDC = Decimal('0.1')  # ~16 USDC por trade
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'SHIBUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']
 TAKE_PROFIT = Decimal('0.03')  # 3% para cubrir fees
 STOP_LOSS = Decimal('-0.01')  # -1%
@@ -486,12 +486,7 @@ def comprar():
             if not meta:
                 logger.debug(f"No meta para {symbol}")
                 continue
-            min_quote = min_quote_for_market(symbol)
             quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
-            if quote_to_spend < min_quote:
-                logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
-                enviar_telegram(f"⚠️ {symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE})")
-                continue
             if quote_to_spend > saldo_spot:
                 logger.info(f"{symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
                 enviar_telegram(f"⚠️ {symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
@@ -670,7 +665,7 @@ def vender_y_convertir():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=3%, 30s checks, rotación tras 30min, IndentationError corregido.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=3%, 30s checks, rotación tras 30min, minNotional corregido.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
     scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
