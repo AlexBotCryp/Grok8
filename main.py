@@ -1,3 +1,4 @@
+```python
 # -*- coding: utf-8 -*-
 import os
 import time
@@ -27,11 +28,11 @@ MIN_VOLUME = Decimal('50000')  # Bajo para más oportunidades
 MAX_POSICIONES = 8  # Aumentado para más trades
 MIN_SALDO_COMPRA = Decimal('2')  # Para pequeñas compras
 PORCENTAJE_USDC = Decimal('0.125')  # ~20 USDC por trade
-ALLOWED_SYMBOLS = ['DOGEUSDC', 'SHIBUSDC', 'ADAUSDC', 'XRPUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'SOLUSDC', 'BNBUSDC', 'LINKUSDC', 'DOTUSDC']  # Añadidos más para diversidad
-TAKE_PROFIT = Decimal('0.008')  # 0.8% neto para cubrir fees
-STOP_LOSS = Decimal('-0.008')  # -0.8%
+ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'DOGEUSDC', 'SHIBUSDC', 'ADAUSDC', 'XRPUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']  # Añadidos más para diversidad
+TAKE_PROFIT = Decimal('0.03')  # 3% para mayores ganancias
+STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
-TRAILING_STOP = Decimal('0.004')  # 0.4%
+TRAILING_STOP = Decimal('0.01')  # 1% para aguantar subidas
 TRADE_COOLDOWN_SEC = 10
 MAX_TRADES_PER_HOUR = 60
 PERDIDA_MAXIMA_DIARIA = Decimal('30')
@@ -462,238 +463,6 @@ def resumen_diario():
         logger.error(f"Error en resumen diario: {e}")
         enviar_telegram(f"⚠️ Error en resumen diario: {e}")
 
-def comprar():
-    if not puede_comprar():
-        logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
-        enviar_telegram("⚠️ Límite de pérdida diaria alcanzado.")
-        return
-    try:
-        saldo_spot = safe_get_balance(MONEDA_BASE)
-        logger.debug(f"Saldo {MONEDA_BASE} disponible: {saldo_spot}")
-        if saldo_spot < MIN_SALDO_COMPRA:
-            logger.info(f"Saldo {MONEDA_BASE} insuficiente: {saldo_spot} < {MIN_SALDO_COMPRA}")
-            enviar_telegram(f"⚠️ Saldo insuficiente: {saldo_spot} {MONEDA_BASE}")
-            return
-        cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot)
-        criptos = mejores_criptos()
-        if not criptos:
-            logger.info("No hay criptos candidatas para comprar.")
-            enviar_telegram("⚠️ No hay criptos candidatas.")
-            return
-        registro = cargar_json(REGISTRO_FILE)
-        if len(registro) >= MAX_POSICIONES:
-            mensaje = f"⚠️ Máximo de posiciones abiertas alcanzado ({len(registro)}/{MAX_POSICIONES}). Posiciones: {list(registro.keys())}"
-            logger.info(mensaje)
-            enviar_telegram(mensaje)
-            return
-        now_ts = time.time()
-        global ULTIMAS_OPERACIONES
-        ULTIMAS_OPERACIONES = [t for t in ULTIMAS_OPERACIONES if now_ts - t < 3600]
-        if len(ULTIMAS_OPERACIONES) >= MAX_TRADES_PER_HOUR:
-            logger.info("Tope de operaciones por hora alcanzado.")
-            enviar_telegram("⚠️ Tope de operaciones por hora.")
-            return
-        compradas = 0
-        for cripto in criptos:
-            if compradas >= MAX_POSICIONES - len(registro):
-                break
-            symbol = cripto["symbol"]
-            if symbol in registro:
-                logger.debug(f"{symbol} ya en cartera, saltando")
-                continue
-            last = ULTIMA_COMPRA.get(symbol, 0)
-            if now_ts - last < TRADE_COOLDOWN_SEC:
-                logger.debug(f"{symbol} en cooldown, saltando")
-                continue
-            ticker = safe_get_ticker(symbol)
-            if not ticker:
-                logger.debug(f"No ticker para {symbol}")
-                continue
-            precio = dec(ticker["lastPrice"])
-            if precio <= 0:
-                logger.debug(f"{symbol} precio inválido: {precio}")
-                continue
-            meta = load_symbol_info(symbol)
-            if not meta:
-                logger.debug(f"No meta para {symbol}")
-                continue
-            min_quote = min_quote_for_market(symbol)
-            quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
-            if quote_to_spend < min_quote:
-                logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
-                enviar_telegram(f"⚠️ {symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE})")
-                continue
-            quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
-            try:
-                logger.debug(f"Intentando comprar {symbol} con {quote_to_spend} {MONEDA_BASE}")
-                orden = retry(
-                    lambda: client.create_order(
-                        symbol=symbol,
-                        side="BUY",
-                        type="MARKET",
-                        quoteOrderQty=format(quote_to_spend, 'f')
-                    ),
-                    tries=5, base_delay=1.0
-                )
-                executed_qty = executed_qty_from_order(orden)
-                if executed_qty <= 0:
-                    executed_qty = float(quote_to_spend / precio)
-                with LOCK:
-                    registro = cargar_json(REGISTRO_FILE)
-                    registro[symbol] = {
-                        "cantidad": executed_qty,
-                        "precio_compra": float(precio),
-                        "timestamp": now_tz().isoformat(),
-                        "high_since_buy": float(precio)
-                    }
-                    guardar_json(registro, REGISTRO_FILE)
-                enviar_telegram(f"🟢 Comprado {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE} a ~{float(precio):.6f}.")
-                logger.info(f"Compra exitosa: {symbol}, qty={executed_qty}, precio={precio}")
-                compradas += 1
-                ULTIMA_COMPRA[symbol] = now_ts
-                ULTIMAS_OPERACIONES.append(now_ts)
-            except BinanceAPIException as e:
-                logger.error(f"Error comprando {symbol}: {e}")
-                enviar_telegram(f"⚠️ Error comprando {symbol}: {e}")
-            except Exception as e:
-                logger.error(f"Error inesperado comprando {symbol}: {e}")
-                enviar_telegram(f"⚠️ Error inesperado comprando {symbol}: {e}")
-            time.sleep(0.2)
-    except Exception as e:
-        logger.error(f"Error general en compra: {e}")
-        enviar_telegram(f"⚠️ Error general en compra: {e}")
-
-def vender_y_convertir():
-    with LOCK:
-        registro = cargar_json(REGISTRO_FILE)
-        nuevos_registro = {}
-        dust_positions = []
-        for symbol, data in list(registro.items()):
-            try:
-                precio_compra = dec(data["precio_compra"])
-                high_since_buy = dec(data.get("high_since_buy", data["precio_compra"]))
-                ticker = safe_get_ticker(symbol)
-                if not ticker:
-                    nuevos_registro[symbol] = data
-                    logger.debug(f"No ticker para {symbol}, manteniendo")
-                    continue
-                precio_actual = dec(ticker["lastPrice"])
-                cambio = (precio_actual - precio_compra) / (precio_compra if precio_compra != 0 else Decimal('1'))
-                meta = load_symbol_info(symbol)
-                if not meta:
-                    nuevos_registro[symbol] = data
-                    logger.debug(f"No meta para {symbol}, manteniendo")
-                    continue
-                if precio_actual > high_since_buy:
-                    data["high_since_buy"] = float(precio_actual)
-                    guardar_json(registro, REGISTRO_FILE)
-                    high_since_buy = precio_actual
-                asset = base_from_symbol(symbol)
-                cantidad_wallet = dec(safe_get_balance(asset))
-                if cantidad_wallet <= 0:
-                    dust_positions.append(symbol)
-                    logger.debug(f"{symbol} sin cantidad, marcando como dust")
-                    continue
-                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
-                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
-                    dust_positions.append(symbol)
-                    logger.debug(f"{symbol} cantidad insuficiente: {qty}")
-                    continue
-                if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_actual > 0:
-                    notional_est = qty * precio_actual
-                    if notional_est < meta["minNotional"] or notional_est < DUST_THRESHOLD:
-                        dust_positions.append(symbol)
-                        logger.debug(f"{symbol} no alcanza minNotional o dust: {notional_est}")
-                        continue
-                ganancia_bruta = qty * (precio_actual - precio_compra)
-                comision_compra = precio_compra * qty * COMMISSION_RATE
-                comision_venta = precio_actual * qty * COMMISSION_RATE
-                ganancia_neta = ganancia_bruta - comision_compra - comision_venta
-                trailing_trigger = (precio_actual - high_since_buy) / high_since_buy <= -TRAILING_STOP
-                vender_por_stop = cambio <= STOP_LOSS or trailing_trigger
-                vender_por_profit = cambio >= TAKE_PROFIT
-                if vender_por_stop or vender_por_profit:
-                    try:
-                        orden = market_sell_with_fallback(symbol, qty, meta)
-                        logger.info(f"Orden de venta: {orden}")
-                        total_hoy = actualizar_pnl_diario(ganancia_neta)
-                        motivo = "Stop-loss/Trailing" if vender_por_stop else "Take-profit"
-                        enviar_telegram(
-                            f"🔴 Vendido {symbol} - {float(qty):.8f} a ~{float(precio_actual):.6f} "
-                            f"(Cambio: {float(cambio)*100:.2f}%) PnL: {float(ganancia_neta):.2f} {MONEDA_BASE}. "
-                            f"Motivo: {motivo}. PnL hoy: {total_hoy:.2f}."
-                        )
-                        comprar()
-                    except BinanceAPIException as e:
-                        logger.error(f"Error vendiendo {symbol}: {e}")
-                        enviar_telegram(f"⚠️ Error vendiendo {symbol}: {e}")
-                        dust_positions.append(symbol)
-                        continue
-                else:
-                    nuevos_registro[symbol] = data
-                    logger.debug(f"No se vende {symbol}: Cambio={float(cambio)*100:.2f}%, Ganancia neta={float(ganancia_neta):.4f}")
-                time.sleep(0.2)
-            except Exception as e:
-                logger.error(f"Error vendiendo {symbol}: {e}")
-                enviar_telegram(f"⚠️ Error vendiendo {symbol}: {e}")
-                nuevos_registro[symbol] = data
-        limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
-        guardar_json(limpio, REGISTRO_FILE)
-        if dust_positions:
-            enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
-        try:
-            registro = cargar_json(REGISTRO_FILE)
-            if not registro:
-                return
-            criptos = mejores_criptos()
-            if criptos:
-                candidates = [c for c in criptos if c['symbol'] not in registro]
-                if candidates:
-                    best = candidates[0]
-                    best_symbol = best['symbol']
-                    pos_perfs = []
-                    for sym, data in registro.items():
-                        ticker = safe_get_ticker(sym)
-                        if not ticker:
-                            continue
-                        price = dec(ticker['lastPrice'])
-                        buy_price = dec(data['precio_compra'])
-                        change = (price - buy_price) / buy_price if buy_price != 0 else 0
-                        qty = dec(data['cantidad'])
-                        ganancia_bruta = qty * (price - buy_price)
-                        comision_compra = buy_price * qty * COMMISSION_RATE
-                        comision_venta = price * qty * COMMISSION_RATE
-                        ganancia_neta = ganancia_bruta - comision_compra - comision_venta
-                        time_held = (now_tz() - datetime.fromisoformat(data['timestamp'])).total_seconds() / 60
-                        pos_perfs.append((sym, change, ganancia_neta, time_held))
-                        time.sleep(0.2)
-                    if pos_perfs:
-                        pos_perfs.sort(key=lambda x: x[1])
-                        worst_sym, worst_change, worst_net, time_held = pos_perfs[0]
-                        if worst_net < 0 or worst_change < Decimal('0.005') or time_held > 10:  # Rotar si pérdida o >10min sin rendimiento
-                            try:
-                                meta = load_symbol_info(worst_sym)
-                                asset = base_from_symbol(worst_sym)
-                                cantidad_wallet = dec(safe_get_balance(asset))
-                                qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
-                                if qty < meta["marketMinQty"] or qty <= Decimal('0'):
-                                    del registro[worst_sym]
-                                    guardar_json(registro, REGISTRO_FILE)
-                                    return
-                                orden = market_sell_with_fallback(worst_sym, qty, meta)
-                                logger.info(f"Rotación: vendido {worst_sym}: {orden}")
-                                total_hoy = actualizar_pnl_diario(worst_net)
-                                enviar_telegram(f"🔄 Rotación: vendido {worst_sym} (PnL neto {float(worst_net):.2f}). Para {best_symbol}.")
-                                del registro[worst_sym]
-                                guardar_json(registro, REGISTRO_FILE)
-                                comprar()
-                            except Exception as e:
-                                logger.error(f"Error en venta por rotación {worst_sym}: {e}")
-                                enviar_telegram(f"⚠️ Error en rotación {worst_sym}: {e}")
-        except Exception as e:
-            logger.error(f"Error en bloque de rotación: {e}")
-            enviar_telegram(f"⚠️ Error en rotación: {e}")
-
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
@@ -710,3 +479,4 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
         logger.info("Bot detenido.")
+```
