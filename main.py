@@ -671,7 +671,7 @@ def resumen_diario():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin filtros, 10s checks, fee-aware, max 5 posiciones, tipo error corregido.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin filtros, 10s checks, fee-aware, max 5 posiciones, errores de tipo corregidos.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=10, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', seconds=10, id="vender")
