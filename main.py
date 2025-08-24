@@ -23,18 +23,18 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
-MIN_VOLUME = 50_000  # Muy bajo para más oportunidades
+MIN_VOLUME = 50_000  # Bajo para más oportunidades
 MAX_POSICIONES = 5  # Hasta 5 criptos
-MIN_SALDO_COMPRA = 5  # Para pequeñas compras
-PORCENTAJE_USDC = 0.2  # ~30 USDC por trade
+MIN_SALDO_COMPRA = 2  # Para pequeñas compras
+PORCENTAJE_USDC = 0.25  # ~40 USDC por trade
 ALLOWED_SYMBOLS = ['DOGEUSDC', 'SHIBUSDC', 'ADAUSDC', 'XRPUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC']
 TAKE_PROFIT = 0.012  # 1.2% neto
 STOP_LOSS = -0.01  # -1%
-COMMISSION_RATE = 0.001
-TRAILING_STOP = 0.005  # 0.5%
-TRADE_COOLDOWN_SEC = 10  # Cada 10s
-MAX_TRADES_PER_HOUR = 60  # Muy agresivo
-PERDIDA_MAXIMA_DIARIA = 30  # Proteger saldo
+COMMISSION_RATE = Decimal('0.001')
+TRAILING_STOP = Decimal('0.005')
+TRADE_COOLDOWN_SEC = 10
+MAX_TRADES_PER_HOUR = 60
+PERDIDA_MAXIMA_DIARIA = 30
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
 REGISTRO_FILE = "registro.json"
@@ -46,7 +46,7 @@ SYMBOL_CACHE = {}
 INVALID_SYMBOL_CACHE = set()
 ULTIMA_COMPRA = {}
 ULTIMAS_OPERACIONES = []
-DUST_THRESHOLD = 0.1
+DUST_THRESHOLD = Decimal('0.1')
 TICKERS_CACHE = {}
 
 def get_cached_ticker(symbol):
@@ -142,7 +142,7 @@ def actualizar_pnl_diario(realized_pnl, fees=0.1):
         today = get_current_date()
         if today not in pnl_data:
             pnl_data[today] = 0
-        pnl_data[today] += float(realized_pnl) - fees
+        pnl_data[today] += float(realized_pnl) - float(fees)
         guardar_json(pnl_data, PNL_DIARIO_FILE)
         logger.debug(f"PnL actualizado: {today} = {pnl_data[today]}")
         return pnl_data[today]
@@ -166,9 +166,9 @@ def reset_diario():
             guardar_json(pnl, PNL_DIARIO_FILE)
             logger.info("PnL diario reseteado")
 
-def dec(x: str) -> Decimal:
+def dec(x):
     try:
-        return Decimal(x)
+        return Decimal(str(x))
     except (InvalidOperation, TypeError):
         return Decimal('0')
 
@@ -238,6 +238,7 @@ def safe_get_balance(asset):
         b = retry(lambda: client.get_asset_balance(asset=asset), tries=15, base_delay=1.0)
         if not b:
             logger.error(f"No se obtuvo balance para {asset}")
+            enviar_telegram(f"⚠️ No se obtuvo balance para {asset}")
             return 0.0
         free = float(b.get('free', 0))
         locked = float(b.get('locked', 0))
@@ -269,10 +270,10 @@ def mejores_criptos(max_candidates=8):
         filtered = []
         for t in sorted(candidates, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:max_candidates]:
             symbol = t["symbol"]
-            precio = float(t["lastPrice"])
+            precio = dec(t["lastPrice"])
             ganancia_bruta = precio * TAKE_PROFIT
             comision_compra = precio * COMMISSION_RATE
-            comision_venta = (precio * (1 + TAKE_PROFIT)) * COMMISSION_RATE
+            comision_venta = (precio * (Decimal('1') + TAKE_PROFIT)) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
             if ganancia_neta > 0:
                 t['score'] = float(t.get("quoteVolume", 0))
@@ -406,13 +407,13 @@ def comprar():
         enviar_telegram("⚠️ Límite de pérdida diaria alcanzado.")
         return
     try:
-        saldo_spot = safe_get_balance(MONEDA_BASE)
+        saldo_spot = Decimal(str(safe_get_balance(MONEDA_BASE)))
         logger.debug(f"Saldo {MONEDA_BASE} disponible: {saldo_spot}")
         if saldo_spot < MIN_SALDO_COMPRA:
             logger.info(f"Saldo {MONEDA_BASE} insuficiente: {saldo_spot} < {MIN_SALDO_COMPRA}")
             enviar_telegram(f"⚠️ Saldo insuficiente: {saldo_spot} {MONEDA_BASE}")
             return
-        cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot)
+        cantidad_usdc = min(saldo_spot * Decimal(str(PORCENTAJE_USDC)), saldo_spot)
         criptos = mejores_criptos()
         if not criptos:
             logger.info("No hay criptos candidatas para comprar.")
@@ -443,14 +444,14 @@ def comprar():
             ticker = safe_get_ticker(symbol)
             if not ticker:
                 continue
-            precio = dec(str(ticker["lastPrice"]))
+            precio = dec(ticker["lastPrice"])
             if precio <= 0:
                 continue
             meta = load_symbol_info(symbol)
             if not meta:
                 continue
             min_quote = min_quote_for_market(symbol)
-            quote_to_spend = dec(str(cantidad_usdc)) * (1 - COMMISSION_RATE)
+            quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
             if quote_to_spend < min_quote:
                 logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
                 enviar_telegram(f"⚠️ {symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE})")
@@ -469,7 +470,7 @@ def comprar():
                 )
                 executed_qty = executed_qty_from_order(orden)
                 if executed_qty <= 0:
-                    executed_qty = float(quote_to_spend) / float(precio)
+                    executed_qty = float(quote_to_spend / precio)
                 with LOCK:
                     registro = cargar_json(REGISTRO_FILE)
                     registro[symbol] = {
@@ -502,13 +503,13 @@ def vender_y_convertir():
         dust_positions = []
         for symbol, data in list(registro.items()):
             try:
-                precio_compra = dec(str(data["precio_compra"]))
-                high_since_buy = dec(str(data.get("high_since_buy", data["precio_compra"])))
+                precio_compra = dec(data["precio_compra"])
+                high_since_buy = dec(data.get("high_since_buy", data["precio_compra"]))
                 ticker = safe_get_ticker(symbol)
                 if not ticker:
                     nuevos_registro[symbol] = data
                     continue
-                precio_actual = dec(str(ticker["lastPrice"]))
+                precio_actual = dec(ticker["lastPrice"])
                 cambio = (precio_actual - precio_compra) / (precio_compra if precio_compra != 0 else Decimal('1'))
                 meta = load_symbol_info(symbol)
                 if not meta:
@@ -519,7 +520,7 @@ def vender_y_convertir():
                     guardar_json(registro, REGISTRO_FILE)
                     high_since_buy = precio_actual
                 asset = base_from_symbol(symbol)
-                cantidad_wallet = dec(str(safe_get_balance(asset)))
+                cantidad_wallet = dec(safe_get_balance(asset))
                 if cantidad_wallet <= 0:
                     dust_positions.append(symbol)
                     continue
@@ -529,16 +530,16 @@ def vender_y_convertir():
                     continue
                 if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_actual > 0:
                     notional_est = qty * precio_actual
-                    if notional_est < meta["minNotional"] or float(notional_est) < DUST_THRESHOLD:
+                    if notional_est < meta["minNotional"] or notional_est < DUST_THRESHOLD:
                         dust_positions.append(symbol)
                         continue
-                ganancia_bruta = float(qty) * (float(precio_actual) - float(precio_compra))
-                comision_compra = float(precio_compra) * float(qty) * COMMISSION_RATE
-                comision_venta = float(precio_actual) * float(qty) * COMMISSION_RATE
+                ganancia_bruta = qty * (precio_actual - precio_compra)
+                comision_compra = precio_compra * qty * COMMISSION_RATE
+                comision_venta = precio_actual * qty * COMMISSION_RATE
                 ganancia_neta = ganancia_bruta - comision_compra - comision_venta
                 trailing_trigger = (precio_actual - high_since_buy) / high_since_buy <= -TRAILING_STOP
-                vender_por_stop = float(cambio) <= STOP_LOSS or trailing_trigger
-                vender_por_profit = float(cambio) >= TAKE_PROFIT
+                vender_por_stop = cambio <= STOP_LOSS or trailing_trigger
+                vender_por_profit = cambio >= TAKE_PROFIT
                 if vender_por_stop or vender_por_profit:
                     try:
                         orden = market_sell_with_fallback(symbol, qty, meta)
@@ -547,7 +548,7 @@ def vender_y_convertir():
                         motivo = "Stop-loss/Trailing" if vender_por_stop else "Take-profit"
                         enviar_telegram(
                             f"🔴 Vendido {symbol} - {float(qty):.8f} a ~{float(precio_actual):.6f} "
-                            f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
+                            f"(Cambio: {float(cambio)*100:.2f}%) PnL: {float(ganancia_neta):.2f} {MONEDA_BASE}. "
                             f"Motivo: {motivo}. PnL hoy: {total_hoy:.2f}."
                         )
                         comprar()
@@ -558,7 +559,7 @@ def vender_y_convertir():
                         continue
                 else:
                     nuevos_registro[symbol] = data
-                    logger.debug(f"No se vende {symbol}: Cambio={float(cambio)*100:.2f}%, Ganancia neta={ganancia_neta:.4f}")
+                    logger.debug(f"No se vende {symbol}: Cambio={float(cambio)*100:.2f}%, Ganancia neta={float(ganancia_neta):.4f}")
                 time.sleep(0.2)
             except Exception as e:
                 logger.error(f"Error vendiendo {symbol}: {e}")
@@ -583,10 +584,10 @@ def vender_y_convertir():
                         ticker = safe_get_ticker(sym)
                         if not ticker:
                             continue
-                        price = float(ticker['lastPrice'])
-                        buy_price = data['precio_compra']
-                        change = (price - buy_price) / buy_price if buy_price else 0
-                        qty = data['cantidad']
+                        price = dec(ticker['lastPrice'])
+                        buy_price = dec(data['precio_compra'])
+                        change = (price - buy_price) / buy_price if buy_price != 0 else 0
+                        qty = dec(data['cantidad'])
                         ganancia_bruta = qty * (price - buy_price)
                         comision_compra = buy_price * qty * COMMISSION_RATE
                         comision_venta = price * qty * COMMISSION_RATE
@@ -600,7 +601,7 @@ def vender_y_convertir():
                             try:
                                 meta = load_symbol_info(worst_sym)
                                 asset = base_from_symbol(worst_sym)
-                                cantidad_wallet = dec(str(safe_get_balance(asset)))
+                                cantidad_wallet = dec(safe_get_balance(asset))
                                 qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
                                 if qty < meta["marketMinQty"] or qty <= Decimal('0'):
                                     del registro[worst_sym]
@@ -609,7 +610,7 @@ def vender_y_convertir():
                                 orden = market_sell_with_fallback(worst_sym, qty, meta)
                                 logger.info(f"Rotación: vendido {worst_sym}: {orden}")
                                 total_hoy = actualizar_pnl_diario(worst_net)
-                                enviar_telegram(f"🔄 Rotación agresiva: vendido {worst_sym} (PnL neto {worst_net:.2f}). Para {best_symbol}.")
+                                enviar_telegram(f"🔄 Rotación agresiva: vendido {worst_sym} (PnL neto {float(worst_net):.2f}). Para {best_symbol}.")
                                 del registro[worst_sym]
                                 guardar_json(registro, REGISTRO_FILE)
                                 comprar()
@@ -653,7 +654,7 @@ def resumen_diario():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin filtros, 10s checks, fee-aware, max 5 posiciones.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin filtros, 10s checks, fee-aware, max 5 posiciones, tipo error corregido.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=10, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', seconds=10, id="vender")
