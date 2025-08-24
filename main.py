@@ -17,24 +17,24 @@ from apscheduler.schedulers.background import BackgroundScheduler
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("bot-ia")
 
-# Config — ultra agresivo para 160 USDC
+# Config — balanceado para 160 USDC
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
-MIN_VOLUME = Decimal('50000')  # Bajo para más oportunidades
-MAX_POSICIONES = 8  # Aumentado para más trades
+MIN_VOLUME = Decimal('50000')  # Para oportunidades
+MAX_POSICIONES = 4  # Reducido para proteger saldo
 MIN_SALDO_COMPRA = Decimal('2')  # Para pequeñas compras
-PORCENTAJE_USDC = Decimal('0.125')  # ~20 USDC por trade
+PORCENTAJE_USDC = Decimal('0.2')  # ~32 USDC por trade
 ALLOWED_SYMBOLS = ['DOGEUSDC', 'SHIBUSDC', 'ADAUSDC', 'XRPUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC']
-TAKE_PROFIT = Decimal('0.008')  # 0.8% neto
-STOP_LOSS = Decimal('-0.008')  # -0.8%
+TAKE_PROFIT = Decimal('0.01')  # 1% neto
+STOP_LOSS = Decimal('-0.006')  # -0.6%
 COMMISSION_RATE = Decimal('0.001')
-TRAILING_STOP = Decimal('0.004')  # 0.4%
-TRADE_COOLDOWN_SEC = 10
-MAX_TRADES_PER_HOUR = 60
-PERDIDA_MAXIMA_DIARIA = Decimal('30')
+TRAILING_STOP = Decimal('0.003')  # 0.3%
+TRADE_COOLDOWN_SEC = 30
+MAX_TRADES_PER_HOUR = 20  # Reducido para menos fees
+PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger 160 USDC
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
 REGISTRO_FILE = "registro.json"
@@ -259,6 +259,20 @@ def safe_get_balance(asset):
         enviar_telegram(f"⚠️ Error inesperado en balance {asset}: {e}")
         return Decimal('0')
 
+def calculate_price_change(symbol):
+    try:
+        klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_5MINUTE, limit=2), tries=5)
+        if len(klines) < 2:
+            return Decimal('0')
+        old_price = Decimal(str(klines[0][4]))
+        new_price = Decimal(str(klines[1][4]))
+        change = (new_price - old_price) / old_price if old_price != 0 else Decimal('0')
+        logger.debug(f"{symbol} cambio 5min: {float(change)*100:.2f}%")
+        return change
+    except Exception as e:
+        logger.debug(f"Error calculando cambio de precio para {symbol}: {e}")
+        return Decimal('0')
+
 def mejores_criptos(max_candidates=8):
     try:
         candidates = []
@@ -272,7 +286,12 @@ def mejores_criptos(max_candidates=8):
                 continue
             vol = Decimal(str(t.get("quoteVolume", 0) or 0))
             if vol > MIN_VOLUME:
-                candidates.append(t)
+                change = calculate_price_change(sym)
+                if change > Decimal('0.005'):  # +0.5% en 5min
+                    candidates.append(t)
+                    logger.debug(f"{sym} añadido: volumen={vol}, cambio={float(change)*100:.2f}%")
+                else:
+                    logger.debug(f"{sym} descartado: cambio={float(change)*100:.2f}% < 0.5%")
             else:
                 logger.debug(f"{sym} volumen bajo: {vol} < {MIN_VOLUME}")
             time.sleep(0.05)
@@ -573,12 +592,13 @@ def vender_y_convertir():
                         comision_compra = buy_price * qty * COMMISSION_RATE
                         comision_venta = price * qty * COMMISSION_RATE
                         ganancia_neta = ganancia_bruta - comision_compra - comision_venta
-                        pos_perfs.append((sym, change, ganancia_neta))
+                        time_held = (now_tz() - datetime.fromisoformat(data['timestamp'])).total_seconds() / 60
+                        pos_perfs.append((sym, change, ganancia_neta, time_held))
                         time.sleep(0.2)
                     if pos_perfs:
                         pos_perfs.sort(key=lambda x: x[1])
-                        worst_sym, worst_change, worst_net = pos_perfs[0]
-                        if worst_net < 0 or worst_change < 0 or worst_change < Decimal('0.002'):  # Forzar rotación si bajo rendimiento
+                        worst_sym, worst_change, worst_net, time_held = pos_perfs[0]
+                        if worst_net < 0 or worst_change < Decimal('0.005') or time_held > 5:  # Rotar si pérdida o >5min sin rendimiento
                             try:
                                 meta = load_symbol_info(worst_sym)
                                 asset = base_from_symbol(worst_sym)
@@ -591,7 +611,7 @@ def vender_y_convertir():
                                 orden = market_sell_with_fallback(worst_sym, qty, meta)
                                 logger.info(f"Rotación: vendido {worst_sym}: {orden}")
                                 total_hoy = actualizar_pnl_diario(worst_net)
-                                enviar_telegram(f"🔄 Rotación agresiva: vendido {worst_sym} (PnL neto {float(worst_net):.2f}). Para {best_symbol}.")
+                                enviar_telegram(f"🔄 Rotación: vendido {worst_sym} (PnL neto {float(worst_net):.2f}). Para {best_symbol}.")
                                 del registro[worst_sym]
                                 guardar_json(registro, REGISTRO_FILE)
                                 comprar()
@@ -635,10 +655,10 @@ def resumen_diario():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin filtros, 10s checks, fee-aware, max 8 posiciones, rotación forzada.")
+    enviar_telegram("🤖 Bot IA Balanceado: Mueve ~160 USDC con filtro de momentum (+0.5% 5min), 30s checks, max 4 posiciones, rotación pensada, menos fees.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', seconds=10, id="comprar")
-    scheduler.add_job(vender_y_convertir, 'interval', seconds=10, id="vender")
+    scheduler.add_job(comprar, 'interval', seconds=30, id="comprar")
+    scheduler.add_job(vender_y_convertir, 'interval', seconds=30, id="vender")
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
