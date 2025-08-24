@@ -26,11 +26,11 @@ MIN_VOLUME = Decimal('50000')  # Para oportunidades
 MIN_SALDO_COMPRA = Decimal('1')  # Para saldos bajos
 PORCENTAJE_USDC = Decimal('0.1')  # ~16 USDC por trade
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'SHIBUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']
-TAKE_PROFIT = Decimal('0.03')  # 3% para cubrir fees
+TAKE_PROFIT = Decimal('0.05')  # 5% para mayores ganancias
 STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
-TRAILING_STOP = Decimal('0.01')  # 1% para aguantar subidas
-TRADE_COOLDOWN_SEC = 30  # Para evitar solapamiento
+TRAILING_STOP = Decimal('0.01')  # 1% para proteger subidas
+TRADE_COOLDOWN_SEC = 60  # Para evitar solapamiento
 PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger saldo
 CRITICAL_SALDO = Decimal('5')  # Pausar si saldo < 5 USDC
 TZ_MADRID = pytz.timezone("Europe/Madrid")
@@ -53,7 +53,7 @@ def get_cached_ticker(symbol):
         logger.debug(f"Usando ticker cacheado para {symbol}")
         return TICKERS_CACHE[symbol]['data']
     try:
-        t = retry(lambda: client.get_ticker(symbol=symbol), tries=10, base_delay=0.5)
+        t = retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5)
         if t and float(t.get('lastPrice', 0)) > 0:
             TICKERS_CACHE[symbol] = {'data': t, 'ts': now}
             logger.debug(f"Ticker actualizado para {symbol}: {t['lastPrice']}")
@@ -101,7 +101,7 @@ def enviar_telegram(mensaje: str):
     except Exception as e:
         logger.error(f"Telegram falló: {e}")
 
-def retry(fn, tries=10, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
+def retry(fn, tries=3, base_delay=0.5, jitter=0.3, exceptions=(Exception,)):
     for i in range(tries):
         try:
             return fn()
@@ -113,7 +113,7 @@ def retry(fn, tries=10, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
 
 def debug_balances():
     try:
-        cuenta = retry(lambda: client.get_account(), tries=15, base_delay=1.0)
+        cuenta = retry(lambda: client.get_account(), tries=3, base_delay=0.5)
         logger.info("=== BALANCES EN CARTERA ===")
         total_value = Decimal('0')
         posiciones = cargar_json(REGISTRO_FILE)
@@ -238,7 +238,7 @@ def safe_get_ticker(symbol):
 
 def safe_get_balance(asset):
     try:
-        b = retry(lambda: client.get_asset_balance(asset=asset), tries=15, base_delay=1.0)
+        b = retry(lambda: client.get_asset_balance(asset=asset), tries=3, base_delay=0.5)
         if not b:
             logger.error(f"No se obtuvo balance para {asset}")
             enviar_telegram(f"⚠️ No se obtuvo balance para {asset}")
@@ -257,7 +257,7 @@ def safe_get_balance(asset):
         enviar_telegram(f"⚠️ Error inesperado en balance {asset}: {e}")
         return Decimal('0')
 
-def mejores_criptos(max_candidates=10):
+def mejores_criptos(max_candidates=5):
     try:
         candidates = []
         for sym in ALLOWED_SYMBOLS:
@@ -307,7 +307,7 @@ def base_from_symbol(symbol: str) -> str:
 def precio_medio_si_hay(symbol, lookback_days=30):
     try:
         since = int((now_tz() - timedelta(days=lookback_days)).timestamp() * 1000)
-        trades = retry(lambda: client.get_my_trades(symbol=symbol, startTime=since), tries=5, base_delay=0.6)
+        trades = retry(lambda: client.get_my_trades(symbol=symbol, startTime=since), tries=3, base_delay=0.5)
         buys = [t for t in trades if t.get('isBuyer')]
         if not buys:
             return None
@@ -333,7 +333,7 @@ def inicializar_registro():
     with LOCK:
         registro = cargar_json(REGISTRO_FILE)
         try:
-            cuenta = retry(lambda: client.get_account(), tries=15, base_delay=1.0)
+            cuenta = retry(lambda: client.get_account(), tries=3, base_delay=0.5)
             logger.debug(f"Cuenta obtenida: {len(cuenta['balances'])} activos")
             for b in cuenta['balances']:
                 asset = b['asset']
@@ -376,7 +376,7 @@ def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
     q = quantize_qty(qty, meta["marketStepSize"])
     while attempts < 3 and q > Decimal('0'):
         try:
-            order = retry(lambda: client.order_market_sell(symbol=symbol, quantity=format(q, 'f')), tries=5, base_delay=0.6)
+            order = retry(lambda: client.order_market_sell(symbol=symbol, quantity=format(q, 'f')), tries=3, base_delay=0.5)
             logger.debug(f"Venta exitosa {symbol}: qty={q}")
             return order
         except BinanceAPIException as e:
@@ -410,7 +410,7 @@ def executed_qty_from_order(order_resp) -> float:
 
 def resumen_diario():
     try:
-        cuenta = retry(lambda: client.get_account(), tries=15, base_delay=1.0)
+        cuenta = retry(lambda: client.get_account(), tries=3, base_delay=0.5)
         pnl_data = cargar_json(PNL_DIARIO_FILE)
         today = get_current_date()
         pnl_hoy_v = pnl_data.get(today, 0)
@@ -427,7 +427,7 @@ def resumen_diario():
                         total_value += total * Decimal(ticker['lastPrice'])
                 else:
                     total_value += total
-            time.sleep(0.2)
+            time.sleep(0.1)
         mensaje += f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}"
         enviar_telegram(mensaje)
         logger.info(f"Resumen diario enviado: {mensaje}")
@@ -501,7 +501,7 @@ def comprar():
                         type="MARKET",
                         quoteOrderQty=format(quote_to_spend, 'f')
                     ),
-                    tries=5, base_delay=1.0
+                    tries=3, base_delay=0.5
                 )
                 executed_qty = executed_qty_from_order(orden)
                 if executed_qty <= 0:
@@ -526,7 +526,10 @@ def comprar():
             except Exception as e:
                 logger.error(f"Error inesperado comprando {symbol}: {e}")
                 enviar_telegram(f"⚠️ Error inesperado comprando {symbol}: {e}")
-            time.sleep(0.2)
+            time.sleep(0.1)
+        if compradas == 0:
+            logger.warning("No se realizaron compras en este ciclo.")
+            enviar_telegram("⚠️ No se realizaron compras en este ciclo.")
     except Exception as e:
         logger.error(f"Error general en compra: {e}")
         enviar_telegram(f"⚠️ Error general en compra: {e}")
@@ -536,8 +539,8 @@ def vender_y_convertir():
         registro = cargar_json(REGISTRO_FILE)
         nuevos_registro = {}
         dust_positions = []
-        for symbol, data in list(registro.items()):
-            try:
+        try:
+            for symbol, data in list(registro.items()):
                 precio_compra = dec(data["precio_compra"])
                 high_since_buy = dec(data.get("high_since_buy", data["precio_compra"]))
                 ticker = safe_get_ticker(symbol)
@@ -600,15 +603,15 @@ def vender_y_convertir():
                 else:
                     nuevos_registro[symbol] = data
                     logger.debug(f"No se vende {symbol}: Cambio={float(cambio)*100:.2f}%, Ganancia neta={float(ganancia_neta):.4f}")
-                time.sleep(0.2)
-            except Exception as e:
-                logger.error(f"Error vendiendo {symbol}: {e}")
-                enviar_telegram(f"⚠️ Error vendiendo {symbol}: {e}")
-                nuevos_registro[symbol] = data
-        limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
-        guardar_json(limpio, REGISTRO_FILE)
-        if dust_positions:
-            enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
+                time.sleep(0.1)
+            limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
+            guardar_json(limpio, REGISTRO_FILE)
+            if dust_positions:
+                enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
+        except Exception as e:
+            logger.error(f"Error en bloque de venta: {e}")
+            enviar_telegram(f"⚠️ Error en bloque de venta: {e}")
+            guardar_json(nuevos_registro, REGISTRO_FILE)
         try:
             registro = cargar_json(REGISTRO_FILE)
             if not registro:
@@ -634,11 +637,11 @@ def vender_y_convertir():
                         ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
                         time_held = (now_tz() - datetime.fromisoformat(data['timestamp'])).total_seconds() / 60
                         pos_perfs.append((sym, change, ganancia_neta, time_held))
-                        time.sleep(0.2)
+                        time.sleep(0.1)
                     if pos_perfs:
                         pos_perfs.sort(key=lambda x: x[1])
                         worst_sym, worst_change, worst_net, time_held = pos_perfs[0]
-                        if worst_net < 0 or time_held > 30:  # Rotar si pérdida o >30min
+                        if worst_net < 0 or time_held > 60:  # Rotar si pérdida o >60min
                             try:
                                 meta = load_symbol_info(worst_sym)
                                 asset = base_from_symbol(worst_sym)
@@ -665,7 +668,7 @@ def vender_y_convertir():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=3%, 30s checks, rotación tras 30min, minNotional corregido.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=5%, 60s checks, rotación tras 60min.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
     scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
