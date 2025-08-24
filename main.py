@@ -450,7 +450,7 @@ def resumen_diario():
         enviar_telegram(f"⚠️ Error en resumen diario: {e}")
 
 def comprar():
-    global last_no_buy_notification, no_buy_cycles
+    global last_no_buy_notification, no_buy_cycles, TRADE_COOLDOWN_SEC  # Declarar global al inicio
     if not puede_comprar():
         logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
         enviar_telegram("⚠️ Límite de pérdida diaria alcanzado.")
@@ -596,7 +596,6 @@ def comprar():
             logger.warning(f"Alerta: Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}, posiciones abiertas: {len(cargar_json(REGISTRO_FILE))}")
             enviar_telegram(f"⚠️ Alerta: Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}, posiciones abiertas: {len(cargar_json(REGISTRO_FILE))}")
         # Ajuste dinámico del cooldown si hay saldo ocioso
-        global TRADE_COOLDOWN_SEC
         if saldo_spot > 20 and TRADE_COOLDOWN_SEC > 15:
             TRADE_COOLDOWN_SEC = 15
             logger.info(f"Reduciendo TRADE_COOLDOWN_SEC a 15s por saldo ocioso alto: {saldo_spot}")
