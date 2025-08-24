@@ -23,18 +23,18 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
-MIN_VOLUME = 50_000  # Bajo para más oportunidades
+MIN_VOLUME = Decimal('50000')  # Bajo para más oportunidades
 MAX_POSICIONES = 5  # Hasta 5 criptos
-MIN_SALDO_COMPRA = 2  # Para pequeñas compras
-PORCENTAJE_USDC = 0.25  # ~40 USDC por trade
+MIN_SALDO_COMPRA = Decimal('2')  # Para pequeñas compras
+PORCENTAJE_USDC = Decimal('0.25')  # ~40 USDC por trade
 ALLOWED_SYMBOLS = ['DOGEUSDC', 'SHIBUSDC', 'ADAUSDC', 'XRPUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC']
-TAKE_PROFIT = 0.012  # 1.2% neto
-STOP_LOSS = -0.01  # -1%
+TAKE_PROFIT = Decimal('0.012')  # 1.2% neto
+STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
 TRAILING_STOP = Decimal('0.005')
 TRADE_COOLDOWN_SEC = 10
 MAX_TRADES_PER_HOUR = 60
-PERDIDA_MAXIMA_DIARIA = 30
+PERDIDA_MAXIMA_DIARIA = Decimal('30')
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
 REGISTRO_FILE = "registro.json"
@@ -117,26 +117,26 @@ def debug_balances():
     try:
         cuenta = retry(lambda: client.get_account(), tries=15, base_delay=1.0)
         logger.info("=== BALANCES EN CARTERA ===")
-        total_value = 0
+        total_value = Decimal('0')
         for b in cuenta['balances']:
-            total = float(b['free']) + float(b['locked'])
-            if total > 0.0001:
+            total = Decimal(str(float(b['free']) + float(b['locked'])))
+            if total > Decimal('0.0001'):
                 logger.info(f"{b['asset']}: free={b['free']}, locked={b['locked']}, total={total}")
                 if b['asset'] == MONEDA_BASE:
                     total_value += total
                 elif b['asset'] + MONEDA_BASE in ALLOWED_SYMBOLS:
                     ticker = safe_get_ticker(b['asset'] + MONEDA_BASE)
                     if ticker:
-                        total_value += total * float(ticker['lastPrice'])
+                        total_value += total * Decimal(ticker['lastPrice'])
         logger.info(f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}")
         enviar_telegram(f"🤖 Inicio bot - Valor total cartera: {total_value:.2f} {MONEDA_BASE}")
         return total_value
     except Exception as e:
         logger.error(f"Error debug balances: {e}")
         enviar_telegram(f"⚠️ Error en balances: {e}")
-        return 0
+        return Decimal('0')
 
-def actualizar_pnl_diario(realized_pnl, fees=0.1):
+def actualizar_pnl_diario(realized_pnl, fees=Decimal('0.1')):
     with LOCK:
         pnl_data = cargar_json(PNL_DIARIO_FILE)
         today = get_current_date()
@@ -149,7 +149,7 @@ def actualizar_pnl_diario(realized_pnl, fees=0.1):
 
 def pnl_hoy():
     pnl_data = cargar_json(PNL_DIARIO_FILE)
-    return pnl_data.get(get_current_date(), 0)
+    return Decimal(str(pnl_data.get(get_current_date(), 0)))
 
 def puede_comprar():
     hoy_pnl = pnl_hoy()
@@ -239,36 +239,40 @@ def safe_get_balance(asset):
         if not b:
             logger.error(f"No se obtuvo balance para {asset}")
             enviar_telegram(f"⚠️ No se obtuvo balance para {asset}")
-            return 0.0
-        free = float(b.get('free', 0))
-        locked = float(b.get('locked', 0))
+            return Decimal('0')
+        free = Decimal(str(b.get('free', 0)))
+        locked = Decimal(str(b.get('locked', 0)))
         total = free + locked
         logger.debug(f"Balance {asset}: free={free}, locked={locked}, total={total}")
         return free
     except BinanceAPIException as e:
         logger.error(f"Error BinanceAPI obteniendo balance {asset}: {e}")
         enviar_telegram(f"⚠️ Error en balance {asset}: {e}")
-        return 0.0
+        return Decimal('0')
     except Exception as e:
         logger.error(f"Error inesperado obteniendo balance {asset}: {e}")
         enviar_telegram(f"⚠️ Error inesperado en balance {asset}: {e}")
-        return 0.0
+        return Decimal('0')
 
 def mejores_criptos(max_candidates=8):
     try:
         candidates = []
         for sym in ALLOWED_SYMBOLS:
             if sym in INVALID_SYMBOL_CACHE:
+                logger.debug(f"Símbolo {sym} en cache inválida, saltando")
                 continue
             t = get_cached_ticker(sym)
             if not t:
+                logger.debug(f"No se obtuvo ticker para {sym}")
                 continue
-            vol = float(t.get("quoteVolume", 0) or 0)
+            vol = Decimal(str(t.get("quoteVolume", 0) or 0))
             if vol > MIN_VOLUME:
                 candidates.append(t)
+            else:
+                logger.debug(f"{sym} volumen bajo: {vol} < {MIN_VOLUME}")
             time.sleep(0.05)
         filtered = []
-        for t in sorted(candidates, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:max_candidates]:
+        for t in sorted(candidates, key=lambda x: Decimal(str(x.get("quoteVolume", 0) or 0)), reverse=True)[:max_candidates]:
             symbol = t["symbol"]
             precio = dec(t["lastPrice"])
             ganancia_bruta = precio * TAKE_PROFIT
@@ -276,8 +280,11 @@ def mejores_criptos(max_candidates=8):
             comision_venta = (precio * (Decimal('1') + TAKE_PROFIT)) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
             if ganancia_neta > 0:
-                t['score'] = float(t.get("quoteVolume", 0))
+                t['score'] = Decimal(str(t.get("quoteVolume", 0)))
                 filtered.append(t)
+                logger.debug(f"{symbol} añadido a candidatos: ganancia_neta={ganancia_neta}, score={t['score']}")
+            else:
+                logger.debug(f"{symbol} descartado: ganancia_neta={ganancia_neta}")
             time.sleep(0.05)
         sorted_filtered = sorted(filtered, key=lambda x: x.get('score', 0), reverse=True)
         logger.debug(f"Mejores criptos: {[t['symbol'] for t in sorted_filtered]}")
@@ -326,10 +333,10 @@ def inicializar_registro():
             logger.debug(f"Cuenta obtenida: {len(cuenta['balances'])} activos")
             for b in cuenta['balances']:
                 asset = b['asset']
-                free = float(b['free'])
-                if free > 0.0000001:
+                free = Decimal(str(b['free']))
+                if free > Decimal('0.0000001'):
                     logger.debug(f"Detectado {asset}: {free} free")
-                if asset != MONEDA_BASE and free > 0.0000001:
+                if asset != MONEDA_BASE and free > Decimal('0.0000001'):
                     symbol = asset + MONEDA_BASE
                     if symbol not in ALLOWED_SYMBOLS:
                         continue
@@ -341,8 +348,8 @@ def inicializar_registro():
                         t = safe_get_ticker(symbol)
                         if not t:
                             continue
-                        precio_actual = float(t['lastPrice'])
-                        pm = precio_medio_si_hay(symbol) or precio_actual
+                        precio_actual = Decimal(t['lastPrice'])
+                        pm = precio_medio_si_hay(symbol) or float(precio_actual)
                         registro[symbol] = {
                             "cantidad": float(free),
                             "precio_compra": float(pm),
@@ -407,13 +414,13 @@ def comprar():
         enviar_telegram("⚠️ Límite de pérdida diaria alcanzado.")
         return
     try:
-        saldo_spot = Decimal(str(safe_get_balance(MONEDA_BASE)))
+        saldo_spot = safe_get_balance(MONEDA_BASE)
         logger.debug(f"Saldo {MONEDA_BASE} disponible: {saldo_spot}")
         if saldo_spot < MIN_SALDO_COMPRA:
             logger.info(f"Saldo {MONEDA_BASE} insuficiente: {saldo_spot} < {MIN_SALDO_COMPRA}")
             enviar_telegram(f"⚠️ Saldo insuficiente: {saldo_spot} {MONEDA_BASE}")
             return
-        cantidad_usdc = min(saldo_spot * Decimal(str(PORCENTAJE_USDC)), saldo_spot)
+        cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot)
         criptos = mejores_criptos()
         if not criptos:
             logger.info("No hay criptos candidatas para comprar.")
@@ -437,18 +444,23 @@ def comprar():
                 break
             symbol = cripto["symbol"]
             if symbol in registro:
+                logger.debug(f"{symbol} ya en cartera, saltando")
                 continue
             last = ULTIMA_COMPRA.get(symbol, 0)
             if now_ts - last < TRADE_COOLDOWN_SEC:
+                logger.debug(f"{symbol} en cooldown, saltando")
                 continue
             ticker = safe_get_ticker(symbol)
             if not ticker:
+                logger.debug(f"No ticker para {symbol}")
                 continue
             precio = dec(ticker["lastPrice"])
             if precio <= 0:
+                logger.debug(f"{symbol} precio inválido: {precio}")
                 continue
             meta = load_symbol_info(symbol)
             if not meta:
+                logger.debug(f"No meta para {symbol}")
                 continue
             min_quote = min_quote_for_market(symbol)
             quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
@@ -508,12 +520,14 @@ def vender_y_convertir():
                 ticker = safe_get_ticker(symbol)
                 if not ticker:
                     nuevos_registro[symbol] = data
+                    logger.debug(f"No ticker para {symbol}, manteniendo")
                     continue
                 precio_actual = dec(ticker["lastPrice"])
                 cambio = (precio_actual - precio_compra) / (precio_compra if precio_compra != 0 else Decimal('1'))
                 meta = load_symbol_info(symbol)
                 if not meta:
                     nuevos_registro[symbol] = data
+                    logger.debug(f"No meta para {symbol}, manteniendo")
                     continue
                 if precio_actual > high_since_buy:
                     data["high_since_buy"] = float(precio_actual)
@@ -523,15 +537,18 @@ def vender_y_convertir():
                 cantidad_wallet = dec(safe_get_balance(asset))
                 if cantidad_wallet <= 0:
                     dust_positions.append(symbol)
+                    logger.debug(f"{symbol} sin cantidad, marcando como dust")
                     continue
                 qty = quantize_qty(cantidad_wallet, meta["marketStepSize"])
                 if qty < meta["marketMinQty"] or qty <= Decimal('0'):
                     dust_positions.append(symbol)
+                    logger.debug(f"{symbol} cantidad insuficiente: {qty}")
                     continue
                 if meta["applyToMarket"] and meta["minNotional"] > 0 and precio_actual > 0:
                     notional_est = qty * precio_actual
                     if notional_est < meta["minNotional"] or notional_est < DUST_THRESHOLD:
                         dust_positions.append(symbol)
+                        logger.debug(f"{symbol} no alcanza minNotional o dust: {notional_est}")
                         continue
                 ganancia_bruta = qty * (precio_actual - precio_compra)
                 comision_compra = precio_compra * qty * COMMISSION_RATE
@@ -628,16 +645,16 @@ def resumen_diario():
         today = get_current_date()
         pnl_hoy_v = pnl_data.get(today, 0)
         mensaje = f"📊 Resumen diario ({today}):\nPNL hoy: {pnl_hoy_v:.2f} {MONEDA_BASE}\nBalances:\n"
-        total_value = 0
+        total_value = Decimal('0')
         for b in cuenta["balances"]:
-            total = float(b["free"]) + float(b["locked"])
-            if total > 0.001:
+            total = Decimal(str(float(b["free"]) + float(b["locked"])))
+            if total > Decimal('0.001'):
                 mensaje += f"{b['asset']}: {total:.6f}\n"
                 if b['asset'] != MONEDA_BASE:
                     symbol = b['asset'] + MONEDA_BASE
                     ticker = safe_get_ticker(symbol)
                     if ticker:
-                        total_value += total * float(ticker['lastPrice'])
+                        total_value += total * Decimal(ticker['lastPrice'])
                 else:
                     total_value += total
             time.sleep(0.2)
