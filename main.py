@@ -24,13 +24,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
 MIN_VOLUME = Decimal('10000')  # Mínimo volumen
 MIN_SALDO_COMPRA = Decimal('0.5')  # Para saldos bajos
-PORCENTAJE_USDC = Decimal('0.8')  # ~80% del saldo por trade (margen de seguridad)
+PORCENTAJE_USDC = Decimal('0.05')  # ~8 USDC por trade
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'SHIBUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']
 TAKE_PROFIT = Decimal('0.05')  # 5% para mayores ganancias
 STOP_LOSS = Decimal('-0.01')  # -1%
-COMMISSION_RATE = Decimal('0.001')  # Estimación de comisión
+COMMISSION_RATE = Decimal('0.001')
 TRAILING_STOP = Decimal('0.01')  # 1% para proteger subidas
-TRADE_COOLDOWN_SEC = 30  # Para más trades, ajustable dinámicamente
+TRADE_COOLDOWN_SEC = 30  # Para más trades
 PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger saldo
 CRITICAL_SALDO = Decimal('3')  # Pausar si saldo < 3 USDC
 NOTIFICATION_COOLDOWN_MIN = 5  # Notificación cada 5 minutos
@@ -466,12 +466,7 @@ def comprar():
             logger.info(f"Saldo crítico: {saldo_spot} < {CRITICAL_SALDO}. Pausando compras.")
             enviar_telegram(f"⚠️ Saldo crítico: {saldo_spot} {MONEDA_BASE}. Pausando compras.")
             return
-        # Verificar saldo disponible con margen
-        cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot * (Decimal('1') - COMMISSION_RATE * 2))
-        if cantidad_usdc < MIN_SALDO_COMPRA:
-            logger.warning(f"Saldo disponible demasiado bajo para compra: {cantidad_usdc} {MONEDA_BASE}")
-            enviar_telegram(f"⚠️ Saldo disponible demasiado bajo: {cantidad_usdc} {MONEDA_BASE}")
-            return
+        cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot)
         criptos = mejores_criptos()
         if not criptos:
             no_buy_cycles += 1
@@ -510,8 +505,8 @@ def comprar():
                 logger.debug(f"No meta para {symbol}")
                 continue
             quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
-            if quote_to_spend > saldo_spot * 0.9:  # Margen de seguridad del 10%
-                no_compradas_razon.append(f"{symbol}: saldo insuficiente ({quote_to_spend} > {saldo_spot * 0.9})")
+            if quote_to_spend > saldo_spot:
+                no_compradas_razon.append(f"{symbol}: saldo insuficiente ({quote_to_spend} > {saldo_spot})")
                 logger.info(f"{symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
                 enviar_telegram(f"⚠️ {symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
                 continue
@@ -545,13 +540,9 @@ def comprar():
                 ULTIMA_COMPRA[symbol] = now_ts
                 ULTIMAS_OPERACIONES.append(now_ts)
             except BinanceAPIException as e:
-                if e.code == -2010:
-                    logger.error(f"Error comprando {symbol}: {e} - Saldo disponible: {saldo_spot}, Monto intentado: {quote_to_spend}")
-                    enviar_telegram(f"⚠️ Error comprando {symbol}: {e} - Saldo: {saldo_spot}, Monto: {quote_to_spend}")
-                else:
-                    no_compradas_razon.append(f"{symbol}: error API ({e})")
-                    logger.error(f"Error comprando {symbol}: {e}")
-                    enviar_telegram(f"⚠️ Error comprando {symbol}: {e}")
+                no_compradas_razon.append(f"{symbol}: error API ({e})")
+                logger.error(f"Error comprando {symbol}: {e}")
+                enviar_telegram(f"⚠️ Error comprando {symbol}: {e}")
             except Exception as e:
                 no_compradas_razon.append(f"{symbol}: error inesperado ({e})")
                 logger.error(f"Error inesperado comprando {symbol}: {e}")
@@ -562,52 +553,6 @@ def comprar():
             logger.warning(f"No se realizaron compras en este ciclo. {razon_msg}")
             enviar_telegram(f"⚠️ No se realizaron compras en este ciclo. {razon_msg}")
             last_no_buy_notification = time.time()
-        elif saldo_spot > MIN_SALDO_COMPRA * 10 and compradas == 0:
-            logger.warning(f"Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}. Forzando reinversión.")
-            enviar_telegram(f"⚠️ Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}. Forzando reinversión.")
-            # Reinvertir saldo ocioso
-            cantidad_usdc = saldo_spot - MIN_SALDO_COMPRA
-            if cantidad_usdc > MIN_SALDO_COMPRA:
-                symbol = random.choice(ALLOWED_SYMBOLS)
-                ticker = safe_get_ticker(symbol)
-                if ticker and load_symbol_info(symbol):
-                    precio = dec(ticker["lastPrice"])
-                    quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
-                    quote_to_spend = quantize_quote(quote_to_spend, load_symbol_info(symbol)["tickSize"])
-                    try:
-                        orden = retry(
-                            lambda: client.create_order(
-                                symbol=symbol,
-                                side="BUY",
-                                type="MARKET",
-                                quoteOrderQty=format(quote_to_spend, 'f')
-                            ),
-                            tries=3, base_delay=0.5
-                        )
-                        executed_qty = executed_qty_from_order(orden)
-                        if executed_qty <= 0:
-                            executed_qty = float(quote_to_spend / precio)
-                        with LOCK:
-                            registro = cargar_json(REGISTRO_FILE)
-                            registro[symbol] = {
-                                "cantidad": executed_qty,
-                                "precio_compra": float(precio),
-                                "timestamp": now_tz().isoformat(),
-                                "high_since_buy": float(precio)
-                            }
-                            guardar_json(registro, REGISTRO_FILE)
-                        enviar_telegram(f"🟢 Reinversión forzada: Comprado {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE} a ~{float(precio):.6f}.")
-                        logger.info(f"Reinversión forzada: {symbol}, qty={executed_qty}, precio={precio}")
-                    except Exception as e:
-                        logger.error(f"Error en reinversión forzada {symbol}: {e}")
-                        enviar_telegram(f"⚠️ Error en reinversión forzada {symbol}: {e}")
-        if saldo_spot > 10:  # Alerta si hay mucho USDC ocioso
-            logger.warning(f"Alerta: Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}, posiciones abiertas: {len(cargar_json(REGISTRO_FILE))}")
-            enviar_telegram(f"⚠️ Alerta: Saldo ocioso alto: {saldo_spot} {MONEDA_BASE}, posiciones abiertas: {len(cargar_json(REGISTRO_FILE))}")
-        # Ajuste dinámico del cooldown si hay saldo ocioso
-        if saldo_spot > 20 and TRADE_COOLDOWN_SEC > 15:
-            TRADE_COOLDOWN_SEC = 15
-            logger.info(f"Reduciendo TRADE_COOLDOWN_SEC a 15s por saldo ocioso alto: {saldo_spot}")
     except Exception as e:
         logger.error(f"Error general en compra: {e}")
         enviar_telegram(f"⚠️ Error general en compra: {e}")
@@ -659,17 +604,16 @@ def vender_y_convertir():
                 comision_venta = precio_actual * qty * COMMISSION_RATE
                 ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
                 time_held = (now_tz() - datetime.fromisoformat(data['timestamp'])).total_seconds() / 60
-                saldo_spot = safe_get_balance(MONEDA_BASE)
                 trailing_trigger = (precio_actual - high_since_buy) / high_since_buy <= -TRAILING_STOP
                 vender_por_stop = cambio <= STOP_LOSS or trailing_trigger
                 vender_por_profit = cambio >= TAKE_PROFIT
-                vender_por_liberacion = (cambio <= Decimal('-0.001') and time_held > 3) or (cambio <= Decimal('-0.005') and time_held > 10)  # Liberar si pérdida >= -0.1% tras 3min o -0.5% tras 10min
-                if vender_por_stop or vender_por_profit or vender_por_liberacion or (saldo_spot < 5 and time_held > 3):
+                vender_por_liberacion = cambio <= Decimal('-0.005') and time_held > 10  # Liberar si pérdida <= -0.5% tras 10min
+                if vender_por_stop or vender_por_profit or vender_por_liberacion:
                     try:
                         orden = market_sell_with_fallback(symbol, qty, meta)
                         logger.info(f"Orden de venta: {orden}")
                         total_hoy = actualizar_pnl_diario(ganancia_neta)
-                        motivo = "Stop-loss/Trailing" if vender_por_stop else ("Take-profit" if vender_por_profit else ("Liberación fondos" if vender_por_liberacion else "Falta de saldo"))
+                        motivo = "Stop-loss/Trailing" if vender_por_stop else ("Take-profit" if vender_por_profit else "Liberación fondos")
                         enviar_telegram(
                             f"🔴 Vendido {symbol} - {float(qty):.8f} a ~{float(precio_actual):.6f} "
                             f"(Cambio: {float(cambio)*100:.2f}%) PnL: {float(ganancia_neta):.2f} {MONEDA_BASE}. "
