@@ -23,7 +23,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
 MIN_VOLUME = Decimal('50000')  # Para oportunidades
-MAX_POSICIONES = 4  # Balanceado para diversificar
 MIN_SALDO_COMPRA = Decimal('2')  # Para pequeñas compras
 PORCENTAJE_USDC = Decimal('0.25')  # ~40 USDC por trade
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'SHIBUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']
@@ -460,18 +459,11 @@ def comprar():
             enviar_telegram("⚠️ No hay criptos candidatas.")
             return
         registro = cargar_json(REGISTRO_FILE)
-        if len(registro) >= MAX_POSICIONES:
-            mensaje = f"⚠️ Máximo de posiciones abiertas alcanzado ({len(registro)}/{MAX_POSICIONES}). Posiciones: {list(registro.keys())}"
-            logger.info(mensaje)
-            enviar_telegram(mensaje)
-            return
         now_ts = time.time()
         global ULTIMAS_OPERACIONES
         ULTIMAS_OPERACIONES = [t for t in ULTIMAS_OPERACIONES if now_ts - t < 3600]
         compradas = 0
         for cripto in criptos:
-            if compradas >= MAX_POSICIONES - len(registro):
-                break
             symbol = cripto["symbol"]
             if symbol in registro:
                 logger.debug(f"{symbol} ya en cartera, saltando")
@@ -672,7 +664,7 @@ def vender_y_convertir():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades, TAKE_PROFIT=3%, 10s checks, max 4 posiciones, rotación tras 30min.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades ni posiciones, TAKE_PROFIT=3%, 10s checks, rotación tras 30min.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=10, id="comprar")
     scheduler.add_job(vender_y_convertir, 'interval', seconds=10, id="vender")
