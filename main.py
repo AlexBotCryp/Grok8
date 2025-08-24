@@ -9,36 +9,32 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from datetime import datetime, timedelta
 import requests
 import pytz
-import numpy as np
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# Logging — DEBUG for tracking
+# Logging — DEBUG para rastrear todo
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("bot-ia")
 
-# Config — for 160 USDC, momentum scalping
+# Config — ultra agresivo para 160 USDC
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
-MIN_VOLUME = 100_000
-MAX_POSICIONES = 5
-MIN_SALDO_COMPRA = 5
-PORCENTAJE_USDC = 0.2
+MIN_VOLUME = 50_000  # Muy bajo para más oportunidades
+MAX_POSICIONES = 5  # Hasta 5 criptos
+MIN_SALDO_COMPRA = 5  # Para pequeñas compras
+PORCENTAJE_USDC = 0.2  # ~30 USDC por trade
 ALLOWED_SYMBOLS = ['DOGEUSDC', 'SHIBUSDC', 'ADAUSDC', 'XRPUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC']
-TAKE_PROFIT = 0.012
-STOP_LOSS = -0.01
+TAKE_PROFIT = 0.012  # 1.2% neto
+STOP_LOSS = -0.01  # -1%
 COMMISSION_RATE = 0.001
-RSI_BUY_MAX = 45
-RSI_SELL_MIN = 55
-MIN_NET_GAIN_ABS = 0.2
-TRAILING_STOP = 0.005
-TRADE_COOLDOWN_SEC = 15
-MAX_TRADES_PER_HOUR = 40
-PERDIDA_MAXIMA_DIARIA = 30
+TRAILING_STOP = 0.005  # 0.5%
+TRADE_COOLDOWN_SEC = 10  # Cada 10s
+MAX_TRADES_PER_HOUR = 60  # Muy agresivo
+PERDIDA_MAXIMA_DIARIA = 30  # Proteger saldo
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
 REGISTRO_FILE = "registro.json"
@@ -50,7 +46,7 @@ SYMBOL_CACHE = {}
 INVALID_SYMBOL_CACHE = set()
 ULTIMA_COMPRA = {}
 ULTIMAS_OPERACIONES = []
-DUST_THRESHOLD = 0.5
+DUST_THRESHOLD = 0.1
 TICKERS_CACHE = {}
 
 def get_cached_ticker(symbol):
@@ -59,7 +55,7 @@ def get_cached_ticker(symbol):
         logger.debug(f"Usando ticker cacheado para {symbol}")
         return TICKERS_CACHE[symbol]['data']
     try:
-        t = retry(lambda: client.get_ticker(symbol=symbol), tries=5, base_delay=0.5)
+        t = retry(lambda: client.get_ticker(symbol=symbol), tries=10, base_delay=0.5)
         if t and float(t.get('lastPrice', 0)) > 0:
             TICKERS_CACHE[symbol] = {'data': t, 'ts': now}
             logger.debug(f"Ticker actualizado para {symbol}: {t['lastPrice']}")
@@ -107,7 +103,7 @@ def enviar_telegram(mensaje: str):
     except Exception as e:
         logger.error(f"Telegram falló: {e}")
 
-def retry(fn, tries=5, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
+def retry(fn, tries=10, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
     for i in range(tries):
         try:
             return fn()
@@ -119,7 +115,7 @@ def retry(fn, tries=5, base_delay=0.7, jitter=0.3, exceptions=(Exception,)):
 
 def debug_balances():
     try:
-        cuenta = retry(lambda: client.get_account(), tries=10, base_delay=1.0)
+        cuenta = retry(lambda: client.get_account(), tries=15, base_delay=1.0)
         logger.info("=== BALANCES EN CARTERA ===")
         total_value = 0
         for b in cuenta['balances']:
@@ -137,6 +133,7 @@ def debug_balances():
         return total_value
     except Exception as e:
         logger.error(f"Error debug balances: {e}")
+        enviar_telegram(f"⚠️ Error en balances: {e}")
         return 0
 
 def actualizar_pnl_diario(realized_pnl, fees=0.1):
@@ -156,7 +153,7 @@ def pnl_hoy():
 
 def puede_comprar():
     hoy_pnl = pnl_hoy()
-    can_buy = hoy_pnl > -PERDIDA_MAXIMA_DIARIA if hoy_pnl < 0 else hoy_pnl > -(PERDIDA_MAXIMA_DIARIA * 1.5)
+    can_buy = hoy_pnl > -PERDIDA_MAXIMA_DIARIA
     logger.debug(f"Puede comprar? {can_buy}, PnL hoy: {hoy_pnl}, Límite: {PERDIDA_MAXIMA_DIARIA}")
     return can_buy
 
@@ -196,7 +193,7 @@ def load_symbol_info(symbol):
             "marketStepSize": dec(market_lot.get('stepSize', '0')) if market_lot else dec(lot.get('stepSize','0')),
             "marketMinQty": dec(market_lot.get('minQty', '0')) if market_lot else dec(lot.get('minQty','0')),
             "tickSize": dec(pricef.get('tickSize', '0')),
-            "minNotional": dec(notional_f.get('minNotional', '0')) if notional_f else dec('5'),
+            "minNotional": dec(notional_f.get('minNotional', '0')) if notional_f else dec('1'),
             "applyToMarket": bool(notional_f.get('applyToMarket', True)) if notional_f else True,
             "baseAsset": info['baseAsset'],
             "quoteAsset": info['quoteAsset'],
@@ -227,7 +224,7 @@ def quantize_quote(quote: Decimal, tick: Decimal) -> Decimal:
 def min_quote_for_market(symbol) -> Decimal:
     meta = load_symbol_info(symbol)
     if not meta:
-        return Decimal('5')
+        return Decimal('1')
     return (meta["minNotional"] * Decimal('1.01')).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
 
 def safe_get_ticker(symbol):
@@ -238,7 +235,7 @@ def safe_get_ticker(symbol):
 
 def safe_get_balance(asset):
     try:
-        b = retry(lambda: client.get_asset_balance(asset=asset), tries=10, base_delay=1.0)
+        b = retry(lambda: client.get_asset_balance(asset=asset), tries=15, base_delay=1.0)
         if not b:
             logger.error(f"No se obtuvo balance para {asset}")
             return 0.0
@@ -249,30 +246,12 @@ def safe_get_balance(asset):
         return free
     except BinanceAPIException as e:
         logger.error(f"Error BinanceAPI obteniendo balance {asset}: {e}")
+        enviar_telegram(f"⚠️ Error en balance {asset}: {e}")
         return 0.0
     except Exception as e:
         logger.error(f"Error inesperado obteniendo balance {asset}: {e}")
+        enviar_telegram(f"⚠️ Error inesperado en balance {asset}: {e}")
         return 0.0
-
-def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50.0
-    deltas = np.diff(closes)
-    seed = deltas[:period]
-    up = seed[seed > 0].sum() / period
-    down = -seed[seed < 0].sum() / period
-    rs = up / down if down != 0 else np.inf
-    rsi = 100 - (100 / (1 + rs))
-    upvals = up
-    downvals = down
-    for d in deltas[period:]:
-        upval = max(d, 0)
-        downval = -min(d, 0)
-        upvals = (upvals * (period - 1) + upval) / period
-        downvals = (downvals * (period - 1) + downval) / period
-        rs = upvals / downvals if downvals != 0 else np.inf
-        rsi = 100 - (100 / (1 + rs))
-    return float(rsi)
 
 def mejores_criptos(max_candidates=8):
     try:
@@ -286,30 +265,25 @@ def mejores_criptos(max_candidates=8):
             vol = float(t.get("quoteVolume", 0) or 0)
             if vol > MIN_VOLUME:
                 candidates.append(t)
-            time.sleep(0.1)
+            time.sleep(0.05)
         filtered = []
         for t in sorted(candidates, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)[:max_candidates]:
             symbol = t["symbol"]
-            klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_5MINUTE, limit=100), tries=5)
-            closes = [float(k[4]) for k in klines]
-            if len(closes) < 15:
-                continue
-            rsi = calculate_rsi(closes[-15:])
             precio = float(t["lastPrice"])
             ganancia_bruta = precio * TAKE_PROFIT
             comision_compra = precio * COMMISSION_RATE
             comision_venta = (precio * (1 + TAKE_PROFIT)) * COMMISSION_RATE
             ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
-            if ganancia_neta > MIN_NET_GAIN_ABS and rsi < RSI_BUY_MAX:
-                t['rsi'] = rsi
+            if ganancia_neta > 0:
                 t['score'] = float(t.get("quoteVolume", 0))
                 filtered.append(t)
-            time.sleep(0.1)
+            time.sleep(0.05)
         sorted_filtered = sorted(filtered, key=lambda x: x.get('score', 0), reverse=True)
         logger.debug(f"Mejores criptos: {[t['symbol'] for t in sorted_filtered]}")
         return sorted_filtered
     except Exception as e:
         logger.error(f"Error obteniendo mejores criptos: {e}")
+        enviar_telegram(f"⚠️ Error obteniendo criptos: {e}")
         return []
 
 def base_from_symbol(symbol: str) -> str:
@@ -347,7 +321,7 @@ def inicializar_registro():
     with LOCK:
         registro = cargar_json(REGISTRO_FILE)
         try:
-            cuenta = retry(lambda: client.get_account(), tries=10, base_delay=1.0)
+            cuenta = retry(lambda: client.get_account(), tries=15, base_delay=1.0)
             logger.debug(f"Cuenta obtenida: {len(cuenta['balances'])} activos")
             for b in cuenta['balances']:
                 asset = b['asset']
@@ -383,6 +357,7 @@ def inicializar_registro():
             guardar_json(registro, REGISTRO_FILE)
         except BinanceAPIException as e:
             logger.error(f"Error inicializando registro: {e}")
+            enviar_telegram(f"⚠️ Error inicializando registro: {e}")
 
 def market_sell_with_fallback(symbol: str, qty: Decimal, meta: dict):
     attempts = 0
@@ -428,27 +403,32 @@ def executed_qty_from_order(order_resp) -> float:
 def comprar():
     if not puede_comprar():
         logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
+        enviar_telegram("⚠️ Límite de pérdida diaria alcanzado.")
         return
     try:
         saldo_spot = safe_get_balance(MONEDA_BASE)
         logger.debug(f"Saldo {MONEDA_BASE} disponible: {saldo_spot}")
         if saldo_spot < MIN_SALDO_COMPRA:
             logger.info(f"Saldo {MONEDA_BASE} insuficiente: {saldo_spot} < {MIN_SALDO_COMPRA}")
+            enviar_telegram(f"⚠️ Saldo insuficiente: {saldo_spot} {MONEDA_BASE}")
             return
-        cantidad_usdc = saldo_spot * PORCENTAJE_USDC
+        cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot)
         criptos = mejores_criptos()
         if not criptos:
             logger.info("No hay criptos candidatas para comprar.")
+            enviar_telegram("⚠️ No hay criptos candidatas.")
             return
         registro = cargar_json(REGISTRO_FILE)
         if len(registro) >= MAX_POSICIONES:
             logger.info("Máximo de posiciones abiertas alcanzado.")
+            enviar_telegram("⚠️ Máximo de posiciones abiertas.")
             return
         now_ts = time.time()
         global ULTIMAS_OPERACIONES
         ULTIMAS_OPERACIONES = [t for t in ULTIMAS_OPERACIONES if now_ts - t < 3600]
         if len(ULTIMAS_OPERACIONES) >= MAX_TRADES_PER_HOUR:
             logger.info("Tope de operaciones por hora alcanzado.")
+            enviar_telegram("⚠️ Tope de operaciones por hora.")
             return
         compradas = 0
         for cripto in criptos:
@@ -466,7 +446,6 @@ def comprar():
             precio = dec(str(ticker["lastPrice"]))
             if precio <= 0:
                 continue
-            rsi = cripto.get("rsi", 50)
             meta = load_symbol_info(symbol)
             if not meta:
                 continue
@@ -474,46 +453,47 @@ def comprar():
             quote_to_spend = dec(str(cantidad_usdc)) * (1 - COMMISSION_RATE)
             if quote_to_spend < min_quote:
                 logger.info(f"{symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE}).")
+                enviar_telegram(f"⚠️ {symbol}: no alcanza minNotional ({float(min_quote):.2f} {MONEDA_BASE})")
                 continue
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
-            if rsi < RSI_BUY_MAX:
-                try:
-                    logger.debug(f"Intentando comprar {symbol} con {quote_to_spend} {MONEDA_BASE}")
-                    orden = retry(
-                        lambda: client.create_order(
-                            symbol=symbol,
-                            side="BUY",
-                            type="MARKET",
-                            quoteOrderQty=format(quote_to_spend, 'f')
-                        ),
-                        tries=5, base_delay=1.0
-                    )
-                    executed_qty = executed_qty_from_order(orden)
-                    if executed_qty <= 0:
-                        executed_qty = float(quote_to_spend) / float(precio)
-                    with LOCK:
-                        registro = cargar_json(REGISTRO_FILE)
-                        registro[symbol] = {
-                            "cantidad": executed_qty,
-                            "precio_compra": float(precio),
-                            "timestamp": now_tz().isoformat(),
-                            "high_since_buy": float(precio)
-                        }
-                        guardar_json(registro, REGISTRO_FILE)
-                    enviar_telegram(f"🟢 Comprado {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE} a ~{float(precio):.6f}. RSI: {rsi:.2f}.")
-                    logger.info(f"Compra exitosa: {symbol}, qty={executed_qty}, precio={precio}")
-                    compradas += 1
-                    ULTIMA_COMPRA[symbol] = now_ts
-                    ULTIMAS_OPERACIONES.append(now_ts)
-                except BinanceAPIException as e:
-                    logger.error(f"Error comprando {symbol}: {e}")
-                except Exception as e:
-                    logger.error(f"Error inesperado comprando {symbol}: {e}")
-            else:
-                logger.info(f"No se compra {symbol}: RSI {rsi:.2f} > {RSI_BUY_MAX}")
-            time.sleep(0.3)
+            try:
+                logger.debug(f"Intentando comprar {symbol} con {quote_to_spend} {MONEDA_BASE}")
+                orden = retry(
+                    lambda: client.create_order(
+                        symbol=symbol,
+                        side="BUY",
+                        type="MARKET",
+                        quoteOrderQty=format(quote_to_spend, 'f')
+                    ),
+                    tries=5, base_delay=1.0
+                )
+                executed_qty = executed_qty_from_order(orden)
+                if executed_qty <= 0:
+                    executed_qty = float(quote_to_spend) / float(precio)
+                with LOCK:
+                    registro = cargar_json(REGISTRO_FILE)
+                    registro[symbol] = {
+                        "cantidad": executed_qty,
+                        "precio_compra": float(precio),
+                        "timestamp": now_tz().isoformat(),
+                        "high_since_buy": float(precio)
+                    }
+                    guardar_json(registro, REGISTRO_FILE)
+                enviar_telegram(f"🟢 Comprado {symbol} por {float(quote_to_spend):.2f} {MONEDA_BASE} a ~{float(precio):.6f}.")
+                logger.info(f"Compra exitosa: {symbol}, qty={executed_qty}, precio={precio}")
+                compradas += 1
+                ULTIMA_COMPRA[symbol] = now_ts
+                ULTIMAS_OPERACIONES.append(now_ts)
+            except BinanceAPIException as e:
+                logger.error(f"Error comprando {symbol}: {e}")
+                enviar_telegram(f"⚠️ Error comprando {symbol}: {e}")
+            except Exception as e:
+                logger.error(f"Error inesperado comprando {symbol}: {e}")
+                enviar_telegram(f"⚠️ Error inesperado comprando {symbol}: {e}")
+            time.sleep(0.2)
     except Exception as e:
         logger.error(f"Error general en compra: {e}")
+        enviar_telegram(f"⚠️ Error general en compra: {e}")
 
 def vender_y_convertir():
     with LOCK:
@@ -530,9 +510,6 @@ def vender_y_convertir():
                     continue
                 precio_actual = dec(str(ticker["lastPrice"]))
                 cambio = (precio_actual - precio_compra) / (precio_compra if precio_compra != 0 else Decimal('1'))
-                klines = retry(lambda: client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_5MINUTE, limit=15), tries=5)
-                closes = [float(k[4]) for k in klines]
-                rsi = calculate_rsi(closes[-15:])
                 meta = load_symbol_info(symbol)
                 if not meta:
                     nuevos_registro[symbol] = data
@@ -561,7 +538,7 @@ def vender_y_convertir():
                 ganancia_neta = ganancia_bruta - comision_compra - comision_venta
                 trailing_trigger = (precio_actual - high_since_buy) / high_since_buy <= -TRAILING_STOP
                 vender_por_stop = float(cambio) <= STOP_LOSS or trailing_trigger
-                vender_por_profit = float(cambio) >= TAKE_PROFIT and ganancia_neta > MIN_NET_GAIN_ABS
+                vender_por_profit = float(cambio) >= TAKE_PROFIT
                 if vender_por_stop or vender_por_profit:
                     try:
                         orden = market_sell_with_fallback(symbol, qty, meta)
@@ -571,20 +548,22 @@ def vender_y_convertir():
                         enviar_telegram(
                             f"🔴 Vendido {symbol} - {float(qty):.8f} a ~{float(precio_actual):.6f} "
                             f"(Cambio: {float(cambio)*100:.2f}%) PnL: {ganancia_neta:.2f} {MONEDA_BASE}. "
-                            f"Motivo: {motivo}. RSI: {rsi:.2f}. PnL hoy: {total_hoy:.2f}."
+                            f"Motivo: {motivo}. PnL hoy: {total_hoy:.2f}."
                         )
                         comprar()
                     except BinanceAPIException as e:
                         logger.error(f"Error vendiendo {symbol}: {e}")
+                        enviar_telegram(f"⚠️ Error vendiendo {symbol}: {e}")
                         dust_positions.append(symbol)
                         continue
                 else:
                     nuevos_registro[symbol] = data
-                    logger.debug(f"No se vende {symbol}: RSI={rsi:.2f}, Ganancia neta={ganancia_neta:.4f}")
+                    logger.debug(f"No se vende {symbol}: Cambio={float(cambio)*100:.2f}%, Ganancia neta={ganancia_neta:.4f}")
+                time.sleep(0.2)
             except Exception as e:
                 logger.error(f"Error vendiendo {symbol}: {e}")
+                enviar_telegram(f"⚠️ Error vendiendo {symbol}: {e}")
                 nuevos_registro[symbol] = data
-            time.sleep(0.3)
         limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
         guardar_json(limpio, REGISTRO_FILE)
         if dust_positions:
@@ -599,7 +578,6 @@ def vender_y_convertir():
                 if candidates:
                     best = candidates[0]
                     best_symbol = best['symbol']
-                    best_rsi = best.get('rsi', 50)
                     pos_perfs = []
                     for sym, data in registro.items():
                         ticker = safe_get_ticker(sym)
@@ -608,20 +586,17 @@ def vender_y_convertir():
                         price = float(ticker['lastPrice'])
                         buy_price = data['precio_compra']
                         change = (price - buy_price) / buy_price if buy_price else 0
-                        klines = retry(lambda: client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_5MINUTE, limit=15), tries=5)
-                        closes = [float(k[4]) for k in klines]
-                        rsi = calculate_rsi(closes[-15:])
                         qty = data['cantidad']
                         ganancia_bruta = qty * (price - buy_price)
                         comision_compra = buy_price * qty * COMMISSION_RATE
                         comision_venta = price * qty * COMMISSION_RATE
                         ganancia_neta = ganancia_bruta - comision_compra - comision_venta
-                        pos_perfs.append((sym, change, rsi, ganancia_neta))
-                        time.sleep(0.3)
+                        pos_perfs.append((sym, change, ganancia_neta))
+                        time.sleep(0.2)
                     if pos_perfs:
                         pos_perfs.sort(key=lambda x: x[1])
-                        worst_sym, worst_change, worst_rsi, worst_net = pos_perfs[0]
-                        if worst_net < 0 or worst_rsi > best_rsi + 5:
+                        worst_sym, worst_change, worst_net = pos_perfs[0]
+                        if worst_net < 0 or worst_change < 0:
                             try:
                                 meta = load_symbol_info(worst_sym)
                                 asset = base_from_symbol(worst_sym)
@@ -640,12 +615,14 @@ def vender_y_convertir():
                                 comprar()
                             except Exception as e:
                                 logger.error(f"Error en venta por rotación {worst_sym}: {e}")
+                                enviar_telegram(f"⚠️ Error en rotación {worst_sym}: {e}")
         except Exception as e:
             logger.error(f"Error en bloque de rotación: {e}")
+            enviar_telegram(f"⚠️ Error en rotación: {e}")
 
 def resumen_diario():
     try:
-        cuenta = retry(lambda: client.get_account(), tries=10, base_delay=1.0)
+        cuenta = retry(lambda: client.get_account(), tries=15, base_delay=1.0)
         pnl_data = cargar_json(PNL_DIARIO_FILE)
         today = get_current_date()
         pnl_hoy_v = pnl_data.get(today, 0)
@@ -662,7 +639,7 @@ def resumen_diario():
                         total_value += total * float(ticker['lastPrice'])
                 else:
                     total_value += total
-            time.sleep(0.3)
+            time.sleep(0.2)
         mensaje += f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}"
         enviar_telegram(mensaje)
         logger.info(f"Resumen diario enviado: {mensaje}")
@@ -671,14 +648,15 @@ def resumen_diario():
         guardar_json(pnl_data, PNL_DIARIO_FILE)
     except BinanceAPIException as e:
         logger.error(f"Error en resumen diario: {e}")
+        enviar_telegram(f"⚠️ Error en resumen diario: {e}")
 
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Momentum Scalping: ~160 USDC, compra múltiples altcoins baratas, vende si baja 1% o sube 1.2% neto, 15s checks, fee-aware.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin filtros, 10s checks, fee-aware, max 5 posiciones.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
-    scheduler.add_job(comprar, 'interval', seconds=15, id="comprar")
-    scheduler.add_job(vender_y_convertir, 'interval', seconds=15, id="vender")
+    scheduler.add_job(comprar, 'interval', seconds=10, id="comprar")
+    scheduler.add_job(vender_y_convertir, 'interval', seconds=10, id="vender")
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA, minute=0, id="resumen")
     scheduler.add_job(reset_diario, 'cron', hour=0, minute=5, id="reset_pnl")
     scheduler.start()
