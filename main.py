@@ -69,7 +69,7 @@ PNL_DIARIO_FILE = "pnl_diario.json"
 # ───────────── ESTADO GLOBAL ─────────────
 client = None
 EX_INFO_READY = False
-SYMBOL_MAP = {}  # symbol -> {base, quote, status, filters, isSpotAllowed, permissions}
+SYMBOL_MAP = {}  # symbol -> {base, quote, status, filters}
 
 # Caché candidatos
 CAND_CACHE_TS = 0.0
@@ -77,6 +77,7 @@ CAND_CACHE = []
 
 # Última compra (para modo agresivo)
 LAST_BUY_TS = 0.0
+BUY_LOCK = threading.Lock()   # lock para evitar solapes
 
 # ───────────── TELEGRAM ─────────────
 def telegram_enabled():
@@ -187,8 +188,6 @@ def load_exchange_info():
                 "quote": s["quoteAsset"],
                 "status": s["status"],
                 "filters": filters,
-                "isSpotAllowed": s.get("isSpotTradingAllowed", False),
-                "permissions": s.get("permissions", []),
             }
         EX_INFO_READY = True
         logger.info(f"exchangeInfo cargada: {len(SYMBOL_MAP)} símbolos.")
@@ -486,143 +485,151 @@ def comprar_oportunidad_for_quote(quote, reg, balances):
 def comprar_oportunidad():
     global LAST_BUY_TS
     if not (client and EX_INFO_READY): return
-    reg = leer_posiciones()
-    if len(reg) >= MAX_OPEN_POSITIONS: return
-    balances = holdings_por_asset()
 
+    # Lock para evitar solapes (y warnings de APScheduler)
+    if not BUY_LOCK.acquire(blocking=False):
+        logger.info("[SKIP] comprar_oportunidad ya está en curso (lock).")
+        return
     try:
-        dbg = {q: float(balances.get(q, 0.0)) for q in PREFERRED_QUOTES}
-        logger.info(f"[DEBUG] Saldos por quote: {dbg}")
-    except Exception:
-        pass
+        reg = leer_posiciones()
+        if len(reg) >= MAX_OPEN_POSITIONS: return
+        balances = holdings_por_asset()
 
-    now = time.time()
-    tiempo_sin_comprar = now - LAST_BUY_TS if LAST_BUY_TS > 0 else 1e9
+        try:
+            dbg = {q: float(balances.get(q, 0.0)) for q in PREFERRED_QUOTES}
+            logger.info(f"[DEBUG] Saldos por quote: {dbg}")
+        except Exception:
+            pass
 
-    for quote in PREFERRED_QUOTES:
-        if len(reg) >= MAX_OPEN_POSITIONS: break
-        disponible = float(balances.get(quote, 0.0))
-        intentos = 0
-        while disponible >= USD_MIN and len(reg) < MAX_OPEN_POSITIONS:
-            intentos += 1
-            if intentos > MAX_BUY_ATTEMPTS_PER_QUOTE: break
+        now = time.time()
+        tiempo_sin_comprar = now - LAST_BUY_TS if LAST_BUY_TS > 0 else 1e9
 
-            cand_all = get_candidates_cached()
-            candidatos = [c for c in cand_all if c["quote"] == quote and c["symbol"] not in reg]
-            logger.info(f"[DEBUG] {quote}: candidatos RSI={len(candidatos)} (total cache={len(cand_all)})")
-            elegido = candidatos[0] if candidatos else None
+        for quote in PREFERRED_QUOTES:
+            if len(reg) >= MAX_OPEN_POSITIONS: break
+            disponible = float(balances.get(quote, 0.0))
+            intentos = 0
+            while disponible >= USD_MIN and len(reg) < MAX_OPEN_POSITIONS:
+                intentos += 1
+                if intentos > MAX_BUY_ATTEMPTS_PER_QUOTE: break
 
-            # Descarta si base es stable o en blacklist
-            if elegido:
-                base_asset = SYMBOL_MAP[elegido["symbol"]]["base"]
-                if base_asset in STABLES or elegido["symbol"] in NOT_PERMITTED:
-                    elegido = None
+                cand_all = get_candidates_cached()
+                candidatos = [c for c in cand_all if c["quote"] == quote and c["symbol"] not in reg]
+                logger.info(f"[DEBUG] {quote}: candidatos RSI={len(candidatos)} (total cache={len(cand_all)})")
+                elegido = candidatos[0] if candidatos else None
 
-            # Fallback con RSI suave
-            if not elegido and USE_FALLBACK:
-                for base in FALLBACK_SYMBOLS:
-                    if base in STABLES:
-                        continue
-                    sym = symbol_exists(base, quote)
-                    if (sym and sym not in reg and sym not in NOT_PERMITTED):
-                        meta = SYMBOL_MAP[sym]
-                        if meta["status"] == "TRADING" and SYMBOL_MAP[sym]["base"] not in STABLES:
-                            try:
-                                kl = safe_get_klines(sym, Client.KLINE_INTERVAL_5MINUTE, 30)
-                                if not kl: continue
-                                closes = [float(k[4]) for k in kl]
-                                rsi = calculate_rsi(closes, RSI_PERIOD)
-                                if 35 <= rsi <= 65:
-                                    elegido = {"symbol": sym, "quote": quote, "rsi": rsi,
-                                               "lastPrice": closes[-1], "quoteVolume": 0}
-                                    break
-                            except Exception:
-                                continue
+                # Descarta si base es stable o en blacklist
+                if elegido:
+                    base_asset = SYMBOL_MAP[elegido["symbol"]]["base"]
+                    if base_asset in STABLES or elegido["symbol"] in NOT_PERMITTED:
+                        elegido = None
 
-            # FORCE BUY si pasa demasiado tiempo sin compras: fallback o top volumen
-            if not elegido and AGGRESSIVE_MODE and tiempo_sin_comprar >= FORCE_BUY_AFTER_SEC:
-                logger.info(f"[FORCE] Tiempo sin comprar={tiempo_sin_comprar:.0f}s -> Forzando entrada en {quote}")
-                # 1) Fallback sin RSI
-                for base in FALLBACK_SYMBOLS:
-                    if base in STABLES:
-                        continue
-                    sym = symbol_exists(base, quote)
-                    if sym and sym not in reg and sym not in NOT_PERMITTED:
-                        meta = SYMBOL_MAP[sym]
-                        if meta["status"] == "TRADING" and SYMBOL_MAP[sym]["base"] not in STABLES:
-                            elegido = {"symbol": sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": 0}
-                            logger.info(f"[FORCE] Elegido por fallback: {sym}")
-                            break
-                # 2) Top volumen sin RSI
-                if not elegido:
-                    tickers = safe_get_ticker_24h() or []
-                    candidatos_force = []
-                    for t in tickers:
-                        sym = t["symbol"]
-                        if sym in NOT_PERMITTED or sym not in SYMBOL_MAP:
+                # Fallback con RSI suave
+                if not elegido and USE_FALLBACK:
+                    for base in FALLBACK_SYMBOLS:
+                        if base in STABLES:
                             continue
-                        meta = SYMBOL_MAP[sym]
-                        if (meta["status"] == "TRADING"
-                            and meta["quote"] == quote
-                            and meta["base"] not in STABLES):
-                            try:
-                                vol = float(t.get("quoteVolume", 0.0))
-                                candidatos_force.append((vol, sym))
-                            except Exception:
+                        sym = symbol_exists(base, quote)
+                        if (sym and sym not in reg and sym not in NOT_PERMITTED):
+                            meta = SYMBOL_MAP[sym]
+                            if meta["status"] == "TRADING" and SYMBOL_MAP[sym]["base"] not in STABLES:
+                                try:
+                                    kl = safe_get_klines(sym, Client.KLINE_INTERVAL_5MINUTE, 30)
+                                    if not kl: continue
+                                    closes = [float(k[4]) for k in kl]
+                                    rsi = calculate_rsi(closes, RSI_PERIOD)
+                                    if 35 <= rsi <= 65:
+                                        elegido = {"symbol": sym, "quote": quote, "rsi": rsi,
+                                                   "lastPrice": closes[-1], "quoteVolume": 0}
+                                        break
+                                except Exception:
+                                    continue
+
+                # FORCE BUY si pasa demasiado tiempo sin compras: fallback o top volumen
+                if not elegido and AGGRESSIVE_MODE and tiempo_sin_comprar >= FORCE_BUY_AFTER_SEC:
+                    logger.info(f"[FORCE] Tiempo sin comprar={tiempo_sin_comprar:.0f}s -> Forzando entrada en {quote}")
+                    # 1) Fallback sin RSI
+                    for base in FALLBACK_SYMBOLS:
+                        if base in STABLES:
+                            continue
+                        sym = symbol_exists(base, quote)
+                        if sym and sym not in reg and sym not in NOT_PERMITTED:
+                            meta = SYMBOL_MAP[sym]
+                            if meta["status"] == "TRADING" and SYMBOL_MAP[sym]["base"] not in STABLES:
+                                elegido = {"symbol": sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": 0}
+                                logger.info(f"[FORCE] Elegido por fallback: {sym}")
+                                break
+                    # 2) Top volumen sin RSI
+                    if not elegido:
+                        tickers = safe_get_ticker_24h() or []
+                        candidatos_force = []
+                        for t in tickers:
+                            sym = t["symbol"]
+                            if sym in NOT_PERMITTED or sym not in SYMBOL_MAP:
                                 continue
-                    candidatos_force.sort(reverse=True)
-                    if candidatos_force:
-                        elegido_sym = candidatos_force[0][1]
-                        elegido = {"symbol": elegido_sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": candidatos_force[0][0]}
-                        logger.info(f"[FORCE] Elegido top volumen {quote}: {elegido_sym}")
+                            meta = SYMBOL_MAP[sym]
+                            if (meta["status"] == "TRADING"
+                                and meta["quote"] == quote
+                                and meta["base"] not in STABLES):
+                                try:
+                                    vol = float(t.get("quoteVolume", 0.0))
+                                    candidatos_force.append((vol, sym))
+                                except Exception:
+                                    continue
+                        candidatos_force.sort(reverse=True)
+                        if candidatos_force:
+                            elegido_sym = candidatos_force[0][1]
+                            elegido = {"symbol": elegido_sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": candidatos_force[0][0]}
+                            logger.info(f"[FORCE] Elegido top volumen {quote}: {elegido_sym}")
 
-            if not elegido:
-                logger.info(f"Sin candidato para {quote}; saldo se mantiene hasta próximo ciclo.")
-                break
-
-            symbol = elegido["symbol"]
-            price = obtener_precio(symbol)
-            if not price: break
-            step, _, _ = get_filter_values_cached(symbol)
-
-            usd_orden = min(next_order_size(), disponible)
-            qty = quantize_qty(usd_orden / price, step)
-
-            if qty <= 0 or not min_notional_ok(symbol, price, qty):
-                usd_orden = min(max(usd_orden * 1.3, USD_MIN), disponible)
-                qty = quantize_qty(usd_orden / price, step)
-                if qty <= 0 or not min_notional_ok(symbol, price, qty):
-                    logger.info(f"{symbol}: no alcanza minNotional con saldo disponible.")
+                if not elegido:
+                    logger.info(f"Sin candidato para {quote}; saldo se mantiene hasta próximo ciclo.")
                     break
 
-            try:
-                orden = client.order_market_buy(symbol=symbol, quantity=qty)
-                filled_qty = float(orden.get("executedQty", qty))
-                last_price = obtener_precio(symbol) or price
+                symbol = elegido["symbol"]
+                price = obtener_precio(symbol)
+                if not price: break
+                step, _, _ = get_filter_values_cached(symbol)
 
-                reg[symbol] = {
-                    "qty": float(filled_qty),
-                    "buy_price": float(last_price),
-                    "peak": float(last_price),              # iniciar pico para trailing
-                    "quote": quote,
-                    "ts": datetime.now(TIMEZONE).isoformat()
-                }
-                escribir_posiciones(reg)
-                LAST_BUY_TS = time.time()
-                enviar_telegram(f"🟢 Compra {symbol} qty={filled_qty} @ {last_price:.8f} {quote} | RSI {round(elegido.get('rsi', 50),1)}")
-                balances = holdings_por_asset()
-                disponible = float(balances.get(quote, 0.0))
-            except BinanceAPIException as e:
-                logger.error(f"Compra error {symbol}: {e}")
-                if getattr(e, "code", None) == -2010:
-                    NOT_PERMITTED.add(symbol)
-                    logger.warning(f"Añadido a blacklist por no permitido: {symbol}")
-                backoff_sleep(e)
-                break
-            except Exception as e:
-                logger.error(f"Compra error {symbol}: {e}")
-                backoff_sleep(e)
-                break
+                usd_orden = min(next_order_size(), disponible)
+                qty = quantize_qty(usd_orden / price, step)
+
+                if qty <= 0 or not min_notional_ok(symbol, price, qty):
+                    usd_orden = min(max(usd_orden * 1.3, USD_MIN), disponible)
+                    qty = quantize_qty(usd_orden / price, step)
+                    if qty <= 0 or not min_notional_ok(symbol, price, qty):
+                        logger.info(f"{symbol}: no alcanza minNotional con saldo disponible.")
+                        break
+
+                try:
+                    orden = client.order_market_buy(symbol=symbol, quantity=qty)
+                    filled_qty = float(orden.get("executedQty", qty))
+                    last_price = obtener_precio(symbol) or price
+
+                    reg[symbol] = {
+                        "qty": float(filled_qty),
+                        "buy_price": float(last_price),
+                        "peak": float(last_price),              # iniciar pico para trailing
+                        "quote": quote,
+                        "ts": datetime.now(TIMEZONE).isoformat()
+                    }
+                    escribir_posiciones(reg)
+                    LAST_BUY_TS = time.time()
+                    enviar_telegram(f"🟢 Compra {symbol} qty={filled_qty} @ {last_price:.8f} {quote} | RSI {round(elegido.get('rsi', 50),1)}")
+                    balances = holdings_por_asset()
+                    disponible = float(balances.get(quote, 0.0))
+                except BinanceAPIException as e:
+                    logger.error(f"Compra error {symbol}: {e}")
+                    if getattr(e, "code", None) == -2010:
+                        NOT_PERMITTED.add(symbol)
+                        logger.warning(f"Añadido a blacklist por no permitido: {symbol}")
+                    backoff_sleep(e)
+                    break
+                except Exception as e:
+                    logger.error(f"Compra error {symbol}: {e}")
+                    backoff_sleep(e)
+                    break
+    finally:
+        BUY_LOCK.release()
 
 # ───────────── GESTIÓN + ROTACIÓN ─────────────
 def gestionar_posiciones():
@@ -778,7 +785,14 @@ def run_bot():
     )
     scheduler = BackgroundScheduler(timezone=TIMEZONE)
     scheduler.add_job(gestionar_posiciones, 'interval', seconds=FAST_SEC, max_instances=1)
-    scheduler.add_job(comprar_oportunidad,   'interval', seconds=BUY_SEC,  max_instances=1)
+    scheduler.add_job(
+        comprar_oportunidad,
+        'interval',
+        seconds=BUY_SEC,
+        max_instances=2,          # se permiten 2; el lock evita solapes reales
+        coalesce=True,            # agrupa si se acumulan
+        misfire_grace_time=30     # tolera pequeños retrasos
+    )
     scheduler.add_job(limpiar_dust,         'interval', minutes=DUST_MIN, max_instances=1)
     scheduler.add_job(resumen_diario,       'cron',     hour=RESUMEN_HORA_LOCAL, minute=0)
     scheduler.add_job(load_exchange_info,   'interval', minutes=15)  # refresco periódico
