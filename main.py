@@ -351,6 +351,15 @@ def holdings_por_asset():
         backoff_sleep(e)
         return {}
 
+def free_base_qty(symbol: str) -> float:
+    """Cantidad libre actual del asset base del símbolo."""
+    try:
+        base = SYMBOL_MAP[symbol]["base"]
+        bal = client.get_asset_balance(asset=base) or {}
+        return float(bal.get("free", 0.0))
+    except Exception:
+        return 0.0
+
 def obtener_precio(symbol):
     while True:
         try:
@@ -446,19 +455,22 @@ def comprar_oportunidad_for_quote(quote, reg, balances):
             return False
 
     try:
-        client.order_market_buy(symbol=symbol, quantity=qty)
+        orden = client.order_market_buy(symbol=symbol, quantity=qty)
+        filled_qty = float(orden.get("executedQty", qty))
+        last_price = obtener_precio(symbol) or price
+
         reg[symbol] = {
-            "qty": float(qty),
-            "buy_price": float(price),
-            "peak": float(price),              # para trailing
+            "qty": float(filled_qty),
+            "buy_price": float(last_price),
+            "peak": float(last_price),              # para trailing
             "quote": quote,
             "ts": datetime.now(TIMEZONE).isoformat()
         }
         escribir_posiciones(reg)
         global LAST_BUY_TS
         LAST_BUY_TS = time.time()
-        enviar_telegram(f"🟢 Compra (rotación) {symbol} qty={qty} @ {price:.8f} {quote}")
-        logger.info(f"[ROTATE] Comprado {symbol} en rotación.")
+        enviar_telegram(f"🟢 Compra (rotación) {symbol} qty={filled_qty} @ {last_price:.8f} {quote}")
+        logger.info(f"[ROTATE] Comprado {symbol} en rotación (executedQty={filled_qty}).")
         return True
     except BinanceAPIException as e:
         logger.error(f"Compra (rotación) error {symbol}: {e}")
@@ -584,17 +596,20 @@ def comprar_oportunidad():
                     break
 
             try:
-                client.order_market_buy(symbol=symbol, quantity=qty)
+                orden = client.order_market_buy(symbol=symbol, quantity=qty)
+                filled_qty = float(orden.get("executedQty", qty))
+                last_price = obtener_precio(symbol) or price
+
                 reg[symbol] = {
-                    "qty": float(qty),
-                    "buy_price": float(price),
-                    "peak": float(price),              # iniciar pico para trailing
+                    "qty": float(filled_qty),
+                    "buy_price": float(last_price),
+                    "peak": float(last_price),              # iniciar pico para trailing
                     "quote": quote,
                     "ts": datetime.now(TIMEZONE).isoformat()
                 }
                 escribir_posiciones(reg)
                 LAST_BUY_TS = time.time()
-                enviar_telegram(f"🟢 Compra {symbol} qty={qty} @ {price:.8f} {quote} | RSI {round(elegido.get('rsi', 50),1)}")
+                enviar_telegram(f"🟢 Compra {symbol} qty={filled_qty} @ {last_price:.8f} {quote} | RSI {round(elegido.get('rsi', 50),1)}")
                 balances = holdings_por_asset()
                 disponible = float(balances.get(quote, 0.0))
             except BinanceAPIException as e:
@@ -651,9 +666,20 @@ def gestionar_posiciones():
 
             if debe_vender:
                 step, _, _ = get_filter_values_cached(symbol)
-                qty_q = quantize_qty(qty, step)
-                if qty_q <= 0: 
+
+                # Vende la menor entre qty registrada y saldo libre actual, con safety 0.1%
+                free_now = free_base_qty(symbol)
+                sell_qty = min(qty, free_now) * 0.999
+                qty_q = quantize_qty(sell_qty, step)
+                if qty_q <= 0:
+                    logger.info(f"{symbol}: saldo libre insuficiente para vender (free={free_now:.8f}, reg={qty:.8f})")
                     continue
+
+                # Verifica minNotional con el precio actual
+                if not min_notional_ok(symbol, price, qty_q):
+                    logger.info(f"{symbol}: venta no cumple minNotional tras ajuste (qty={qty_q}).")
+                    continue
+
                 client.order_market_sell(symbol=symbol, quantity=qty_q)
                 realized = (price - buy_price) * qty_q
                 total_pnl = actualizar_pnl_diario(realized)
