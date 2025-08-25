@@ -17,20 +17,20 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PORT = int(os.getenv("PORT", "10000"))  # Render Web Service
 
-# Estrategia base (puedes ajustar por entorno)
+# Estrategia base (ajustable por entorno)
 USD_MIN = float(os.getenv("USD_MIN", "15"))
 USD_MAX = float(os.getenv("USD_MAX", "20"))
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))           # 2% TP clásico
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))           # 2% TP
 STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))              # -2% SL
-ROTATE_PROFIT = float(os.getenv("ROTATE_PROFIT", "0.012"))      # +1.2% → rotar a otra cripto
-TRAIL_ACTIVATE = float(os.getenv("TRAIL_ACTIVATE", "0.008"))    # activar trailing al +0.8%
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.006"))              # vender si cae 0.6% desde el pico
+ROTATE_PROFIT = float(os.getenv("ROTATE_PROFIT", "0.012"))      # +1.2% ⇒ rotar
+TRAIL_ACTIVATE = float(os.getenv("TRAIL_ACTIVATE", "0.008"))    # trailing on al +0.8%
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.006"))              # stop de trailing 0.6%
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
-MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "80000"))
+MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "30000"))
 RESUMEN_HORA_LOCAL = int(os.getenv("RESUMEN_HORA", "23"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "35"))             # ventana RSI amplia
-RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "65"))
+RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "30"))
+RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "70"))
 RSI_SELL_OVERBOUGHT = float(os.getenv("RSI_SELL_OVERBOUGHT", "68"))
 
 USE_FALLBACK = os.getenv("USE_FALLBACK", "true").lower() == "true"
@@ -45,15 +45,15 @@ PREFERRED_QUOTES = [q.strip().upper() for q in os.getenv(
     "PREFERRED_QUOTES", "USDC,USDT"
 ).split(",") if q.strip()]
 
-# Ciclos rápidos
-FAST_SEC = int(os.getenv("FAST_SEC", "20"))            # gestionar_posiciones
-BUY_SEC  = int(os.getenv("BUY_SEC", "45"))             # comprar_oportunidad
-DUST_MIN = int(os.getenv("DUST_MIN", "12"))            # limpiar_dust
-SCAN_COOLDOWN_SEC = int(os.getenv("SCAN_COOLDOWN_SEC", "60"))  # caché escaneo
+# Ciclos rápidos (por defecto, más seguidos)
+FAST_SEC = int(os.getenv("FAST_SEC", "10"))           # gestionar_posiciones
+BUY_SEC  = int(os.getenv("BUY_SEC", "20"))            # comprar_oportunidad
+DUST_MIN = int(os.getenv("DUST_MIN", "5"))            # limpiar_dust
+SCAN_COOLDOWN_SEC = int(os.getenv("SCAN_COOLDOWN_SEC", "30"))  # caché escaneo
 
 # Modo agresivo (fuerza compra si pasa tiempo sin operar)
 AGGRESSIVE_MODE = os.getenv("AGGRESSIVE_MODE", "true").lower() == "true"
-FORCE_BUY_AFTER_SEC = int(os.getenv("FORCE_BUY_AFTER_SEC", "900"))  # 15 min sin comprar
+FORCE_BUY_AFTER_SEC = int(os.getenv("FORCE_BUY_AFTER_SEC", "300"))  # 5 min sin comprar
 MAX_BUY_ATTEMPTS_PER_QUOTE = int(os.getenv("MAX_BUY_ATTEMPTS_PER_QUOTE", "12"))
 
 # Stables y blacklist
@@ -297,7 +297,8 @@ def scan_candidatos():
     reduced = []
     for q, arr in by_quote.items():
         arr.sort(key=lambda x: x[0], reverse=True)
-        reduced.extend([t for _, t in arr[:80]])
+        # sube el techo por quote a 200 para más candidatos
+        reduced.extend([t for _, t in arr[:200]])
 
     for t in reduced:
         sym = t["symbol"]
@@ -375,10 +376,7 @@ def next_order_size():
 
 # ───────────── COMPRAS ─────────────
 def comprar_oportunidad_for_quote(quote, reg, balances):
-    """
-    Intenta gastar una orden (15–20) en la quote indicada inmediatamente (para rotación).
-    Devuelve True si compró algo.
-    """
+    """Intenta gastar una orden (15–20) en la quote indicada para rotación inmediata."""
     if len(reg) >= MAX_OPEN_POSITIONS:
         return False
     disponible = float(balances.get(quote, 0.0))
@@ -481,11 +479,13 @@ def comprar_oportunidad():
             logger.info(f"[DEBUG] {quote}: candidatos RSI={len(candidatos)} (total cache={len(cand_all)})")
             elegido = candidatos[0] if candidatos else None
 
+            # Descarta si base es stable o en blacklist
             if elegido:
                 base_asset = SYMBOL_MAP[elegido["symbol"]]["base"]
                 if base_asset in STABLES or elegido["symbol"] in NOT_PERMITTED:
                     elegido = None
 
+            # Fallback con RSI suave
             if not elegido and USE_FALLBACK:
                 for base in FALLBACK_SYMBOLS:
                     if base in STABLES:
