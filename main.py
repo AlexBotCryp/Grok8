@@ -23,8 +23,8 @@ USD_MAX = float(os.getenv("USD_MAX", "20"))
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))           # 2% TP clásico
 STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))              # -2% SL
 ROTATE_PROFIT = float(os.getenv("ROTATE_PROFIT", "0.012"))      # +1.2% → rotar a otra cripto
-TRAIL_ACTIVATE = float(os.getenv("TRAIL_ACTIVATE", "0.008"))    # activar trailing al +0.8% desde compra
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.006"))              # vender si cae 0.6% desde el pico (si trailing activo)
+TRAIL_ACTIVATE = float(os.getenv("TRAIL_ACTIVATE", "0.008"))    # activar trailing al +0.8%
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.006"))              # vender si cae 0.6% desde el pico
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "80000"))
 RESUMEN_HORA_LOCAL = int(os.getenv("RESUMEN_HORA", "23"))
@@ -335,17 +335,22 @@ def leer_posiciones():  return cargar_json(REGISTRO_FILE, {})
 def escribir_posiciones(reg): guardar_json(reg, REGISTRO_FILE)
 
 def holdings_por_asset():
-    if not client: return {}
+    """Devuelve dict {asset: total_free+locked} para todos los balances > 0."""
+    if not client:
+        return {}
     try:
         acc = client.get_account()
         res = {}
-        for b in acc["balances"]:
-            total = float(b["free"]) + float(b["locked"])
-            if total > 0: res[b]["asset"] = total
-        return {b["asset"]: float(b["free"]) + float(b["locked"]) for b in acc["balances"]}
+        for bal in acc.get("balances", []):
+            asset = bal.get("asset")
+            total = float(bal.get("free", 0)) + float(bal.get("locked", 0))
+            if asset and total > 0:
+                res[asset] = total
+        return res
     except Exception as e:
         logger.warning(f"holdings error: {e}")
-        backoff_sleep(e); return {}
+        backoff_sleep(e)
+        return {}
 
 def obtener_precio(symbol):
     while True:
@@ -614,14 +619,13 @@ def gestionar_posiciones():
                     f"🔴 Venta {symbol} qty={qty_q} @ {price:.8f} ({change*100:.2f}%) "
                     f"Motivo: {motivo} RSI:{rsi:.1f} | PnL: {realized:.4f} {quote} | PnL hoy: {total_pnl:.4f}"
                 )
-                # ROTACIÓN INMEDIATA: intenta comprar otra con la misma quote
+                # ROTACIÓN INMEDIATA
                 balances = holdings_por_asset()
                 reg_tmp = leer_posiciones()
-                reg_tmp.pop(symbol, None)  # ya vendida
+                reg_tmp.pop(symbol, None)
                 escribir_posiciones(reg_tmp)
                 _ = comprar_oportunidad_for_quote(quote, reg_tmp, balances)
             else:
-                # guarda pico actualizado
                 data["peak"] = float(peak)
                 nuevos[symbol] = data
 
