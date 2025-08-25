@@ -24,8 +24,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
 MIN_VOLUME = Decimal('10000')  # Mínimo volumen
-MIN_SALDO_COMPRA = Decimal('0.5')  # Para saldos bajos
-PORCENTAJE_USDC = Decimal('0.8')  # ~80% del saldo por trade (margen de seguridad)
+MIN_SALDO_COMPRA = Decimal('15')  # Mínimo saldo para una compra
+COMPRA_POR_CRIPTO = Decimal('15')  # $15 por crypto
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'AVAXUSDC']  # Reducido a 5 para menos requests
 TAKE_PROFIT = Decimal('0.05')  # 5% para mayores ganancias
 STOP_LOSS = Decimal('-0.01')  # -1%
@@ -42,6 +42,7 @@ REGISTRO_FILE = "registro.json"
 PNL_DIARIO_FILE = "pnl_diario.json"
 
 client = Client(API_KEY, API_SECRET)
+bm = BinanceSocketManager(client)
 LOCK = threading.RLock()
 SYMBOL_CACHE = {}
 INVALID_SYMBOL_CACHE = set()
@@ -58,31 +59,38 @@ def process_ticker(msg):
         symbol = t['s']
         if symbol in ALLOWED_SYMBOLS:
             TICKERS_CACHE[symbol] = {'data': t, 'ts': time.time()}
+            logger.debug(f"WebSocket update for {symbol}: {t['c']}")
 
 def process_user(msg):
     if msg['e'] == 'outboundAccountPosition':
         for b in msg['B']:
             asset = b['a']
             BALANCES_CACHE[asset] = {'free': Decimal(b['f']), 'locked': Decimal(b['l'])}
+            logger.debug(f"WebSocket balance update for {asset}: free={b['f']}, locked={b['l']}")
     elif msg['e'] == 'balanceUpdate':
         asset = msg['a']
         free_delta = Decimal(msg['d'])
         if asset in BALANCES_CACHE:
             BALANCES_CACHE[asset]['free'] += free_delta
+            logger.debug(f"WebSocket balance update for {asset}: delta={free_delta}")
+
+def start_websockets():
+    symbols = [s.lower() for s in ALLOWED_SYMBOLS]
+    bm.start_ticker_socket(process_ticker, symbols)
+    bm.start_user_socket(process_user)
+    bm.start()
 
 def get_cached_ticker(symbol):
-    now = time.time()
-    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 60:
-        logger.debug(f"Usando ticker cacheado para {symbol}")
+    if symbol in TICKERS_CACHE:
         return TICKERS_CACHE[symbol]['data']
+    logger.warning(f"No WebSocket data for {symbol}, falling back to API")
     try:
-        t = retry(lambda: client.get_ticker(symbol=symbol), tries=3, base_delay=0.5)
+        t = client.get_ticker(symbol=symbol)
         if t and float(t.get('lastPrice', 0)) > 0:
-            TICKERS_CACHE[symbol] = {'data': t, 'ts': now}
-            logger.debug(f"Ticker actualizado para {symbol}: {t['lastPrice']}")
+            TICKERS_CACHE[symbol] = {'data': t, 'ts': time.time()}
             return t
     except Exception as e:
-        logger.error(f"Error cache ticker {symbol}: {e}")
+        logger.error(f"Error fetching ticker {symbol} via API: {e}")
     return None
 
 def now_tz():
@@ -151,7 +159,7 @@ def debug_balances():
                 if b['asset'] == MONEDA_BASE:
                     total_value += total
                 elif b['asset'] + MONEDA_BASE in ALLOWED_SYMBOLS:
-                    ticker = safe_get_ticker(b['asset'] + MONEDA_BASE)
+                    ticker = get_cached_ticker(b['asset'] + MONEDA_BASE)
                     if ticker:
                         total_value += total * Decimal(ticker['lastPrice'])
         logger.info(f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}")
@@ -255,12 +263,21 @@ def min_quote_for_market(symbol) -> Decimal:
     return (meta["minNotional"] * Decimal('1.01')).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
 
 def safe_get_ticker(symbol):
-    ticker = get_cached_ticker(symbol)
-    if ticker:
-        logger.debug(f"Ticker {symbol}: precio={ticker['lastPrice']}, volumen={ticker.get('quoteVolume', 0)}")
-    return ticker
+    if symbol in TICKERS_CACHE:
+        return TICKERS_CACHE[symbol]['data']
+    logger.warning(f"No WebSocket data for {symbol}, falling back to API")
+    try:
+        t = client.get_ticker(symbol=symbol)
+        if t and float(t.get('lastPrice', 0)) > 0:
+            TICKERS_CACHE[symbol] = {'data': t, 'ts': time.time()}
+            return t
+    except Exception as e:
+        logger.error(f"Error fetching ticker {symbol} via API: {e}")
+    return None
 
 def safe_get_balance(asset):
+    if asset in BALANCES_CACHE:
+        return BALANCES_CACHE[asset]['free']
     try:
         b = retry(lambda: client.get_asset_balance(asset=asset), tries=3, base_delay=0.5)
         if not b:
@@ -270,6 +287,7 @@ def safe_get_balance(asset):
         free = Decimal(str(b.get('free', 0)))
         locked = Decimal(str(b.get('locked', 0)))
         total = free + locked
+        BALANCES_CACHE[asset] = {'free': free, 'locked': locked}
         logger.debug(f"Balance {asset}: free={free}, locked={locked}, total={total}")
         return free
     except BinanceAPIException as e:
@@ -288,7 +306,7 @@ def mejores_criptos(max_candidates=10):
             if sym in INVALID_SYMBOL_CACHE:
                 logger.debug(f"Símbolo {sym} en cache inválida, saltando")
                 continue
-            t = get_cached_ticker(sym)
+            t = safe_get_ticker(sym)
             if not t:
                 logger.debug(f"No se obtuvo ticker para {sym}")
                 continue
@@ -301,7 +319,7 @@ def mejores_criptos(max_candidates=10):
             time.sleep(0.05)
         if not candidates and no_buy_cycles >= NO_BUY_CYCLES_THRESHOLD:
             logger.warning("Forzando compras tras 3 ciclos sin candidatos.")
-            return [get_cached_ticker(random.choice(ALLOWED_SYMBOLS)) for _ in range(min(5, len(ALLOWED_SYMBOLS)))]
+            return [safe_get_ticker(random.choice(ALLOWED_SYMBOLS)) for _ in range(min(5, len(ALLOWED_SYMBOLS)))]
         if not candidates:
             logger.warning("No hay criptos con volumen suficiente.")
             enviar_telegram("⚠️ No hay criptos con volumen suficiente (>10000 USDC).")
@@ -447,8 +465,8 @@ def resumen_diario():
         pnl_hoy_v = pnl_data.get(today, 0)
         mensaje = f"📊 Resumen diario ({today}):\nPNL hoy: {pnl_hoy_v:.2f} {MONEDA_BASE}\nBalances:\n"
         total_value = Decimal('0')
-        for b in cuenta["balances"]:
-            total = Decimal(str(float(b["free"]) + float(b["locked"])))
+        for b in cuenta['balances']:
+            total = Decimal(str(float(b['free']) + float(b['locked'])))
             if total > Decimal('0.001'):
                 mensaje += f"{b['asset']}: {total:.6f}\n"
                 if b['asset'] != MONEDA_BASE:
@@ -486,8 +504,14 @@ def comprar():
             logger.info(f"Saldo crítico: {saldo_spot} < {CRITICAL_SALDO}. Pausando compras.")
             enviar_telegram(f"⚠️ Saldo crítico: {saldo_spot} {MONEDA_BASE}. Pausando compras.")
             return
-        cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot)
-        criptos = mejores_criptos()
+        # Calcular cuántas compras de $15 se pueden hacer con el saldo disponible
+        max_compras = int(saldo_spot // COMPRA_POR_CRIPTO)
+        if max_compras == 0:
+            logger.info(f"No hay suficiente saldo para al menos una compra de {COMPRA_POR_CRIPTO} {MONEDA_BASE}")
+            enviar_telegram(f"⚠️ No hay suficiente saldo para al menos una compra de {COMPRA_POR_CRIPTO} {MONEDA_BASE}")
+            return
+        cantidad_usdc = min(COMPRA_POR_CRIPTO * max_compras, saldo_spot)  # Usar el 100% del saldo en múltiplos de $15
+        criptos = mejores_criptos(max_candidates=max_compras)  # Limitar candidatos al número de compras posibles
         if not criptos:
             no_buy_cycles += 1
             logger.info("No hay criptos candidatas para comprar.")
@@ -524,11 +548,11 @@ def comprar():
                 no_compradas_razon.append(f"{symbol}: sin info de símbolo")
                 logger.debug(f"No meta para {symbol}")
                 continue
-            quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
-            if quote_to_spend > saldo_spot:
-                no_compradas_razon.append(f"{symbol}: saldo insuficiente ({quote_to_spend} > {saldo_spot})")
-                logger.info(f"{symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
-                enviar_telegram(f"⚠️ {symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
+            min_notional = min_quote_for_market(symbol)
+            quote_to_spend = max(COMPRA_POR_CRIPTO * (Decimal('1') - COMMISSION_RATE), min_notional)
+            if quote_to_spend > saldo_spot or compradas * COMPRA_POR_CRIPTO >= saldo_spot:
+                no_compradas_razon.append(f"{symbol}: no hay suficiente saldo restante ({saldo_spot} < {quote_to_spend})")
+                logger.debug(f"{symbol}: no hay suficiente saldo restante para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
                 continue
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
             try:
@@ -538,7 +562,7 @@ def comprar():
                         symbol=symbol,
                         side="BUY",
                         type="MARKET",
-                        quoteOrderQty=format(quote_to_spend, 'f')
+                        quoteOrderQty=format(float(quote_to_spend), 'f')
                     ),
                     tries=3, base_delay=0.5
                 )
@@ -559,6 +583,7 @@ def comprar():
                 compradas += 1
                 ULTIMA_COMPRA[symbol] = now_ts
                 ULTIMAS_OPERACIONES.append(now_ts)
+                saldo_spot -= quote_to_spend  # Actualizar saldo restante
             except BinanceAPIException as e:
                 no_compradas_razon.append(f"{symbol}: error API ({e})")
                 logger.error(f"Error comprando {symbol}: {e}")
@@ -713,7 +738,9 @@ def vender_y_convertir():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=10%, 60s checks, rotación tras 30min, operaciones mayores.")
+    ws_thread = threading.Thread(target=start_websockets, daemon=True)
+    ws_thread.start()
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=5%, 60s checks, rotación tras 30min, operaciones mayores.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
     scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
@@ -726,4 +753,3 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
         logger.info("Bot detenido.")
-```
