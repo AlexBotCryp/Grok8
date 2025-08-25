@@ -1,11 +1,4 @@
-import os
-import time
-import json
-import logging
-import requests
-import pytz
-import numpy as np
-import threading
+import os, time, json, logging, requests, pytz, numpy as np, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -13,7 +6,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ─────────────────────────  CONFIG  ─────────────────────────
+# ───────────── CONFIG BÁSICA ─────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("bot-spot")
@@ -22,22 +15,13 @@ API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# Para Render (Web Service)
-PORT = int(os.getenv("PORT", "10000"))  # Render inyecta PORT
-
-if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-    raise ValueError("Faltan variables: BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
-
-# Preferimos cotizar en USDC, pero podemos rutear por otros si es necesario
-PREFERRED_QUOTES = os.getenv("PREFERRED_QUOTES", "USDC,USDT,FDUSD,TUSD,BUSD").split(",")
-PREFERRED_QUOTES = [q.strip().upper() for q in PREFERRED_QUOTES if q.strip()]
+PORT = int(os.getenv("PORT", "10000"))  # Render Web Service
 
 # Estrategia
 USD_MIN = float(os.getenv("USD_MIN", "15"))
 USD_MAX = float(os.getenv("USD_MAX", "20"))
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))            # 5%
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))               # -2%
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "200000"))
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "1"))
@@ -47,48 +31,29 @@ RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "42"))
 RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "58"))
 RSI_SELL_OVERBOUGHT = float(os.getenv("RSI_SELL_OVERBOUGHT", "68"))
 
-# Fallback para no dejar saldo parado si no hay señal RSI
 USE_FALLBACK = os.getenv("USE_FALLBACK", "true").lower() == "true"
-FALLBACK_SYMBOLS = os.getenv("FALLBACK_SYMBOLS", "BTC,ETH,SOL").split(",")
-FALLBACK_SYMBOLS = [s.strip().upper() for s in FALLBACK_SYMBOLS if s.strip()]
+FALLBACK_SYMBOLS = [s.strip().upper() for s in os.getenv("FALLBACK_SYMBOLS", "BTC,ETH,SOL").split(",") if s.strip()]
 
-# Zona horaria
 TZ_NAME = os.getenv("TZ", "Europe/Madrid")
 TIMEZONE = pytz.timezone(TZ_NAME)
 
-# Persistencia
-REGISTRO_FILE = "registro.json"       # posiciones abiertas {symbol: {qty, buy_price, quote, ts}}
-PNL_DIARIO_FILE = "pnl_diario.json"   # {YYYY-MM-DD: pnl_en_quote}
+PREFERRED_QUOTES = [q.strip().upper() for q in os.getenv("PREFERRED_QUOTES", "USDC,USDT,FDUSD,TUSD,BUSD").split(",") if q.strip()]
 
-# Cliente
-client = Client(API_KEY, API_SECRET)
+REGISTRO_FILE = "registro.json"
+PNL_DIARIO_FILE = "pnl_diario.json"
 
-# Estructuras globales (exchangeInfo, filtros, mapa de símbolos)
-EX_INFO = None
-SYMBOL_MAP = {}  # { "BTCUSDC": {"base":"BTC","quote":"USDC","status":"TRADING","filters":{...}} , ... }
+# ───────────── ESTADO GLOBAL ─────────────
+client = None
+EX_INFO_READY = False
+SYMBOL_MAP = {}  # symbol -> {base, quote, status, filters}
 
-# ─────────────────────────  HTTP SERVER (Render)  ─────────────────────────
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        try:
-            if self.path == "/" or self.path == "/health":
-                self.send_response(200)
-                self.send_header("Content-type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b"ok")
-            else:
-                self.send_response(404)
-                self.end_headers()
-        except Exception as e:
-            logger.warning(f"HealthHandler error: {e}")
+def telegram_enabled():
+    return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 
-def run_http_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info(f"HTTP server escuchando en 0.0.0.0:{PORT}")
-    server.serve_forever()
-
-# ─────────────────────────  UTILIDADES  ─────────────────────────
 def enviar_telegram(msg: str):
+    if not telegram_enabled():
+        logger.debug(f"(Telegram OFF) {msg}")
+        return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -98,6 +63,36 @@ def enviar_telegram(msg: str):
     except Exception as e:
         logger.warning(f"Telegram error: {e}")
 
+# ───────────── HTTP para Render ─────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            if self.path == "/health" or self.path == "/":
+                self.send_response(200); self.end_headers()
+                self.wfile.write(b"ok")
+            elif self.path == "/selftest":
+                # pequeño autodiagnóstico
+                status = {
+                    "telegram": "ON" if telegram_enabled() else "OFF",
+                    "binance_client": "READY" if client else "NOT_INIT",
+                    "exchange_info": "READY" if EX_INFO_READY else "LOADING",
+                    "positions_file_exists": os.path.exists(REGISTRO_FILE),
+                    "pnl_file_exists": os.path.exists(PNL_DIARIO_FILE)
+                }
+                body = json.dumps(status).encode()
+                self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404); self.end_headers()
+        except Exception as e:
+            logger.warning(f"HealthHandler error: {e}")
+
+def run_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info(f"HTTP server escuchando en 0.0.0.0:{PORT}")
+    server.serve_forever()
+
+# ───────────── UTILIDADES ─────────────
 def cargar_json(path, default):
     try:
         if os.path.exists(path):
@@ -124,26 +119,49 @@ def actualizar_pnl_diario(delta):
     guardar_json(pnl, PNL_DIARIO_FILE)
     return pnl[d]
 
-def backoff_sleep(e: BinanceAPIException):
-    # Manejo simple para -1003 “request weight”
-    if getattr(e, "code", None) == -1003:
-        logger.warning("Rate limit / weight alto. Pausa 120s.")
+def backoff_sleep(e: Exception):
+    if isinstance(e, BinanceAPIException) and getattr(e, "code", None) == -1003:
+        logger.warning("Rate limit alto (-1003). Pausa 120s.")
         time.sleep(120)
     else:
         time.sleep(2)
 
+def init_binance_client():
+    global client
+    if client is None:
+        if not (API_KEY and API_SECRET):
+            logger.warning("Faltan claves de Binance; el bot no operará hasta que las pongas.")
+            return
+        try:
+            client = Client(API_KEY, API_SECRET)
+            # ping suave
+            client.ping()
+            logger.info("Binance client OK.")
+        except Exception as e:
+            client = None
+            logger.warning(f"No se pudo inicializar Binance client: {e}")
+
 def load_exchange_info():
-    global EX_INFO, SYMBOL_MAP
-    EX_INFO = client.get_exchange_info()
-    for s in EX_INFO["symbols"]:
-        symbol = s["symbol"]
-        filters = {f["filterType"]: f for f in s.get("filters", [])}
-        SYMBOL_MAP[symbol] = {
-            "base": s["baseAsset"],
-            "quote": s["quoteAsset"],
-            "status": s["status"],
-            "filters": filters
-        }
+    global EX_INFO_READY, SYMBOL_MAP
+    if not client: 
+        return
+    try:
+        info = client.get_exchange_info()
+        SYMBOL_MAP.clear()
+        for s in info["symbols"]:
+            filters = {f["filterType"]: f for f in s.get("filters", [])}
+            SYMBOL_MAP[s["symbol"]] = {
+                "base": s["baseAsset"],
+                "quote": s["quoteAsset"],
+                "status": s["status"],
+                "filters": filters
+            }
+        EX_INFO_READY = True
+        logger.info(f"exchangeInfo cargada: {len(SYMBOL_MAP)} símbolos.")
+    except Exception as e:
+        EX_INFO_READY = False
+        logger.warning(f"Fallo cargando exchangeInfo (reintentará): {e}")
+        backoff_sleep(e)
 
 def symbol_exists(base, quote):
     sym = base + quote
@@ -172,27 +190,25 @@ def quantize_qty(qty, step: Decimal):
     d = (Decimal(str(qty)) / step).to_integral_value(rounding=ROUND_DOWN) * step
     return float(d)
 
-def quantize_price(price, tick: Decimal):
-    if tick == 0:
-        return price
-    d = (Decimal(str(price)) / tick).to_integral_value(rounding=ROUND_DOWN) * tick
-    return float(d)
-
 def safe_get_klines(symbol, interval, limit):
     while True:
         try:
             return client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        except BinanceAPIException as e:
+        except Exception as e:
             logger.warning(f"Klines error {symbol}: {e}")
             backoff_sleep(e)
+            if client is None:
+                break
 
 def safe_get_ticker_24h():
     while True:
         try:
             return client.get_ticker()
-        except BinanceAPIException as e:
+        except Exception as e:
             logger.warning(f"get_ticker error: {e}")
             backoff_sleep(e)
+            if client is None:
+                break
 
 def calculate_rsi(closes, period=14):
     if len(closes) <= period:
@@ -201,51 +217,46 @@ def calculate_rsi(closes, period=14):
     delta = np.diff(arr)
     gains = np.where(delta > 0, delta, 0.0)
     losses = np.where(delta < 0, -delta, 0.0)
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
-    if avg_loss == 0:
-        return 100.0
+    avg_gain = np.mean(gains[:period]); avg_loss = np.mean(losses[:period])
+    if avg_loss == 0: return 100.0
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        if avg_loss == 0:
-            return 100.0
+        if avg_loss == 0: return 100.0
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
     return float(rsi)
 
-# ─────────────────────────  ESTRATEGIA  ─────────────────────────
+# ───────────── ESTRATEGIA ─────────────
 def scan_candidatos():
+    if not (client and EX_INFO_READY):
+        return []
     candidatos = []
     tickers = safe_get_ticker_24h()
-
+    if not tickers: return []
     symbols_ok = {s for s, meta in SYMBOL_MAP.items()
                   if meta["status"] == "TRADING" and meta["quote"] in PREFERRED_QUOTES}
-
     by_quote = {q: [] for q in PREFERRED_QUOTES}
     for t in tickers:
         sym = t["symbol"]
-        if sym not in symbols_ok:
-            continue
+        if sym not in symbols_ok: continue
         q = SYMBOL_MAP[sym]["quote"]
         vol = float(t.get("quoteVolume", 0.0))
         if vol >= MIN_QUOTE_VOLUME:
             by_quote[q].append((vol, t))
-
     reduced = []
     for q, arr in by_quote.items():
         arr.sort(key=lambda x: x[0], reverse=True)
         reduced.extend([t for _, t in arr[:80]])
-
     for t in reduced:
         sym = t["symbol"]
         try:
             kl = safe_get_klines(sym, Client.KLINE_INTERVAL_5MINUTE, 60)
+            if not kl: continue
             closes = [float(k[4]) for k in kl]
-            if len(closes) < RSI_PERIOD + 2:
-                continue
+            if len(closes) < RSI_PERIOD + 2: continue
             rsi = calculate_rsi(closes, RSI_PERIOD)
             if closes[-1] > closes[-2] and RSI_BUY_MIN <= rsi <= RSI_BUY_MAX:
                 candidatos.append({
@@ -257,38 +268,39 @@ def scan_candidatos():
                 })
         except Exception as e:
             logger.debug(f"scan cand error {sym}: {e}")
-
     candidatos.sort(key=lambda x: (x["quoteVolume"], -abs(x["rsi"] - (RSI_BUY_MIN + RSI_BUY_MAX)/2)), reverse=True)
     return candidatos
 
-def leer_posiciones():
-    return cargar_json(REGISTRO_FILE, {})
-
-def escribir_posiciones(reg):
-    guardar_json(reg, REGISTRO_FILE)
+def leer_posiciones():  return cargar_json(REGISTRO_FILE, {})
+def escribir_posiciones(reg): guardar_json(reg, REGISTRO_FILE)
 
 def holdings_por_asset():
-    acc = client.get_account()
-    res = {}
-    for b in acc["balances"]:
-        total = float(b["free"]) + float(b["locked"])
-        if total > 0:
-            res[b["asset"]] = total
-    return res
+    if not client: return {}
+    try:
+        acc = client.get_account()
+        res = {}
+        for b in acc["balances"]:
+            total = float(b["free"]) + float(b["locked"])
+            if total > 0: res[b["asset"]] = total
+        return res
+    except Exception as e:
+        logger.warning(f"holdings error: {e}")
+        backoff_sleep(e); return {}
 
 def obtener_precio(symbol):
     while True:
         try:
             t = client.get_ticker(symbol=symbol)
             return float(t["lastPrice"])
-        except BinanceAPIException as e:
+        except Exception as e:
             logger.warning(f"precio error {symbol}: {e}")
             backoff_sleep(e)
+            if client is None: break
 
-def get_filter_values_cached(symbol):
-    return get_filter_values(symbol)
+def get_filter_values_cached(symbol): return get_filter_values(symbol)
 
 def min_notional_ok(symbol, price, qty):
+    if symbol not in SYMBOL_MAP: return False
     _, _, min_notional = get_filter_values_cached(symbol)
     return (price * qty) >= min_notional * 1.02
 
@@ -297,32 +309,26 @@ def next_order_size():
     return round(random.uniform(USD_MIN, USD_MAX), 2)
 
 def comprar_oportunidad():
+    if not (client and EX_INFO_READY): return
     reg = leer_posiciones()
-    if len(reg) >= MAX_OPEN_POSITIONS:
-        logger.info("Máximo de posiciones abiertas alcanzado.")
-        return
-
+    if len(reg) >= MAX_OPEN_POSITIONS: return
     balances = holdings_por_asset()
     for quote in PREFERRED_QUOTES:
-        if len(reg) >= MAX_OPEN_POSITIONS:
-            break
-
+        if len(reg) >= MAX_OPEN_POSITIONS: break
         disponible = float(balances.get(quote, 0.0))
-        intentos_seguridad = 0
+        intentos = 0
         while disponible >= USD_MIN and len(reg) < MAX_OPEN_POSITIONS:
-            intentos_seguridad += 1
-            if intentos_seguridad > 10:
-                break
-
+            intentos += 1
+            if intentos > 10: break
             candidatos = [c for c in scan_candidatos() if c["quote"] == quote and c["symbol"] not in reg]
             elegido = candidatos[0] if candidatos else None
-
             if not elegido and USE_FALLBACK:
                 for base in FALLBACK_SYMBOLS:
                     sym = symbol_exists(base, quote)
-                    if sym and sym not in reg and SYMBOL_MAP[sym]["status"] == "TRADING":
+                    if sym and sym not in reg:
                         try:
                             kl = safe_get_klines(sym, Client.KLINE_INTERVAL_5MINUTE, 30)
+                            if not kl: continue
                             closes = [float(k[4]) for k in kl]
                             rsi = calculate_rsi(closes, RSI_PERIOD)
                             if 35 <= rsi <= 65:
@@ -330,118 +336,89 @@ def comprar_oportunidad():
                                 break
                         except Exception:
                             continue
-
-            if not elegido:
-                logger.info(f"Sin candidato para {quote}; saldo se mantiene hasta próximo ciclo.")
-                break
-
+            if not elegido: break
             symbol = elegido["symbol"]
             price = obtener_precio(symbol)
-            step, tick, _ = get_filter_values_cached(symbol)
-
+            if not price: break
+            step, _, _ = get_filter_values_cached(symbol)
             usd_orden = min(next_order_size(), disponible)
-            qty = usd_orden / price
-            qty = quantize_qty(qty, step)
-
+            qty = quantize_qty(usd_orden / price, step)
             if qty <= 0 or not min_notional_ok(symbol, price, qty):
                 usd_orden = min(max(usd_orden * 1.3, USD_MIN), disponible)
                 qty = quantize_qty(usd_orden / price, step)
                 if qty <= 0 or not min_notional_ok(symbol, price, qty):
-                    logger.info(f"{symbol}: no alcanza minNotional con saldo disponible.")
                     break
-
             try:
                 client.order_market_buy(symbol=symbol, quantity=qty)
-                buy_price = price
                 reg[symbol] = {
                     "qty": float(qty),
-                    "buy_price": float(buy_price),
+                    "buy_price": float(price),
                     "quote": quote,
                     "ts": datetime.now(TIMEZONE).isoformat()
                 }
                 escribir_posiciones(reg)
-                enviar_telegram(f"🟢 Compra {symbol} qty={qty} @ {buy_price:.8f} {quote} | RSI {round(elegido.get('rsi', 50),1)}")
-                logger.info(f"Comprado {symbol} qty={qty} a {buy_price}")
+                enviar_telegram(f"🟢 Compra {symbol} qty={qty} @ {price:.8f} {quote} | RSI {round(elegido.get('rsi', 50),1)}")
                 balances = holdings_por_asset()
                 disponible = float(balances.get(quote, 0.0))
-            except BinanceAPIException as e:
-                logger.error(f"Error comprando {symbol}: {e}")
-                backoff_sleep(e)
-                break
+            except Exception as e:
+                logger.error(f"Compra error {symbol}: {e}")
+                backoff_sleep(e); break
 
 def gestionar_posiciones():
+    if not (client and EX_INFO_READY): return
     reg = leer_posiciones()
-    if not reg:
-        return
-
+    if not reg: return
     nuevos = {}
     for symbol, data in reg.items():
         try:
-            qty = float(data["qty"])
-            buy_price = float(data["buy_price"])
-            quote = data["quote"]
-
-            if qty <= 0:
-                continue
-
+            qty = float(data["qty"]); buy_price = float(data["buy_price"]); quote = data["quote"]
+            if qty <= 0: continue
             price = obtener_precio(symbol)
+            if not price: 
+                nuevos[symbol] = data; continue
             change = (price - buy_price) / buy_price
-
             kl = safe_get_klines(symbol, Client.KLINE_INTERVAL_5MINUTE, 60)
+            if not kl:
+                nuevos[symbol] = data; continue
             closes = [float(k[4]) for k in kl]
             rsi = calculate_rsi(closes, RSI_PERIOD)
-
-            tp = change >= TAKE_PROFIT
-            sl = change <= STOP_LOSS
-            ob = rsi >= RSI_SELL_OVERBOUGHT
-
+            tp = change >= TAKE_PROFIT; sl = change <= STOP_LOSS; ob = rsi >= RSI_SELL_OVERBOUGHT
             if tp or sl or ob:
-                step, tick, _ = get_filter_values_cached(symbol)
+                step, _, _ = get_filter_values_cached(symbol)
                 qty_q = quantize_qty(qty, step)
-                if qty_q <= 0:
-                    continue
+                if qty_q <= 0: continue
                 client.order_market_sell(symbol=symbol, quantity=qty_q)
                 realized = (price - buy_price) * qty_q
                 total_pnl = actualizar_pnl_diario(realized)
                 motivo = "TP" if tp else ("SL" if sl else "RSI")
                 enviar_telegram(f"🔴 Venta {symbol} qty={qty_q} @ {price:.8f} ({change*100:.2f}%) Motivo: {motivo} RSI:{rsi:.1f} | PnL: {realized:.4f} {quote} | PnL hoy: {total_pnl:.4f}")
-                logger.info(f"Vendido {symbol} por {motivo} PnL={realized:.6f} {quote}")
             else:
                 nuevos[symbol] = data
-        except BinanceAPIException as e:
-            logger.error(f"Error gestionando {symbol}: {e}")
-            backoff_sleep(e)
-            nuevos[symbol] = data
         except Exception as e:
-            logger.error(f"Error interno {symbol}: {e}")
-            nuevos[symbol] = data
-
+            logger.error(f"Gestion error {symbol}: {e}")
+            backoff_sleep(e); nuevos[symbol] = data
     escribir_posiciones(nuevos)
 
 def limpiar_dust():
+    if not (client and EX_INFO_READY): return
     try:
         reg = leer_posiciones()
         activos_reg = {SYMBOL_MAP[s]["base"] for s in reg.keys() if s in SYMBOL_MAP}
-
         bals = holdings_por_asset()
         for asset, qty in bals.items():
-            if asset in PREFERRED_QUOTES or qty <= 0:
-                continue
-            if asset in activos_reg:
-                continue
+            if asset in PREFERRED_QUOTES or qty <= 0: continue
+            if asset in activos_reg: continue
             sym, q = find_best_route(asset, PREFERRED_QUOTES)
-            if not sym:
-                continue
+            if not sym: continue
             price = obtener_precio(sym)
-            step, tick, _ = get_filter_values_cached(sym)
+            if not price: continue
+            step, _, _ = get_filter_values(sym)
             qty_sell = quantize_qty(qty, step)
-            if qty_sell <= 0 or not min_notional_ok(sym, price, qty_sell):
-                continue
+            if qty_sell <= 0 or not min_notional_ok(sym, price, qty_sell): continue
             try:
                 client.order_market_sell(symbol=sym, quantity=qty_sell)
                 enviar_telegram(f"🧹 Limpieza: vendido {qty_sell} {asset} -> {q}")
-                logger.info(f"Limpieza {asset} via {sym}")
-            except BinanceAPIException as e:
+            except Exception as e:
                 logger.debug(f"No se pudo limpiar {asset}: {e}")
                 backoff_sleep(e)
     except Exception as e:
@@ -449,14 +426,15 @@ def limpiar_dust():
 
 def resumen_diario():
     try:
-        cuenta = client.get_account()
+        if client:
+            cuenta = client.get_account()
+        else:
+            cuenta = {"balances": []}
         pnl = cargar_json(PNL_DIARIO_FILE, {})
-        d = hoy_str()
-        pnl_hoy = pnl.get(d, 0.0)
-        mensaje = [f"📊 Resumen diario ({d}, {TZ_NAME}):", f"PNL hoy: {pnl_hoy:.4f}"]
-        mensaje.append("Balances (principales):")
-        for b in cuenta["balances"]:
-            total = float(b["free"]) + float(b["locked"])
+        d = hoy_str(); pnl_hoy = pnl.get(d, 0.0)
+        mensaje = [f"📊 Resumen diario ({d}, {TZ_NAME}):", f"PNL hoy: {pnl_hoy:.4f}", "Balances:"]
+        for b in cuenta.get("balances", []):
+            total = float(b.get("free",0)) + float(b.get("locked",0))
             if total >= 0.001:
                 mensaje.append(f"• {b['asset']}: {total:.6f}")
         enviar_telegram("\n".join(mensaje))
@@ -474,26 +452,29 @@ def ciclo():
     except Exception as e:
         logger.error(f"Ciclo error: {e}")
 
-# ─────────────────────────  ARRANQUE  ─────────────────────────
+# ───────────── ARRANQUE ROBUSTO ─────────────
+def init_loop():
+    """Reintenta cliente y exchangeInfo en background sin tumbar proceso."""
+    global EX_INFO_READY
+    while True:
+        if client is None:
+            init_binance_client()
+        if client and not EX_INFO_READY:
+            load_exchange_info()
+        time.sleep(10)
+
 def run_bot():
-    try:
-        enviar_telegram("🤖 Bot spot activo (sin Grok). RSI 5m, TP 5%, SL 2%, órdenes 15–20 USDC. 🚍")
-        logger.info("Cargando exchange info…")
-        load_exchange_info()
-        logger.info("Exchange info cargada.")
-        scheduler = BackgroundScheduler(timezone=TIMEZONE)
-        scheduler.add_job(ciclo, 'interval', minutes=INTERVAL_MINUTES, max_instances=1)
-        scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA_LOCAL, minute=0)
-        scheduler.start()
-    except Exception as e:
-        logger.exception(f"Fallo crítico al iniciar el bot: {e}")
-        enviar_telegram(f"⚠️ Fallo crítico al iniciar el bot: {e}")
+    enviar_telegram("🤖 Bot spot activo (sin Grok). RSI 5m, TP 5%, SL 2%, órdenes 15–20 USDC.")
+    scheduler = BackgroundScheduler(timezone=TIMEZONE)
+    scheduler.add_job(ciclo, 'interval', minutes=INTERVAL_MINUTES, max_instances=1)
+    scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA_LOCAL, minute=0)
+    scheduler.add_job(load_exchange_info, 'interval', minutes=15)  # refresco periódico de exchangeInfo
+    scheduler.start()
 
 def main():
-    # Lanzar bot en hilo
-    t = threading.Thread(target=run_bot, daemon=True)
-    t.start()
-    # Mantener proceso vivo con servidor HTTP
+    # Hilos: init (reintentos), bot (jobs), http (health)
+    threading.Thread(target=init_loop, daemon=True).start()
+    threading.Thread(target=run_bot, daemon=True).start()
     run_http_server()
 
 if __name__ == "__main__":
