@@ -23,17 +23,17 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
 MIN_VOLUME = Decimal('10000')  # Mínimo volumen
-MIN_SALDO_COMPRA = Decimal('0.5')  # Para saldos bajos
-PORCENTAJE_USDC = Decimal('1.0')  # 100% del saldo por trade
+MIN_SALDO_COMPRA = Decimal('15')  # Mínimo saldo para una compra
+COMPRA_POR_CRIPTO = Decimal('15')  # $15 por crypto
 ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'SHIBUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']
-TAKE_PROFIT = Decimal('0.10')  # 10% para mayores ganancias
+TAKE_PROFIT = Decimal('0.05')  # 5% para mayores ganancias
 STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
-TRAILING_STOP = Decimal('0.02')  # 2% para aguantar más subidas
-TRADE_COOLDOWN_SEC = 60  # Cada 1 minuto para menos frecuencia
+TRAILING_STOP = Decimal('0.01')  # 1% para proteger subidas
+TRADE_COOLDOWN_SEC = 30  # Para más trades
 PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger saldo
 CRITICAL_SALDO = Decimal('3')  # Pausar si saldo < 3 USDC
-NOTIFICATION_COOLDOWN_MIN = 10  # Notificación cada 10 minutos para menos spam
+NOTIFICATION_COOLDOWN_MIN = 5  # Notificación cada 5 minutos
 NO_BUY_CYCLES_THRESHOLD = 3  # Forzar compras tras 3 ciclos sin éxito
 TZ_MADRID = pytz.timezone("Europe/Madrid")
 RESUMEN_HORA = 23
@@ -261,7 +261,7 @@ def safe_get_balance(asset):
         enviar_telegram(f"⚠️ Error inesperado en balance {asset}: {e}")
         return Decimal('0')
 
-def mejores_criptos(max_candidates=3):
+def mejores_criptos(max_candidates=10):
     try:
         candidates = []
         for sym in ALLOWED_SYMBOLS:
@@ -281,12 +281,10 @@ def mejores_criptos(max_candidates=3):
             time.sleep(0.05)
         if not candidates and no_buy_cycles >= NO_BUY_CYCLES_THRESHOLD:
             logger.warning("Forzando compras tras 3 ciclos sin candidatos.")
-            return [get_cached_ticker(random.choice(ALLOWED_SYMBOLS)) for _ in range(min(3, len(ALLOWED_SYMBOLS)))]
+            return [get_cached_ticker(random.choice(ALLOWED_SYMBOLS)) for _ in range(min(5, len(ALLOWED_SYMBOLS)))]
         if not candidates:
             logger.warning("No hay criptos con volumen suficiente.")
-            if time.time() - last_no_buy_notification >= NOTIFICATION_COOLDOWN_MIN * 60:
-                enviar_telegram("⚠️ No hay criptos con volumen suficiente (>10000 USDC).")
-                last_no_buy_notification = time.time()
+            enviar_telegram("⚠️ No hay criptos con volumen suficiente (>10000 USDC).")
             return []
         filtered = []
         for t in sorted(candidates, key=lambda x: Decimal(str(x.get("quoteVolume", 0) or 0)), reverse=True)[:max_candidates]:
@@ -308,9 +306,7 @@ def mejores_criptos(max_candidates=3):
         return sorted_filtered
     except Exception as e:
         logger.error(f"Error obteniendo mejores criptos: {e}")
-        if time.time() - last_no_buy_notification >= NOTIFICATION_COOLDOWN_MIN * 60:
-            enviar_telegram(f"⚠️ Error obteniendo criptos: {e}")
-            last_no_buy_notification = time.time()
+        enviar_telegram(f"⚠️ Error obteniendo criptos: {e}")
         return []
 
 def base_from_symbol(symbol: str) -> str:
@@ -710,3 +706,4 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
         logger.info("Bot detenido.")
+```
