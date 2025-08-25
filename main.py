@@ -61,6 +61,8 @@ def get_cached_ticker(symbol):
             TICKERS_CACHE[symbol] = {'data': t, 'ts': now}
             logger.debug(f"Ticker actualizado para {symbol}: {t['lastPrice']}")
             return t
+    except BinanceAPIException as e:
+        logger.error(f"Error Binance fetching ticker {symbol}: {e}")
     except Exception as e:
         logger.error(f"Error fetching ticker {symbol} via API: {e}")
     return None
@@ -138,10 +140,13 @@ def debug_balances():
         mensaje += f"Valor total cartera: {total_value:.2f} {MONEDA_BASE}"
         enviar_telegram(mensaje)
         return total_value
+    except BinanceAPIException as e:
+        logger.error(f"Error Binance en debug balances: {e}")
+        enviar_telegram(f"⚠️ Error en balances: {e}")
     except Exception as e:
         logger.error(f"Error debug balances: {e}")
         enviar_telegram(f"⚠️ Error en balances: {e}")
-        return Decimal('0')
+    return Decimal('0')
 
 def actualizar_pnl_diario(realized_pnl, fees=Decimal('0.1')):
     with LOCK:
@@ -211,6 +216,8 @@ def load_symbol_info(symbol):
         SYMBOL_CACHE[symbol] = meta
         logger.debug(f"Info símbolo {symbol} cargada: {meta}")
         return meta
+    except BinanceAPIException as e:
+        logger.error(f"Error Binance cargando info de {symbol}: {e}")
     except Exception as e:
         logger.info(f"Error cargando info de {symbol}: {e}")
         INVALID_SYMBOL_CACHE.add(symbol)
@@ -245,6 +252,8 @@ def safe_get_ticker(symbol):
             TICKERS_CACHE[symbol] = {'data': t, 'ts': now}
             logger.debug(f"Ticker actualizado para {symbol}: {t['lastPrice']}")
             return t
+    except BinanceAPIException as e:
+        logger.error(f"Error Binance fetching ticker {symbol}: {e}")
     except Exception as e:
         logger.error(f"Error fetching ticker {symbol} via API: {e}")
     return None
@@ -267,11 +276,10 @@ def safe_get_balance(asset):
     except BinanceAPIException as e:
         logger.error(f"Error BinanceAPI obteniendo balance {asset}: {e}")
         enviar_telegram(f"⚠️ Error en balance {asset}: {e}")
-        return Decimal('0')
     except Exception as e:
         logger.error(f"Error inesperado obteniendo balance {asset}: {e}")
         enviar_telegram(f"⚠️ Error inesperado en balance {asset}: {e}")
-        return Decimal('0')
+    return Decimal('0')
 
 def mejores_criptos(max_candidates=10):
     try:
@@ -316,10 +324,13 @@ def mejores_criptos(max_candidates=10):
         sorted_filtered = sorted(filtered, key=lambda x: x.get('score', 0), reverse=True)
         logger.debug(f"Mejores criptos: {[t['symbol'] for t in sorted_filtered]}")
         return sorted_filtered
+    except BinanceAPIException as e:
+        logger.error(f"Error Binance obteniendo mejores criptos: {e}")
+        enviar_telegram(f"⚠️ Error Binance obteniendo criptos: {e}")
     except Exception as e:
         logger.error(f"Error obteniendo mejores criptos: {e}")
         enviar_telegram(f"⚠️ Error obteniendo criptos: {e}")
-        return []
+    return []
 
 def base_from_symbol(symbol: str) -> str:
     if symbol.endswith(MONEDA_BASE):
@@ -348,9 +359,11 @@ def precio_medio_si_hay(symbol, lookback_days=30):
             qty_sum += qty
         if qty_sum > 0:
             return float(cost_sum / qty_sum)
+    except BinanceAPIException as e:
+        logger.warning(f"Error Binance calculando precio medio {symbol}: {e}")
     except Exception as e:
         logger.warning(f"No se pudo calcular precio medio {symbol}: {e}")
-        return None
+    return None
 
 def inicializar_registro():
     with LOCK:
@@ -390,6 +403,9 @@ def inicializar_registro():
                     logger.info(f"Saldo {MONEDA_BASE}: {free}")
             guardar_json(registro, REGISTRO_FILE)
         except BinanceAPIException as e:
+            logger.error(f"Error Binance inicializando registro: {e}")
+            enviar_telegram(f"⚠️ Error Binance inicializando registro: {e}")
+        except Exception as e:
             logger.error(f"Error inicializando registro: {e}")
             enviar_telegram(f"⚠️ Error inicializando registro: {e}")
 
@@ -458,6 +474,9 @@ def resumen_diario():
         pnl_data = {k: v for k, v in pnl_data.items() if k >= seven_days_ago}
         guardar_json(pnl_data, PNL_DIARIO_FILE)
     except BinanceAPIException as e:
+        logger.error(f"Error Binance en resumen diario: {e}")
+        enviar_telegram(f"⚠️ Error Binance en resumen diario: {e}")
+    except Exception as e:
         logger.error(f"Error en resumen diario: {e}")
         enviar_telegram(f"⚠️ Error en resumen diario: {e}")
 
@@ -558,8 +577,8 @@ def comprar():
                 saldo_spot -= quote_to_spend
             except BinanceAPIException as e:
                 no_compradas_razon.append(f"{symbol}: error API ({e})")
-                logger.error(f"Error comprando {symbol}: {e}")
-                enviar_telegram(f"⚠️ Error comprando {symbol}: {e}")
+                logger.error(f"Error Binance comprando {symbol}: {e}")
+                enviar_telegram(f"⚠️ Error Binance comprando {symbol}: {e}")
             except Exception as e:
                 no_compradas_razon.append(f"{symbol}: error inesperado ({e})")
                 logger.error(f"Error inesperado comprando {symbol}: {e}")
@@ -570,6 +589,9 @@ def comprar():
             logger.warning(f"No se realizaron compras en este ciclo. {razon_msg}")
             enviar_telegram(f"⚠️ No se realizaron compras en este ciclo. {razon_msg}")
             last_no_buy_notification = time.time()
+    except BinanceAPIException as e:
+        logger.error(f"Error Binance general en compra: {e}")
+        enviar_telegram(f"⚠️ Error Binance general en compra: {e}")
     except Exception as e:
         logger.error(f"Error general en compra: {e}")
         enviar_telegram(f"⚠️ Error general en compra: {e}")
@@ -638,6 +660,11 @@ def vender_y_convertir():
                         )
                         comprar()
                     except BinanceAPIException as e:
+                        logger.error(f"Error Binance vendiendo {symbol}: {e}")
+                        enviar_telegram(f"⚠️ Error Binance vendiendo {symbol}: {e}")
+                        dust_positions.append(symbol)
+                        continue
+                    except Exception as e:
                         logger.error(f"Error vendiendo {symbol}: {e}")
                         enviar_telegram(f"⚠️ Error vendiendo {symbol}: {e}")
                         dust_positions.append(symbol)
@@ -646,10 +673,14 @@ def vender_y_convertir():
                     nuevos_registro[symbol] = data
                     logger.debug(f"No se vende {symbol}: Cambio={float(cambio)*100:.2f}%, Ganancia neta={float(ganancia_neta):.4f}")
                 time.sleep(1)
-            limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
-            guardar_json(limpio, REGISTRO_FILE)
+            limpo = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
+            guardar_json(limpo, REGISTRO_FILE)
             if dust_positions:
                 enviar_telegram(f"🧹 Limpiado dust: {', '.join(dust_positions)}")
+        except BinanceAPIException as e:
+            logger.error(f"Error Binance en bloque de venta: {e}")
+            enviar_telegram(f"⚠️ Error Binance en bloque de venta: {e}")
+            guardar_json(nuevos_registro, REGISTRO_FILE)
         except Exception as e:
             logger.error(f"Error en bloque de venta: {e}")
             enviar_telegram(f"⚠️ Error en bloque de venta: {e}")
@@ -700,9 +731,15 @@ def vender_y_convertir():
                                 del registro[worst_sym]
                                 guardar_json(registro, REGISTRO_FILE)
                                 comprar()
+                            except BinanceAPIException as e:
+                                logger.error(f"Error Binance en rotación {worst_sym}: {e}")
+                                enviar_telegram(f"⚠️ Error Binance en rotación: {e}")
                             except Exception as e:
-                                logger.error(f"Error en venta por rotación {worst_sym}: {e}")
+                                logger.error(f"Error en rotación {worst_sym}: {e}")
                                 enviar_telegram(f"⚠️ Error en rotación: {e}")
+        except BinanceAPIException as e:
+            logger.error(f"Error Binance en bloque de rotación: {e}")
+            enviar_telegram(f"⚠️ Error Binance en rotación: {e}")
         except Exception as e:
             logger.error(f"Error en bloque de rotación: {e}")
             enviar_telegram(f"⚠️ Error en rotación: {e}")
