@@ -466,8 +466,14 @@ def comprar():
             logger.info(f"Saldo crítico: {saldo_spot} < {CRITICAL_SALDO}. Pausando compras.")
             enviar_telegram(f"⚠️ Saldo crítico: {saldo_spot} {MONEDA_BASE}. Pausando compras.")
             return
-        cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot)
-        criptos = mejores_criptos()
+        # Calcular cuántas compras de $15 se pueden hacer con el saldo disponible
+        max_compras = int(saldo_spot // COMPRA_POR_CRIPTO)
+        if max_compras == 0:
+            logger.info(f"No hay suficiente saldo para al menos una compra de {COMPRA_POR_CRIPTO} {MONEDA_BASE}")
+            enviar_telegram(f"⚠️ No hay suficiente saldo para al menos una compra de {COMPRA_POR_CRIPTO} {MONEDA_BASE}")
+            return
+        cantidad_usdc = min(COMPRA_POR_CRIPTO * max_compras, saldo_spot)  # Usar el 100% del saldo en múltiplos de $15
+        criptos = mejores_criptos(max_candidates=max_compras)  # Limitar candidatos al número de compras posibles
         if not criptos:
             no_buy_cycles += 1
             logger.info("No hay criptos candidatas para comprar.")
@@ -504,11 +510,11 @@ def comprar():
                 no_compradas_razon.append(f"{symbol}: sin info de símbolo")
                 logger.debug(f"No meta para {symbol}")
                 continue
-            quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
-            if quote_to_spend > saldo_spot:
-                no_compradas_razon.append(f"{symbol}: saldo insuficiente ({quote_to_spend} > {saldo_spot})")
-                logger.info(f"{symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
-                enviar_telegram(f"⚠️ {symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
+            min_notional = min_quote_for_market(symbol)
+            quote_to_spend = max(COMPRA_POR_CRIPTO * (Decimal('1') - COMMISSION_RATE), min_notional)
+            if quote_to_spend > saldo_spot or compradas * COMPRA_POR_CRIPTO >= saldo_spot:
+                no_compradas_razon.append(f"{symbol}: no hay suficiente saldo restante ({saldo_spot} < {quote_to_spend})")
+                logger.debug(f"{symbol}: no hay suficiente saldo restante para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
                 continue
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
             try:
@@ -518,7 +524,7 @@ def comprar():
                         symbol=symbol,
                         side="BUY",
                         type="MARKET",
-                        quoteOrderQty=format(quote_to_spend, 'f')
+                        quoteOrderQty=format(float(quote_to_spend), 'f')
                     ),
                     tries=3, base_delay=0.5
                 )
@@ -539,6 +545,7 @@ def comprar():
                 compradas += 1
                 ULTIMA_COMPRA[symbol] = now_ts
                 ULTIMAS_OPERACIONES.append(now_ts)
+                saldo_spot -= quote_to_spend  # Actualizar saldo restante
             except BinanceAPIException as e:
                 no_compradas_razon.append(f"{symbol}: error API ({e})")
                 logger.error(f"Error comprando {symbol}: {e}")
@@ -693,7 +700,7 @@ def vender_y_convertir():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=10%, 60s checks, rotación tras 30min, operaciones mayores.")
+    enviar_telegram("🤖 Bot IA: Usa $15 por cripto, 100% del saldo, TAKE_PROFIT=5%, 30s checks, rotación tras 30min.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
     scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
@@ -706,4 +713,3 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
         logger.info("Bot detenido.")
-```
