@@ -11,6 +11,7 @@ import pytz
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
+from binance.websockets import BinanceSocketManager
 
 # Logging — DEBUG para rastrear todo
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -23,14 +24,14 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
 MONEDA_BASE = "USDC"
 MIN_VOLUME = Decimal('10000')  # Mínimo volumen
-MIN_SALDO_COMPRA = Decimal('15')  # Mínimo saldo para una compra
-COMPRA_POR_CRIPTO = Decimal('15')  # $15 por crypto
-ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'SHIBUSDC', 'MATICUSDC', 'TRXUSDC', 'VETUSDC', 'HBARUSDC', 'LINKUSDC', 'DOTUSDC', 'AVAXUSDC']
+MIN_SALDO_COMPRA = Decimal('0.5')  # Para saldos bajos
+PORCENTAJE_USDC = Decimal('0.8')  # ~80% del saldo por trade (margen de seguridad)
+ALLOWED_SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'AVAXUSDC']  # Reducido a 5 para menos requests
 TAKE_PROFIT = Decimal('0.05')  # 5% para mayores ganancias
 STOP_LOSS = Decimal('-0.01')  # -1%
 COMMISSION_RATE = Decimal('0.001')
 TRAILING_STOP = Decimal('0.01')  # 1% para proteger subidas
-TRADE_COOLDOWN_SEC = 30  # Para más trades
+TRADE_COOLDOWN_SEC = 60  # Cada 60 segundos para reducir requests
 PERDIDA_MAXIMA_DIARIA = Decimal('20')  # Proteger saldo
 CRITICAL_SALDO = Decimal('3')  # Pausar si saldo < 3 USDC
 NOTIFICATION_COOLDOWN_MIN = 5  # Notificación cada 5 minutos
@@ -48,8 +49,26 @@ ULTIMA_COMPRA = {}
 ULTIMAS_OPERACIONES = []
 DUST_THRESHOLD = Decimal('0.1')
 TICKERS_CACHE = {}
+BALANCES_CACHE = {}
 last_no_buy_notification = 0  # Para limitar notificaciones
 no_buy_cycles = 0  # Contador de ciclos sin compras
+
+def process_ticker(msg):
+    for t in msg:
+        symbol = t['s']
+        if symbol in ALLOWED_SYMBOLS:
+            TICKERS_CACHE[symbol] = {'data': t, 'ts': time.time()}
+
+def process_user(msg):
+    if msg['e'] == 'outboundAccountPosition':
+        for b in msg['B']:
+            asset = b['a']
+            BALANCES_CACHE[asset] = {'free': Decimal(b['f']), 'locked': Decimal(b['l'])}
+    elif msg['e'] == 'balanceUpdate':
+        asset = msg['a']
+        free_delta = Decimal(msg['d'])
+        if asset in BALANCES_CACHE:
+            BALANCES_CACHE[asset]['free'] += free_delta
 
 def get_cached_ticker(symbol):
     now = time.time()
@@ -128,6 +147,7 @@ def debug_balances():
             total = Decimal(str(float(b['free']) + float(b['locked'])))
             if total > Decimal('0.0001'):
                 logger.info(f"{b['asset']}: free={b['free']}, locked={b['locked']}, total={total}")
+                BALANCES_CACHE[b['asset']] = {'free': Decimal(b['free']), 'locked': Decimal(b['locked'])}
                 if b['asset'] == MONEDA_BASE:
                     total_value += total
                 elif b['asset'] + MONEDA_BASE in ALLOWED_SYMBOLS:
@@ -466,14 +486,8 @@ def comprar():
             logger.info(f"Saldo crítico: {saldo_spot} < {CRITICAL_SALDO}. Pausando compras.")
             enviar_telegram(f"⚠️ Saldo crítico: {saldo_spot} {MONEDA_BASE}. Pausando compras.")
             return
-        # Calcular cuántas compras de $15 se pueden hacer con el saldo disponible
-        max_compras = int(saldo_spot // COMPRA_POR_CRIPTO)
-        if max_compras == 0:
-            logger.info(f"No hay suficiente saldo para al menos una compra de {COMPRA_POR_CRIPTO} {MONEDA_BASE}")
-            enviar_telegram(f"⚠️ No hay suficiente saldo para al menos una compra de {COMPRA_POR_CRIPTO} {MONEDA_BASE}")
-            return
-        cantidad_usdc = min(COMPRA_POR_CRIPTO * max_compras, saldo_spot)  # Usar el 100% del saldo en múltiplos de $15
-        criptos = mejores_criptos(max_candidates=max_compras)  # Limitar candidatos al número de compras posibles
+        cantidad_usdc = min(saldo_spot * PORCENTAJE_USDC, saldo_spot)
+        criptos = mejores_criptos()
         if not criptos:
             no_buy_cycles += 1
             logger.info("No hay criptos candidatas para comprar.")
@@ -510,11 +524,11 @@ def comprar():
                 no_compradas_razon.append(f"{symbol}: sin info de símbolo")
                 logger.debug(f"No meta para {symbol}")
                 continue
-            min_notional = min_quote_for_market(symbol)
-            quote_to_spend = max(COMPRA_POR_CRIPTO * (Decimal('1') - COMMISSION_RATE), min_notional)
-            if quote_to_spend > saldo_spot or compradas * COMPRA_POR_CRIPTO >= saldo_spot:
-                no_compradas_razon.append(f"{symbol}: no hay suficiente saldo restante ({saldo_spot} < {quote_to_spend})")
-                logger.debug(f"{symbol}: no hay suficiente saldo restante para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
+            quote_to_spend = cantidad_usdc * (Decimal('1') - COMMISSION_RATE)
+            if quote_to_spend > saldo_spot:
+                no_compradas_razon.append(f"{symbol}: saldo insuficiente ({quote_to_spend} > {saldo_spot})")
+                logger.info(f"{symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
+                enviar_telegram(f"⚠️ {symbol}: saldo insuficiente para {quote_to_spend} {MONEDA_BASE}, disponible: {saldo_spot}")
                 continue
             quote_to_spend = quantize_quote(quote_to_spend, meta["tickSize"])
             try:
@@ -524,7 +538,7 @@ def comprar():
                         symbol=symbol,
                         side="BUY",
                         type="MARKET",
-                        quoteOrderQty=format(float(quote_to_spend), 'f')
+                        quoteOrderQty=format(quote_to_spend, 'f')
                     ),
                     tries=3, base_delay=0.5
                 )
@@ -545,7 +559,6 @@ def comprar():
                 compradas += 1
                 ULTIMA_COMPRA[symbol] = now_ts
                 ULTIMAS_OPERACIONES.append(now_ts)
-                saldo_spot -= quote_to_spend  # Actualizar saldo restante
             except BinanceAPIException as e:
                 no_compradas_razon.append(f"{symbol}: error API ({e})")
                 logger.error(f"Error comprando {symbol}: {e}")
@@ -700,7 +713,7 @@ def vender_y_convertir():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    enviar_telegram("🤖 Bot IA: Usa $15 por cripto, 100% del saldo, TAKE_PROFIT=5%, 30s checks, rotación tras 30min.")
+    enviar_telegram("🤖 Bot IA Ultra Agresivo: Mueve ~160 USDC en cualquier cripto, sin tope de trades/posiciones, TAKE_PROFIT=10%, 60s checks, rotación tras 30min, operaciones mayores.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
     scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
@@ -713,3 +726,4 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
         logger.info("Bot detenido.")
+```
