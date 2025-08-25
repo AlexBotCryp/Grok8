@@ -24,7 +24,6 @@ TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))          # 5%
 STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))             # -2%
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "200000"))
-INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "1"))
 RESUMEN_HORA_LOCAL = int(os.getenv("RESUMEN_HORA", "23"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "42"))
@@ -38,6 +37,12 @@ TZ_NAME = os.getenv("TZ", "Europe/Madrid")
 TIMEZONE = pytz.timezone(TZ_NAME)
 
 PREFERRED_QUOTES = [q.strip().upper() for q in os.getenv("PREFERRED_QUOTES", "USDC,USDT,FDUSD,TUSD,BUSD").split(",") if q.strip()]
+
+# Ciclos rápidos
+FAST_SEC = int(os.getenv("FAST_SEC", "20"))            # gestionar_posiciones
+BUY_SEC  = int(os.getenv("BUY_SEC", "90"))             # comprar_oportunidad
+DUST_MIN = int(os.getenv("DUST_MIN", "12"))            # limpiar_dust
+SCAN_COOLDOWN_SEC = int(os.getenv("SCAN_COOLDOWN_SEC", "90"))  # caché escaneo
 
 # Stables y blacklist
 STABLES = [s.strip().upper() for s in os.getenv(
@@ -53,6 +58,10 @@ PNL_DIARIO_FILE = "pnl_diario.json"
 client = None
 EX_INFO_READY = False
 SYMBOL_MAP = {}  # symbol -> {base, quote, status, filters, isSpotAllowed, permissions}
+
+# Caché candidatos
+CAND_CACHE_TS = 0.0
+CAND_CACHE = []
 
 # ───────────── TELEGRAM ─────────────
 def telegram_enabled():
@@ -240,7 +249,7 @@ def calculate_rsi(closes, period=14):
         rsi = 100 - (100 / (1 + rs))
     return float(rsi)
 
-# ───────────── ESTRATEGIA ─────────────
+# ───────────── ESTRATEGIA + CACHÉ ─────────────
 def scan_candidatos():
     if not (client and EX_INFO_READY):
         return []
@@ -297,6 +306,16 @@ def scan_candidatos():
     candidatos.sort(key=lambda x: (x["quoteVolume"], -abs(x["rsi"] - (RSI_BUY_MIN + RSI_BUY_MAX)/2)), reverse=True)
     return candidatos
 
+def get_candidates_cached():
+    global CAND_CACHE_TS, CAND_CACHE
+    now = time.time()
+    if (now - CAND_CACHE_TS) < SCAN_COOLDOWN_SEC and CAND_CACHE:
+        return CAND_CACHE
+    items = scan_candidatos()
+    CAND_CACHE = items
+    CAND_CACHE_TS = now
+    return items
+
 def leer_posiciones():  return cargar_json(REGISTRO_FILE, {})
 def escribir_posiciones(reg): guardar_json(reg, REGISTRO_FILE)
 
@@ -348,8 +367,7 @@ def comprar_oportunidad():
             intentos += 1
             if intentos > 10: break
 
-            # Candidatos por RSI para ESTA quote
-            cand_all = scan_candidatos()
+            cand_all = get_candidates_cached()
             candidatos = [c for c in cand_all if c["quote"] == quote and c["symbol"] not in reg]
             elegido = candidatos[0] if candidatos else None
 
@@ -479,7 +497,6 @@ def limpiar_dust():
                 continue
             sym, q = find_best_route(asset, PREFERRED_QUOTES)
             if not sym or sym in NOT_PERMITTED: continue
-            # evitar vender hacia par donde la base sea estable
             if SYMBOL_MAP[sym]["base"] in STABLES: continue
             price = obtener_precio(sym)
             if not price: continue
@@ -519,15 +536,13 @@ def resumen_diario():
     except Exception as e:
         logger.warning(f"Resumen diario error: {e}")
 
-def ciclo():
-    try:
-        gestionar_posiciones()
-        comprar_oportunidad()   # intenta gastar la quote hasta ~0 (dentro de filtros)
-        limpiar_dust()
-    except Exception as e:
-        logger.error(f"Ciclo error: {e}")
+# ───────────── ARRANQUE Y SCHEDULER ─────────────
+def ciclo_dummy():
+    # (ya no se usa; mantenido por compatibilidad si ves logs viejos)
+    gestionar_posiciones()
+    comprar_oportunidad()
+    limpiar_dust()
 
-# ───────────── ARRANQUE ROBUSTO ─────────────
 def init_loop():
     """Reintenta cliente y exchangeInfo en background sin tumbar proceso."""
     global EX_INFO_READY
@@ -539,11 +554,13 @@ def init_loop():
         time.sleep(10)
 
 def run_bot():
-    enviar_telegram("🤖 Bot spot activo (sin Grok). RSI 5m, TP 5%, SL 2%, órdenes 15–20 USDC. Sin stables↔stables.")
+    enviar_telegram(f"🤖 Bot spot activo. Posiciones cada {FAST_SEC}s, compras cada {BUY_SEC}s, limpieza cada {DUST_MIN}min. TP 5%, SL 2%, órdenes 15–20 USDC. Sin stables↔stables.")
     scheduler = BackgroundScheduler(timezone=TIMEZONE)
-    scheduler.add_job(ciclo, 'interval', minutes=INTERVAL_MINUTES, max_instances=1)
-    scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA_LOCAL, minute=0)
-    scheduler.add_job(load_exchange_info, 'interval', minutes=15)  # refresco periódico
+    scheduler.add_job(gestionar_posiciones, 'interval', seconds=FAST_SEC, max_instances=1)
+    scheduler.add_job(comprar_oportunidad,   'interval', seconds=BUY_SEC,  max_instances=1)
+    scheduler.add_job(limpiar_dust,         'interval', minutes=DUST_MIN, max_instances=1)
+    scheduler.add_job(resumen_diario,       'cron',     hour=RESUMEN_HORA_LOCAL, minute=0)
+    scheduler.add_job(load_exchange_info,   'interval', minutes=15)  # refresco periódico
     scheduler.start()
 
 def main():
