@@ -28,7 +28,7 @@ TAKE_PROFIT = Decimal('0.05')
 STOP_LOSS = Decimal('-0.01')
 COMMISSION_RATE = Decimal('0.001')
 TRAILING_STOP = Decimal('0.01')
-TRADE_COOLDOWN_SEC = 300  # Aumentado a 5 minutos para reducir requests
+TRADE_COOLDOWN_SEC = 300
 PERDIDA_MAXIMA_DIARIA = Decimal('20')
 CRITICAL_SALDO = Decimal('3')
 NOTIFICATION_COOLDOWN_MIN = 5
@@ -52,7 +52,7 @@ no_buy_cycles = 0
 
 def get_cached_ticker(symbol):
     now = time.time()
-    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 300:  # Cache por 5 minutos
+    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 300:
         logger.debug(f"Usando ticker cacheado para {symbol}")
         return TICKERS_CACHE[symbol]['data']
     try:
@@ -236,7 +236,7 @@ def min_quote_for_market(symbol) -> Decimal:
 
 def safe_get_ticker(symbol):
     now = time.time()
-    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 300:  # Cache por 5 minutos
+    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 300:
         logger.debug(f"Usando ticker cacheado para {symbol}")
         return TICKERS_CACHE[symbol]['data']
     try:
@@ -290,7 +290,7 @@ def mejores_criptos(max_candidates=10):
                 logger.debug(f"{sym} añadido: volumen={vol}")
             else:
                 logger.debug(f"{sym} volumen bajo: {vol} < {MIN_VOLUME}")
-            time.sleep(1)  # Pausa de 1 segundo entre requests para evitar límites
+            time.sleep(1)
         if not candidates and no_buy_cycles >= NO_BUY_CYCLES_THRESHOLD:
             logger.warning("Forzando compras tras 3 ciclos sin candidatos.")
             return [safe_get_ticker(random.choice(ALLOWED_SYMBOLS)) for _ in range(min(5, len(ALLOWED_SYMBOLS)))]
@@ -312,7 +312,7 @@ def mejores_criptos(max_candidates=10):
                 logger.debug(f"{symbol} añadido a candidatos: ganancia_neta={ganancia_neta}, score={t['score']}")
             else:
                 logger.debug(f"{symbol} descartado: ganancia_neta={ganancia_neta}")
-            time.sleep(1)  # Pausa adicional
+            time.sleep(1)
         sorted_filtered = sorted(filtered, key=lambda x: x.get('score', 0), reverse=True)
         logger.debug(f"Mejores criptos: {[t['symbol'] for t in sorted_filtered]}")
         return sorted_filtered
@@ -450,7 +450,7 @@ def resumen_diario():
                         total_value += total * Decimal(ticker['lastPrice'])
                 else:
                     total_value += total
-            time.sleep(1)  # Pausa para evitar límites
+            time.sleep(1)
         mensaje += f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}"
         enviar_telegram(mensaje)
         logger.info(f"Resumen diario enviado: {mensaje}")
@@ -462,7 +462,7 @@ def resumen_diario():
         enviar_telegram(f"⚠️ Error en resumen diario: {e}")
 
 def comprar():
-    global last_no_buy_notification, no_buy_cycles, TRADE_COOLDOWN_SEC
+    global last_no_buy_notification, no_buy_cycles, TRADE_COOLDOWN_SEC, ULTIMAS_OPERACIONES
     if not puede_comprar():
         logger.info("Límite de pérdida diaria alcanzado. No se comprará más hoy.")
         enviar_telegram("⚠️ Límite de pérdida diaria alcanzado.")
@@ -564,7 +564,7 @@ def comprar():
                 no_compradas_razon.append(f"{symbol}: error inesperado ({e})")
                 logger.error(f"Error inesperado comprando {symbol}: {e}")
                 enviar_telegram(f"⚠️ Error inesperado comprando {symbol}: {e}")
-            time.sleep(1)  # Pausa para evitar límites
+            time.sleep(1)
         if compradas == 0 and time.time() - last_no_buy_notification >= NOTIFICATION_COOLDOWN_MIN * 60:
             razon_msg = f"Razones: {', '.join(no_compradas_razon)}" if no_compradas_razon else "Razones no especificadas"
             logger.warning(f"No se realizaron compras en este ciclo. {razon_msg}")
@@ -645,7 +645,7 @@ def vender_y_convertir():
                 else:
                     nuevos_registro[symbol] = data
                     logger.debug(f"No se vende {symbol}: Cambio={float(cambio)*100:.2f}%, Ganancia neta={float(ganancia_neta):.4f}")
-                time.sleep(1)  # Pausa para evitar límites
+                time.sleep(1)
             limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
             guardar_json(limpio, REGISTRO_FILE)
             if dust_positions:
@@ -679,7 +679,7 @@ def vender_y_convertir():
                         ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
                         time_held = (now_tz() - datetime.fromisoformat(data['timestamp'])).total_seconds() / 60
                         pos_perfs.append((sym, change, ganancia_neta, time_held))
-                        time.sleep(1)  # Pausa para evitar límites
+                        time.sleep(1)
                     if pos_perfs:
                         pos_perfs.sort(key=lambda x: x[1])
                         worst_sym, worst_change, worst_net, time_held = pos_perfs[0]
