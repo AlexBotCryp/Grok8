@@ -17,32 +17,41 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PORT = int(os.getenv("PORT", "10000"))  # Render Web Service
 
-# Estrategia
+# Estrategia base
 USD_MIN = float(os.getenv("USD_MIN", "15"))
 USD_MAX = float(os.getenv("USD_MAX", "20"))
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))          # 5%
 STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))             # -2%
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
-MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "200000"))
+MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "80000"))  # más bajo para encontrar señales
 RESUMEN_HORA_LOCAL = int(os.getenv("RESUMEN_HORA", "23"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "42"))
-RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "58"))
+RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "35"))            # ventana RSI más amplia
+RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "65"))
 RSI_SELL_OVERBOUGHT = float(os.getenv("RSI_SELL_OVERBOUGHT", "68"))
 
 USE_FALLBACK = os.getenv("USE_FALLBACK", "true").lower() == "true"
-FALLBACK_SYMBOLS = [s.strip().upper() for s in os.getenv("FALLBACK_SYMBOLS", "BTC,ETH,SOL").split(",") if s.strip()]
+FALLBACK_SYMBOLS = [s.strip().upper() for s in os.getenv(
+    "FALLBACK_SYMBOLS", "BTC,ETH,SOL,BNB,MATIC,XRP,ADA,TRX,DOGE,LINK"
+).split(",") if s.strip()]
 
 TZ_NAME = os.getenv("TZ", "Europe/Madrid")
 TIMEZONE = pytz.timezone(TZ_NAME)
 
-PREFERRED_QUOTES = [q.strip().upper() for q in os.getenv("PREFERRED_QUOTES", "USDC,USDT,FDUSD,TUSD,BUSD").split(",") if q.strip()]
+PREFERRED_QUOTES = [q.strip().upper() for q in os.getenv(
+    "PREFERRED_QUOTES", "USDC,USDT"
+).split(",") if q.strip()]
 
 # Ciclos rápidos
 FAST_SEC = int(os.getenv("FAST_SEC", "20"))            # gestionar_posiciones
-BUY_SEC  = int(os.getenv("BUY_SEC", "90"))             # comprar_oportunidad
+BUY_SEC  = int(os.getenv("BUY_SEC", "45"))             # comprar_oportunidad
 DUST_MIN = int(os.getenv("DUST_MIN", "12"))            # limpiar_dust
-SCAN_COOLDOWN_SEC = int(os.getenv("SCAN_COOLDOWN_SEC", "90"))  # caché escaneo
+SCAN_COOLDOWN_SEC = int(os.getenv("SCAN_COOLDOWN_SEC", "60"))  # caché escaneo
+
+# Modo agresivo (fuerza compra si pasa tiempo sin operar)
+AGGRESSIVE_MODE = os.getenv("AGGRESSIVE_MODE", "true").lower() == "true"
+FORCE_BUY_AFTER_SEC = int(os.getenv("FORCE_BUY_AFTER_SEC", "900"))  # 15 min sin comprar
+MAX_BUY_ATTEMPTS_PER_QUOTE = int(os.getenv("MAX_BUY_ATTEMPTS_PER_QUOTE", "12"))
 
 # Stables y blacklist
 STABLES = [s.strip().upper() for s in os.getenv(
@@ -62,6 +71,9 @@ SYMBOL_MAP = {}  # symbol -> {base, quote, status, filters, isSpotAllowed, permi
 # Caché candidatos
 CAND_CACHE_TS = 0.0
 CAND_CACHE = []
+
+# Última compra (para modo agresivo)
+LAST_BUY_TS = 0.0
 
 # ───────────── TELEGRAM ─────────────
 def telegram_enabled():
@@ -354,10 +366,21 @@ def next_order_size():
     return round(random.uniform(USD_MIN, USD_MAX), 2)
 
 def comprar_oportunidad():
+    global LAST_BUY_TS
     if not (client and EX_INFO_READY): return
     reg = leer_posiciones()
     if len(reg) >= MAX_OPEN_POSITIONS: return
     balances = holdings_por_asset()
+
+    # DEBUG: saldos por quote
+    try:
+        dbg = {q: float(balances.get(q, 0.0)) for q in PREFERRED_QUOTES}
+        logger.info(f"[DEBUG] Saldos por quote: {dbg}")
+    except Exception:
+        pass
+
+    now = time.time()
+    tiempo_sin_comprar = now - LAST_BUY_TS if LAST_BUY_TS > 0 else 1e9
 
     for quote in PREFERRED_QUOTES:
         if len(reg) >= MAX_OPEN_POSITIONS: break
@@ -365,10 +388,11 @@ def comprar_oportunidad():
         intentos = 0
         while disponible >= USD_MIN and len(reg) < MAX_OPEN_POSITIONS:
             intentos += 1
-            if intentos > 10: break
+            if intentos > MAX_BUY_ATTEMPTS_PER_QUOTE: break
 
             cand_all = get_candidates_cached()
             candidatos = [c for c in cand_all if c["quote"] == quote and c["symbol"] not in reg]
+            logger.info(f"[DEBUG] {quote}: candidatos RSI={len(candidatos)} (total cache={len(cand_all)})")
             elegido = candidatos[0] if candidatos else None
 
             # Descarta si base es stable o en blacklist
@@ -380,7 +404,7 @@ def comprar_oportunidad():
             # Fallback a BTC/ETH/SOL… (nunca stables)
             if not elegido and USE_FALLBACK:
                 for base in FALLBACK_SYMBOLS:
-                    if base in STABLES:  # por si alguien mete USDT, etc.
+                    if base in STABLES:
                         continue
                     sym = symbol_exists(base, quote)
                     if (sym and sym not in reg and sym not in NOT_PERMITTED):
@@ -398,6 +422,33 @@ def comprar_oportunidad():
                                     break
                             except Exception:
                                 continue
+
+            # FORCE BUY si pasa demasiado tiempo sin compras
+            if not elegido and AGGRESSIVE_MODE and tiempo_sin_comprar >= FORCE_BUY_AFTER_SEC:
+                # 1) FALLBACK_SYMBOLS sin exigir RSI (solo permisos y notional)
+                for base in FALLBACK_SYMBOLS:
+                    if base in STABLES: 
+                        continue
+                    sym = symbol_exists(base, quote)
+                    if (sym and sym not in reg and sym not in NOT_PERMITTED):
+                        meta = SYMBOL_MAP[sym]
+                        if (meta.get("isSpotAllowed", False) and "SPOT" in meta.get("permissions", [])
+                            and meta["base"] not in STABLES):
+                            elegido = {"symbol": sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": 0}
+                            logger.info(f"[FORCE] Elegido por fuerza (fallback sin RSI): {sym}")
+                            break
+                # 2) top por volumen de la caché
+                if not elegido:
+                    top_vol = sorted(
+                        [c for c in get_candidates_cached()
+                         if c["quote"] == quote
+                         and SYMBOL_MAP[c["symbol"]]["base"] not in STABLES
+                         and c["symbol"] not in NOT_PERMITTED],
+                        key=lambda x: x["quoteVolume"], reverse=True
+                    )
+                    if top_vol:
+                        elegido = top_vol[0]
+                        logger.info(f"[FORCE] Elegido top volumen para {quote}: {elegido['symbol']}")
 
             if not elegido:
                 logger.info(f"Sin candidato para {quote}; saldo se mantiene hasta próximo ciclo.")
@@ -427,6 +478,7 @@ def comprar_oportunidad():
                     "ts": datetime.now(TIMEZONE).isoformat()
                 }
                 escribir_posiciones(reg)
+                LAST_BUY_TS = time.time()
                 enviar_telegram(f"🟢 Compra {symbol} qty={qty} @ {price:.8f} {quote} | RSI {round(elegido.get('rsi', 50),1)}")
                 balances = holdings_por_asset()
                 disponible = float(balances.get(quote, 0.0))
@@ -537,12 +589,6 @@ def resumen_diario():
         logger.warning(f"Resumen diario error: {e}")
 
 # ───────────── ARRANQUE Y SCHEDULER ─────────────
-def ciclo_dummy():
-    # (ya no se usa; mantenido por compatibilidad si ves logs viejos)
-    gestionar_posiciones()
-    comprar_oportunidad()
-    limpiar_dust()
-
 def init_loop():
     """Reintenta cliente y exchangeInfo en background sin tumbar proceso."""
     global EX_INFO_READY
@@ -554,7 +600,10 @@ def init_loop():
         time.sleep(10)
 
 def run_bot():
-    enviar_telegram(f"🤖 Bot spot activo. Posiciones cada {FAST_SEC}s, compras cada {BUY_SEC}s, limpieza cada {DUST_MIN}min. TP 5%, SL 2%, órdenes 15–20 USDC. Sin stables↔stables.")
+    enviar_telegram(
+        f"🤖 Bot spot activo. Posiciones cada {FAST_SEC}s, compras cada {BUY_SEC}s, limpieza cada {DUST_MIN}min. "
+        f"TP 5%, SL 2%, órdenes 15–20 USDC. Sin stables↔stables. Modo agresivo={AGGRESSIVE_MODE}"
+    )
     scheduler = BackgroundScheduler(timezone=TIMEZONE)
     scheduler.add_job(gestionar_posiciones, 'interval', seconds=FAST_SEC, max_instances=1)
     scheduler.add_job(comprar_oportunidad,   'interval', seconds=BUY_SEC,  max_instances=1)
