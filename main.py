@@ -20,8 +20,8 @@ PORT = int(os.getenv("PORT", "10000"))  # Render Web Service
 # Estrategia
 USD_MIN = float(os.getenv("USD_MIN", "15"))
 USD_MAX = float(os.getenv("USD_MAX", "20"))
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))          # 5%
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))             # -2%
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "200000"))
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "1"))
@@ -39,14 +39,22 @@ TIMEZONE = pytz.timezone(TZ_NAME)
 
 PREFERRED_QUOTES = [q.strip().upper() for q in os.getenv("PREFERRED_QUOTES", "USDC,USDT,FDUSD,TUSD,BUSD").split(",") if q.strip()]
 
+# Stables y blacklist
+STABLES = [s.strip().upper() for s in os.getenv(
+    "STABLES",
+    "USDT,USDC,FDUSD,TUSD,BUSD,DAI,USDP,USTC,EUR,TRY,GBP,BRL,ARS"
+).split(",") if s.strip()]
+NOT_PERMITTED = set()  # símbolos baneados por -2010
+
 REGISTRO_FILE = "registro.json"
 PNL_DIARIO_FILE = "pnl_diario.json"
 
 # ───────────── ESTADO GLOBAL ─────────────
 client = None
 EX_INFO_READY = False
-SYMBOL_MAP = {}  # symbol -> {base, quote, status, filters}
+SYMBOL_MAP = {}  # symbol -> {base, quote, status, filters, isSpotAllowed, permissions}
 
+# ───────────── TELEGRAM ─────────────
 def telegram_enabled():
     return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 
@@ -67,17 +75,17 @@ def enviar_telegram(msg: str):
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
-            if self.path == "/health" or self.path == "/":
+            if self.path in ("/health", "/"):
                 self.send_response(200); self.end_headers()
                 self.wfile.write(b"ok")
             elif self.path == "/selftest":
-                # pequeño autodiagnóstico
                 status = {
                     "telegram": "ON" if telegram_enabled() else "OFF",
                     "binance_client": "READY" if client else "NOT_INIT",
                     "exchange_info": "READY" if EX_INFO_READY else "LOADING",
                     "positions_file_exists": os.path.exists(REGISTRO_FILE),
-                    "pnl_file_exists": os.path.exists(PNL_DIARIO_FILE)
+                    "pnl_file_exists": os.path.exists(PNL_DIARIO_FILE),
+                    "blacklist_size": len(NOT_PERMITTED),
                 }
                 body = json.dumps(status).encode()
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
@@ -126,6 +134,7 @@ def backoff_sleep(e: Exception):
     else:
         time.sleep(2)
 
+# ───────────── BINANCE INIT ─────────────
 def init_binance_client():
     global client
     if client is None:
@@ -134,7 +143,6 @@ def init_binance_client():
             return
         try:
             client = Client(API_KEY, API_SECRET)
-            # ping suave
             client.ping()
             logger.info("Binance client OK.")
         except Exception as e:
@@ -143,7 +151,7 @@ def init_binance_client():
 
 def load_exchange_info():
     global EX_INFO_READY, SYMBOL_MAP
-    if not client: 
+    if not client:
         return
     try:
         info = client.get_exchange_info()
@@ -154,7 +162,9 @@ def load_exchange_info():
                 "base": s["baseAsset"],
                 "quote": s["quoteAsset"],
                 "status": s["status"],
-                "filters": filters
+                "filters": filters,
+                "isSpotAllowed": s.get("isSpotTradingAllowed", False),
+                "permissions": s.get("permissions", []),
             }
         EX_INFO_READY = True
         logger.info(f"exchangeInfo cargada: {len(SYMBOL_MAP)} símbolos.")
@@ -163,6 +173,7 @@ def load_exchange_info():
         logger.warning(f"Fallo cargando exchangeInfo (reintentará): {e}")
         backoff_sleep(e)
 
+# ───────────── HELPERS MERCADO ─────────────
 def symbol_exists(base, quote):
     sym = base + quote
     return sym if sym in SYMBOL_MAP and SYMBOL_MAP[sym]["status"] == "TRADING" else None
@@ -235,21 +246,35 @@ def scan_candidatos():
         return []
     candidatos = []
     tickers = safe_get_ticker_24h()
-    if not tickers: return []
-    symbols_ok = {s for s, meta in SYMBOL_MAP.items()
-                  if meta["status"] == "TRADING" and meta["quote"] in PREFERRED_QUOTES}
+    if not tickers:
+        return []
+
+    # Sólo símbolos spot activos, con quote preferida, base NO stable y no en blacklist
+    symbols_ok = set()
+    for sym, meta in SYMBOL_MAP.items():
+        if (meta["status"] == "TRADING"
+            and meta["quote"] in PREFERRED_QUOTES
+            and meta.get("isSpotAllowed", False)
+            and ("SPOT" in meta.get("permissions", []))
+            and meta["base"] not in STABLES
+            and sym not in NOT_PERMITTED):
+            symbols_ok.add(sym)
+
     by_quote = {q: [] for q in PREFERRED_QUOTES}
     for t in tickers:
         sym = t["symbol"]
-        if sym not in symbols_ok: continue
+        if sym not in symbols_ok:
+            continue
         q = SYMBOL_MAP[sym]["quote"]
         vol = float(t.get("quoteVolume", 0.0))
         if vol >= MIN_QUOTE_VOLUME:
             by_quote[q].append((vol, t))
+
     reduced = []
     for q, arr in by_quote.items():
         arr.sort(key=lambda x: x[0], reverse=True)
         reduced.extend([t for _, t in arr[:80]])
+
     for t in reduced:
         sym = t["symbol"]
         try:
@@ -268,6 +293,7 @@ def scan_candidatos():
                 })
         except Exception as e:
             logger.debug(f"scan cand error {sym}: {e}")
+
     candidatos.sort(key=lambda x: (x["quoteVolume"], -abs(x["rsi"] - (RSI_BUY_MIN + RSI_BUY_MAX)/2)), reverse=True)
     return candidatos
 
@@ -313,6 +339,7 @@ def comprar_oportunidad():
     reg = leer_posiciones()
     if len(reg) >= MAX_OPEN_POSITIONS: return
     balances = holdings_por_asset()
+
     for quote in PREFERRED_QUOTES:
         if len(reg) >= MAX_OPEN_POSITIONS: break
         disponible = float(balances.get(quote, 0.0))
@@ -320,34 +347,59 @@ def comprar_oportunidad():
         while disponible >= USD_MIN and len(reg) < MAX_OPEN_POSITIONS:
             intentos += 1
             if intentos > 10: break
-            candidatos = [c for c in scan_candidatos() if c["quote"] == quote and c["symbol"] not in reg]
+
+            # Candidatos por RSI para ESTA quote
+            cand_all = scan_candidatos()
+            candidatos = [c for c in cand_all if c["quote"] == quote and c["symbol"] not in reg]
             elegido = candidatos[0] if candidatos else None
+
+            # Descarta si base es stable o en blacklist
+            if elegido:
+                base_asset = SYMBOL_MAP[elegido["symbol"]]["base"]
+                if base_asset in STABLES or elegido["symbol"] in NOT_PERMITTED:
+                    elegido = None
+
+            # Fallback a BTC/ETH/SOL… (nunca stables)
             if not elegido and USE_FALLBACK:
                 for base in FALLBACK_SYMBOLS:
+                    if base in STABLES:  # por si alguien mete USDT, etc.
+                        continue
                     sym = symbol_exists(base, quote)
-                    if sym and sym not in reg:
-                        try:
-                            kl = safe_get_klines(sym, Client.KLINE_INTERVAL_5MINUTE, 30)
-                            if not kl: continue
-                            closes = [float(k[4]) for k in kl]
-                            rsi = calculate_rsi(closes, RSI_PERIOD)
-                            if 35 <= rsi <= 65:
-                                elegido = {"symbol": sym, "quote": quote, "rsi": rsi, "lastPrice": closes[-1], "quoteVolume": 0}
-                                break
-                        except Exception:
-                            continue
-            if not elegido: break
+                    if (sym and sym not in reg and sym not in NOT_PERMITTED):
+                        meta = SYMBOL_MAP[sym]
+                        if (meta.get("isSpotAllowed", False) and "SPOT" in meta.get("permissions", [])
+                            and meta["base"] not in STABLES):
+                            try:
+                                kl = safe_get_klines(sym, Client.KLINE_INTERVAL_5MINUTE, 30)
+                                if not kl: continue
+                                closes = [float(k[4]) for k in kl]
+                                rsi = calculate_rsi(closes, RSI_PERIOD)
+                                if 35 <= rsi <= 65:
+                                    elegido = {"symbol": sym, "quote": quote, "rsi": rsi,
+                                               "lastPrice": closes[-1], "quoteVolume": 0}
+                                    break
+                            except Exception:
+                                continue
+
+            if not elegido:
+                logger.info(f"Sin candidato para {quote}; saldo se mantiene hasta próximo ciclo.")
+                break
+
             symbol = elegido["symbol"]
             price = obtener_precio(symbol)
             if not price: break
             step, _, _ = get_filter_values_cached(symbol)
+
             usd_orden = min(next_order_size(), disponible)
             qty = quantize_qty(usd_orden / price, step)
+
             if qty <= 0 or not min_notional_ok(symbol, price, qty):
                 usd_orden = min(max(usd_orden * 1.3, USD_MIN), disponible)
                 qty = quantize_qty(usd_orden / price, step)
                 if qty <= 0 or not min_notional_ok(symbol, price, qty):
+                    logger.info(f"{symbol}: no alcanza minNotional con saldo disponible.")
                     break
+
             try:
                 client.order_market_buy(symbol=symbol, quantity=qty)
                 reg[symbol] = {
@@ -360,9 +412,17 @@ def comprar_oportunidad():
                 enviar_telegram(f"🟢 Compra {symbol} qty={qty} @ {price:.8f} {quote} | RSI {round(elegido.get('rsi', 50),1)}")
                 balances = holdings_por_asset()
                 disponible = float(balances.get(quote, 0.0))
+            except BinanceAPIException as e:
+                logger.error(f"Compra error {symbol}: {e}")
+                if getattr(e, "code", None) == -2010:
+                    NOT_PERMITTED.add(symbol)
+                    logger.warning(f"Añadido a blacklist por no permitido: {symbol}")
+                backoff_sleep(e)
+                break
             except Exception as e:
                 logger.error(f"Compra error {symbol}: {e}")
-                backoff_sleep(e); break
+                backoff_sleep(e)
+                break
 
 def gestionar_posiciones():
     if not (client and EX_INFO_READY): return
@@ -374,7 +434,7 @@ def gestionar_posiciones():
             qty = float(data["qty"]); buy_price = float(data["buy_price"]); quote = data["quote"]
             if qty <= 0: continue
             price = obtener_precio(symbol)
-            if not price: 
+            if not price:
                 nuevos[symbol] = data; continue
             change = (price - buy_price) / buy_price
             kl = safe_get_klines(symbol, Client.KLINE_INTERVAL_5MINUTE, 60)
@@ -382,7 +442,11 @@ def gestionar_posiciones():
                 nuevos[symbol] = data; continue
             closes = [float(k[4]) for k in kl]
             rsi = calculate_rsi(closes, RSI_PERIOD)
-            tp = change >= TAKE_PROFIT; sl = change <= STOP_LOSS; ob = rsi >= RSI_SELL_OVERBOUGHT
+
+            tp = change >= TAKE_PROFIT
+            sl = change <= STOP_LOSS
+            ob = rsi >= RSI_SELL_OVERBOUGHT
+
             if tp or sl or ob:
                 step, _, _ = get_filter_values_cached(symbol)
                 qty_q = quantize_qty(qty, step)
@@ -394,6 +458,9 @@ def gestionar_posiciones():
                 enviar_telegram(f"🔴 Venta {symbol} qty={qty_q} @ {price:.8f} ({change*100:.2f}%) Motivo: {motivo} RSI:{rsi:.1f} | PnL: {realized:.4f} {quote} | PnL hoy: {total_pnl:.4f}")
             else:
                 nuevos[symbol] = data
+        except BinanceAPIException as e:
+            logger.error(f"Gestion error {symbol}: {e}")
+            backoff_sleep(e); nuevos[symbol] = data
         except Exception as e:
             logger.error(f"Gestion error {symbol}: {e}")
             backoff_sleep(e); nuevos[symbol] = data
@@ -408,8 +475,12 @@ def limpiar_dust():
         for asset, qty in bals.items():
             if asset in PREFERRED_QUOTES or qty <= 0: continue
             if asset in activos_reg: continue
+            if asset in STABLES:  # evitar base estable
+                continue
             sym, q = find_best_route(asset, PREFERRED_QUOTES)
-            if not sym: continue
+            if not sym or sym in NOT_PERMITTED: continue
+            # evitar vender hacia par donde la base sea estable
+            if SYMBOL_MAP[sym]["base"] in STABLES: continue
             price = obtener_precio(sym)
             if not price: continue
             step, _, _ = get_filter_values(sym)
@@ -418,8 +489,12 @@ def limpiar_dust():
             try:
                 client.order_market_sell(symbol=sym, quantity=qty_sell)
                 enviar_telegram(f"🧹 Limpieza: vendido {qty_sell} {asset} -> {q}")
-            except Exception as e:
-                logger.debug(f"No se pudo limpiar {asset}: {e}")
+            except BinanceAPIException as e:
+                if getattr(e, "code", None) == -2010:
+                    NOT_PERMITTED.add(sym)
+                    logger.warning(f"Blacklist por no permitido (limpieza): {sym}")
+                else:
+                    logger.debug(f"No se pudo limpiar {asset}: {e}")
                 backoff_sleep(e)
     except Exception as e:
         logger.debug(f"limpiar_dust error: {e}")
@@ -447,7 +522,7 @@ def resumen_diario():
 def ciclo():
     try:
         gestionar_posiciones()
-        comprar_oportunidad()
+        comprar_oportunidad()   # intenta gastar la quote hasta ~0 (dentro de filtros)
         limpiar_dust()
     except Exception as e:
         logger.error(f"Ciclo error: {e}")
@@ -464,15 +539,14 @@ def init_loop():
         time.sleep(10)
 
 def run_bot():
-    enviar_telegram("🤖 Bot spot activo (sin Grok). RSI 5m, TP 5%, SL 2%, órdenes 15–20 USDC.")
+    enviar_telegram("🤖 Bot spot activo (sin Grok). RSI 5m, TP 5%, SL 2%, órdenes 15–20 USDC. Sin stables↔stables.")
     scheduler = BackgroundScheduler(timezone=TIMEZONE)
     scheduler.add_job(ciclo, 'interval', minutes=INTERVAL_MINUTES, max_instances=1)
     scheduler.add_job(resumen_diario, 'cron', hour=RESUMEN_HORA_LOCAL, minute=0)
-    scheduler.add_job(load_exchange_info, 'interval', minutes=15)  # refresco periódico de exchangeInfo
+    scheduler.add_job(load_exchange_info, 'interval', minutes=15)  # refresco periódico
     scheduler.start()
 
 def main():
-    # Hilos: init (reintentos), bot (jobs), http (health)
     threading.Thread(target=init_loop, daemon=True).start()
     threading.Thread(target=run_bot, daemon=True).start()
     run_http_server()
