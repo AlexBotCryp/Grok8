@@ -11,7 +11,6 @@ import pytz
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
-from binance.websockets import BinanceSocketManager
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("bot-ia")
@@ -29,7 +28,7 @@ TAKE_PROFIT = Decimal('0.05')
 STOP_LOSS = Decimal('-0.01')
 COMMISSION_RATE = Decimal('0.001')
 TRAILING_STOP = Decimal('0.01')
-TRADE_COOLDOWN_SEC = 60
+TRADE_COOLDOWN_SEC = 300  # Aumentado a 5 minutos para reducir requests
 PERDIDA_MAXIMA_DIARIA = Decimal('20')
 CRITICAL_SALDO = Decimal('3')
 NOTIFICATION_COOLDOWN_MIN = 5
@@ -40,7 +39,6 @@ REGISTRO_FILE = "registro.json"
 PNL_DIARIO_FILE = "pnl_diario.json"
 
 client = Client(API_KEY, API_SECRET)
-bm = BinanceSocketManager(client)
 LOCK = threading.RLock()
 SYMBOL_CACHE = {}
 INVALID_SYMBOL_CACHE = set()
@@ -52,40 +50,16 @@ BALANCES_CACHE = {}
 last_no_buy_notification = 0
 no_buy_cycles = 0
 
-def process_ticker(msg):
-    for t in msg:
-        symbol = t['s']
-        if symbol in ALLOWED_SYMBOLS:
-            TICKERS_CACHE[symbol] = {'data': t, 'ts': time.time()}
-            logger.debug(f"WebSocket update for {symbol}: {t['c']}")
-
-def process_user(msg):
-    if msg['e'] == 'outboundAccountPosition':
-        for b in msg['B']:
-            asset = b['a']
-            BALANCES_CACHE[asset] = {'free': Decimal(b['f']), 'locked': Decimal(b['l'])}
-            logger.debug(f"WebSocket balance update for {asset}: free={b['f']}, locked={b['l']}")
-    elif msg['e'] == 'balanceUpdate':
-        asset = msg['a']
-        free_delta = Decimal(msg['d'])
-        if asset in BALANCES_CACHE:
-            BALANCES_CACHE[asset]['free'] += free_delta
-            logger.debug(f"WebSocket balance update for {asset}: delta={free_delta}")
-
-def start_websockets():
-    symbols = [s.lower() for s in ALLOWED_SYMBOLS]
-    bm.start_ticker_socket(process_ticker, symbols)
-    bm.start_user_socket(process_user)
-    bm.start()
-
 def get_cached_ticker(symbol):
-    if symbol in TICKERS_CACHE:
+    now = time.time()
+    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 300:  # Cache por 5 minutos
+        logger.debug(f"Usando ticker cacheado para {symbol}")
         return TICKERS_CACHE[symbol]['data']
-    logger.warning(f"No WebSocket data for {symbol}, falling back to API")
     try:
         t = client.get_ticker(symbol=symbol)
         if t and float(t.get('lastPrice', 0)) > 0:
-            TICKERS_CACHE[symbol] = {'data': t, 'ts': time.time()}
+            TICKERS_CACHE[symbol] = {'data': t, 'ts': now}
+            logger.debug(f"Ticker actualizado para {symbol}: {t['lastPrice']}")
             return t
     except Exception as e:
         logger.error(f"Error fetching ticker {symbol} via API: {e}")
@@ -261,13 +235,15 @@ def min_quote_for_market(symbol) -> Decimal:
     return (meta["minNotional"] * Decimal('1.01')).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
 
 def safe_get_ticker(symbol):
-    if symbol in TICKERS_CACHE:
+    now = time.time()
+    if symbol in TICKERS_CACHE and now - TICKERS_CACHE[symbol]['ts'] < 300:  # Cache por 5 minutos
+        logger.debug(f"Usando ticker cacheado para {symbol}")
         return TICKERS_CACHE[symbol]['data']
-    logger.warning(f"No WebSocket data for {symbol}, falling back to API")
     try:
         t = client.get_ticker(symbol=symbol)
         if t and float(t.get('lastPrice', 0)) > 0:
-            TICKERS_CACHE[symbol] = {'data': t, 'ts': time.time()}
+            TICKERS_CACHE[symbol] = {'data': t, 'ts': now}
+            logger.debug(f"Ticker actualizado para {symbol}: {t['lastPrice']}")
             return t
     except Exception as e:
         logger.error(f"Error fetching ticker {symbol} via API: {e}")
@@ -314,7 +290,7 @@ def mejores_criptos(max_candidates=10):
                 logger.debug(f"{sym} añadido: volumen={vol}")
             else:
                 logger.debug(f"{sym} volumen bajo: {vol} < {MIN_VOLUME}")
-            time.sleep(0.05)
+            time.sleep(1)  # Pausa de 1 segundo entre requests para evitar límites
         if not candidates and no_buy_cycles >= NO_BUY_CYCLES_THRESHOLD:
             logger.warning("Forzando compras tras 3 ciclos sin candidatos.")
             return [safe_get_ticker(random.choice(ALLOWED_SYMBOLS)) for _ in range(min(5, len(ALLOWED_SYMBOLS)))]
@@ -336,7 +312,7 @@ def mejores_criptos(max_candidates=10):
                 logger.debug(f"{symbol} añadido a candidatos: ganancia_neta={ganancia_neta}, score={t['score']}")
             else:
                 logger.debug(f"{symbol} descartado: ganancia_neta={ganancia_neta}")
-            time.sleep(0.05)
+            time.sleep(1)  # Pausa adicional
         sorted_filtered = sorted(filtered, key=lambda x: x.get('score', 0), reverse=True)
         logger.debug(f"Mejores criptos: {[t['symbol'] for t in sorted_filtered]}")
         return sorted_filtered
@@ -469,12 +445,12 @@ def resumen_diario():
                 mensaje += f"{b['asset']}: {total:.6f}\n"
                 if b['asset'] != MONEDA_BASE:
                     symbol = b['asset'] + MONEDA_BASE
-                    ticker = safe_get_ticker(symbol)
+                    ticker = get_cached_ticker(symbol)
                     if ticker:
                         total_value += total * Decimal(ticker['lastPrice'])
                 else:
                     total_value += total
-            time.sleep(0.1)
+            time.sleep(1)  # Pausa para evitar límites
         mensaje += f"Valor total estimado: {total_value:.2f} {MONEDA_BASE}"
         enviar_telegram(mensaje)
         logger.info(f"Resumen diario enviado: {mensaje}")
@@ -529,7 +505,7 @@ def comprar():
                 no_compradas_razon.append(f"{symbol}: en cooldown")
                 logger.debug(f"{symbol} en cooldown, saltando")
                 continue
-            ticker = safe_get_ticker(symbol)
+            ticker = get_cached_ticker(symbol)
             if not ticker:
                 no_compradas_razon.append(f"{symbol}: sin ticker")
                 logger.debug(f"No ticker para {symbol}")
@@ -588,7 +564,7 @@ def comprar():
                 no_compradas_razon.append(f"{symbol}: error inesperado ({e})")
                 logger.error(f"Error inesperado comprando {symbol}: {e}")
                 enviar_telegram(f"⚠️ Error inesperado comprando {symbol}: {e}")
-            time.sleep(0.1)
+            time.sleep(1)  # Pausa para evitar límites
         if compradas == 0 and time.time() - last_no_buy_notification >= NOTIFICATION_COOLDOWN_MIN * 60:
             razon_msg = f"Razones: {', '.join(no_compradas_razon)}" if no_compradas_razon else "Razones no especificadas"
             logger.warning(f"No se realizaron compras en este ciclo. {razon_msg}")
@@ -607,7 +583,7 @@ def vender_y_convertir():
             for symbol, data in list(registro.items()):
                 precio_compra = dec(data["precio_compra"])
                 high_since_buy = dec(data.get("high_since_buy", data["precio_compra"]))
-                ticker = safe_get_ticker(symbol)
+                ticker = get_cached_ticker(symbol)
                 if not ticker:
                     nuevos_registro[symbol] = data
                     logger.debug(f"No ticker para {symbol}, manteniendo")
@@ -669,7 +645,7 @@ def vender_y_convertir():
                 else:
                     nuevos_registro[symbol] = data
                     logger.debug(f"No se vende {symbol}: Cambio={float(cambio)*100:.2f}%, Ganancia neta={float(ganancia_neta):.4f}")
-                time.sleep(0.1)
+                time.sleep(1)  # Pausa para evitar límites
             limpio = {sym: d for sym, d in nuevos_registro.items() if sym not in dust_positions}
             guardar_json(limpio, REGISTRO_FILE)
             if dust_positions:
@@ -690,7 +666,7 @@ def vender_y_convertir():
                     best_symbol = best['symbol']
                     pos_perfs = []
                     for sym, data in registro.items():
-                        ticker = safe_get_ticker(sym)
+                        ticker = get_cached_ticker(sym)
                         if not ticker:
                             continue
                         price = dec(ticker['lastPrice'])
@@ -703,7 +679,7 @@ def vender_y_convertir():
                         ganancia_neta = ganancia_bruta - (comision_compra + comision_venta)
                         time_held = (now_tz() - datetime.fromisoformat(data['timestamp'])).total_seconds() / 60
                         pos_perfs.append((sym, change, ganancia_neta, time_held))
-                        time.sleep(0.1)
+                        time.sleep(1)  # Pausa para evitar límites
                     if pos_perfs:
                         pos_perfs.sort(key=lambda x: x[1])
                         worst_sym, worst_change, worst_net, time_held = pos_perfs[0]
@@ -734,9 +710,7 @@ def vender_y_convertir():
 if __name__ == "__main__":
     debug_balances()
     inicializar_registro()
-    ws_thread = threading.Thread(target=start_websockets, daemon=True)
-    ws_thread.start()
-    enviar_telegram("🤖 Bot IA: Usa WebSocket, $15 por cripto, 100% del saldo, TAKE_PROFIT=5%, 60s checks.")
+    enviar_telegram("🤖 Bot IA: Usa $15 por cripto, 100% del saldo, TAKE_PROFIT=5%, 300s checks.")
     scheduler = BackgroundScheduler(timezone=TZ_MADRID)
     scheduler.add_job(comprar, 'interval', seconds=TRADE_COOLDOWN_SEC, id="comprar", coalesce=True, max_instances=1)
     scheduler.add_job(vender_y_convertir, 'interval', seconds=TRADE_COOLDOWN_SEC, id="vender", coalesce=True, max_instances=1)
