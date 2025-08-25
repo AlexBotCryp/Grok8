@@ -17,16 +17,19 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PORT = int(os.getenv("PORT", "10000"))  # Render Web Service
 
-# Estrategia base
+# Estrategia base (puedes ajustar por entorno)
 USD_MIN = float(os.getenv("USD_MIN", "15"))
 USD_MAX = float(os.getenv("USD_MAX", "20"))
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))          # 5%
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))             # -2%
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))           # 2% TP clásico
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))              # -2% SL
+ROTATE_PROFIT = float(os.getenv("ROTATE_PROFIT", "0.012"))      # +1.2% → rotar a otra cripto
+TRAIL_ACTIVATE = float(os.getenv("TRAIL_ACTIVATE", "0.008"))    # activar trailing al +0.8% desde compra
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.006"))              # vender si cae 0.6% desde el pico (si trailing activo)
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
-MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "80000"))  # más bajo para encontrar señales
+MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "80000"))
 RESUMEN_HORA_LOCAL = int(os.getenv("RESUMEN_HORA", "23"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "35"))            # ventana RSI más amplia
+RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "35"))             # ventana RSI amplia
 RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "65"))
 RSI_SELL_OVERBOUGHT = float(os.getenv("RSI_SELL_OVERBOUGHT", "68"))
 
@@ -338,8 +341,8 @@ def holdings_por_asset():
         res = {}
         for b in acc["balances"]:
             total = float(b["free"]) + float(b["locked"])
-            if total > 0: res[b["asset"]] = total
-        return res
+            if total > 0: res[b]["asset"] = total
+        return {b["asset"]: float(b["free"]) + float(b["locked"]) for b in acc["balances"]}
     except Exception as e:
         logger.warning(f"holdings error: {e}")
         backoff_sleep(e); return {}
@@ -365,6 +368,85 @@ def next_order_size():
     import random
     return round(random.uniform(USD_MIN, USD_MAX), 2)
 
+# ───────────── COMPRAS ─────────────
+def comprar_oportunidad_for_quote(quote, reg, balances):
+    """
+    Intenta gastar una orden (15–20) en la quote indicada inmediatamente (para rotación).
+    Devuelve True si compró algo.
+    """
+    if len(reg) >= MAX_OPEN_POSITIONS:
+        return False
+    disponible = float(balances.get(quote, 0.0))
+    if disponible < USD_MIN:
+        return False
+
+    cand_all = get_candidates_cached()
+    candidatos = [c for c in cand_all if c["quote"] == quote and c["symbol"] not in reg]
+    elegido = candidatos[0] if candidatos else None
+
+    if elegido:
+        base_asset = SYMBOL_MAP[elegido["symbol"]]["base"]
+        if base_asset in STABLES or elegido["symbol"] in NOT_PERMITTED:
+            elegido = None
+
+    if not elegido and USE_FALLBACK:
+        for base in FALLBACK_SYMBOLS:
+            if base in STABLES:
+                continue
+            sym = symbol_exists(base, quote)
+            if (sym and sym not in reg and sym not in NOT_PERMITTED):
+                meta = SYMBOL_MAP[sym]
+                if (meta.get("isSpotAllowed", False) and "SPOT" in meta.get("permissions", [])
+                    and meta["base"] not in STABLES):
+                    elegido = {"symbol": sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": 0}
+                    logger.info(f"[ROTATE] Elegido fallback para rotación: {sym}")
+                    break
+
+    if not elegido:
+        return False
+
+    symbol = elegido["symbol"]
+    price = obtener_precio(symbol)
+    if not price:
+        return False
+    step, _, _ = get_filter_values_cached(symbol)
+
+    usd_orden = min(next_order_size(), disponible)
+    qty = quantize_qty(usd_orden / price, step)
+
+    if qty <= 0 or not min_notional_ok(symbol, price, qty):
+        usd_orden = min(max(usd_orden * 1.3, USD_MIN), disponible)
+        qty = quantize_qty(usd_orden / price, step)
+        if qty <= 0 or not min_notional_ok(symbol, price, qty):
+            logger.info(f"[ROTATE] {symbol}: no alcanza minNotional con saldo disponible.")
+            return False
+
+    try:
+        client.order_market_buy(symbol=symbol, quantity=qty)
+        reg[symbol] = {
+            "qty": float(qty),
+            "buy_price": float(price),
+            "peak": float(price),              # para trailing
+            "quote": quote,
+            "ts": datetime.now(TIMEZONE).isoformat()
+        }
+        escribir_posiciones(reg)
+        global LAST_BUY_TS
+        LAST_BUY_TS = time.time()
+        enviar_telegram(f"🟢 Compra (rotación) {symbol} qty={qty} @ {price:.8f} {quote}")
+        logger.info(f"[ROTATE] Comprado {symbol} en rotación.")
+        return True
+    except BinanceAPIException as e:
+        logger.error(f"Compra (rotación) error {symbol}: {e}")
+        if getattr(e, "code", None) == -2010:
+            NOT_PERMITTED.add(symbol)
+            logger.warning(f"Añadido a blacklist por no permitido: {symbol}")
+        backoff_sleep(e)
+    except Exception as e:
+        logger.error(f"Compra (rotación) error {symbol}: {e}")
+        backoff_sleep(e)
+    return False
+
 def comprar_oportunidad():
     global LAST_BUY_TS
     if not (client and EX_INFO_READY): return
@@ -372,7 +454,6 @@ def comprar_oportunidad():
     if len(reg) >= MAX_OPEN_POSITIONS: return
     balances = holdings_por_asset()
 
-    # DEBUG: saldos por quote
     try:
         dbg = {q: float(balances.get(q, 0.0)) for q in PREFERRED_QUOTES}
         logger.info(f"[DEBUG] Saldos por quote: {dbg}")
@@ -395,13 +476,11 @@ def comprar_oportunidad():
             logger.info(f"[DEBUG] {quote}: candidatos RSI={len(candidatos)} (total cache={len(cand_all)})")
             elegido = candidatos[0] if candidatos else None
 
-            # Descarta si base es stable o en blacklist
             if elegido:
                 base_asset = SYMBOL_MAP[elegido["symbol"]]["base"]
                 if base_asset in STABLES or elegido["symbol"] in NOT_PERMITTED:
                     elegido = None
 
-            # Fallback a BTC/ETH/SOL… (nunca stables)
             if not elegido and USE_FALLBACK:
                 for base in FALLBACK_SYMBOLS:
                     if base in STABLES:
@@ -425,7 +504,6 @@ def comprar_oportunidad():
 
             # FORCE BUY si pasa demasiado tiempo sin compras
             if not elegido and AGGRESSIVE_MODE and tiempo_sin_comprar >= FORCE_BUY_AFTER_SEC:
-                # 1) FALLBACK_SYMBOLS sin exigir RSI (solo permisos y notional)
                 for base in FALLBACK_SYMBOLS:
                     if base in STABLES: 
                         continue
@@ -437,18 +515,6 @@ def comprar_oportunidad():
                             elegido = {"symbol": sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": 0}
                             logger.info(f"[FORCE] Elegido por fuerza (fallback sin RSI): {sym}")
                             break
-                # 2) top por volumen de la caché
-                if not elegido:
-                    top_vol = sorted(
-                        [c for c in get_candidates_cached()
-                         if c["quote"] == quote
-                         and SYMBOL_MAP[c["symbol"]]["base"] not in STABLES
-                         and c["symbol"] not in NOT_PERMITTED],
-                        key=lambda x: x["quoteVolume"], reverse=True
-                    )
-                    if top_vol:
-                        elegido = top_vol[0]
-                        logger.info(f"[FORCE] Elegido top volumen para {quote}: {elegido['symbol']}")
 
             if not elegido:
                 logger.info(f"Sin candidato para {quote}; saldo se mantiene hasta próximo ciclo.")
@@ -474,6 +540,7 @@ def comprar_oportunidad():
                 reg[symbol] = {
                     "qty": float(qty),
                     "buy_price": float(price),
+                    "peak": float(price),              # iniciar pico para trailing
                     "quote": quote,
                     "ts": datetime.now(TIMEZONE).isoformat()
                 }
@@ -494,6 +561,7 @@ def comprar_oportunidad():
                 backoff_sleep(e)
                 break
 
+# ───────────── GESTIÓN + ROTACIÓN ─────────────
 def gestionar_posiciones():
     if not (client and EX_INFO_READY): return
     reg = leer_posiciones()
@@ -501,33 +569,62 @@ def gestionar_posiciones():
     nuevos = {}
     for symbol, data in reg.items():
         try:
-            qty = float(data["qty"]); buy_price = float(data["buy_price"]); quote = data["quote"]
+            qty = float(data["qty"])
+            buy_price = float(data["buy_price"])
+            peak = float(data.get("peak", buy_price))
+            quote = data["quote"]
             if qty <= 0: continue
+
             price = obtener_precio(symbol)
             if not price:
                 nuevos[symbol] = data; continue
+
             change = (price - buy_price) / buy_price
+
+            # Actualiza pico y trailing
+            peak = max(peak, price)
+            trailing_active = (peak - buy_price) / buy_price >= TRAIL_ACTIVATE
+            trail_hit = trailing_active and (price <= peak * (1 - TRAIL_PCT))
+
+            # RSI para sobrecompra adicional
             kl = safe_get_klines(symbol, Client.KLINE_INTERVAL_5MINUTE, 60)
             if not kl:
                 nuevos[symbol] = data; continue
             closes = [float(k[4]) for k in kl]
             rsi = calculate_rsi(closes, RSI_PERIOD)
 
+            # Señales de salida
             tp = change >= TAKE_PROFIT
             sl = change <= STOP_LOSS
             ob = rsi >= RSI_SELL_OVERBOUGHT
+            rotate = change >= ROTATE_PROFIT  # rotación por ganancia modesta
 
-            if tp or sl or ob:
+            debe_vender = tp or sl or ob or trail_hit or rotate
+
+            if debe_vender:
                 step, _, _ = get_filter_values_cached(symbol)
                 qty_q = quantize_qty(qty, step)
-                if qty_q <= 0: continue
+                if qty_q <= 0: 
+                    continue
                 client.order_market_sell(symbol=symbol, quantity=qty_q)
                 realized = (price - buy_price) * qty_q
                 total_pnl = actualizar_pnl_diario(realized)
-                motivo = "TP" if tp else ("SL" if sl else "RSI")
-                enviar_telegram(f"🔴 Venta {symbol} qty={qty_q} @ {price:.8f} ({change*100:.2f}%) Motivo: {motivo} RSI:{rsi:.1f} | PnL: {realized:.4f} {quote} | PnL hoy: {total_pnl:.4f}")
+                motivo = ("TP" if tp else ("SL" if sl else ("RSI" if ob else ("TRAIL" if trail_hit else "ROTATE"))))
+                enviar_telegram(
+                    f"🔴 Venta {symbol} qty={qty_q} @ {price:.8f} ({change*100:.2f}%) "
+                    f"Motivo: {motivo} RSI:{rsi:.1f} | PnL: {realized:.4f} {quote} | PnL hoy: {total_pnl:.4f}"
+                )
+                # ROTACIÓN INMEDIATA: intenta comprar otra con la misma quote
+                balances = holdings_por_asset()
+                reg_tmp = leer_posiciones()
+                reg_tmp.pop(symbol, None)  # ya vendida
+                escribir_posiciones(reg_tmp)
+                _ = comprar_oportunidad_for_quote(quote, reg_tmp, balances)
             else:
+                # guarda pico actualizado
+                data["peak"] = float(peak)
                 nuevos[symbol] = data
+
         except BinanceAPIException as e:
             logger.error(f"Gestion error {symbol}: {e}")
             backoff_sleep(e); nuevos[symbol] = data
@@ -536,6 +633,7 @@ def gestionar_posiciones():
             backoff_sleep(e); nuevos[symbol] = data
     escribir_posiciones(nuevos)
 
+# ───────────── LIMPIEZA y RESUMEN ─────────────
 def limpiar_dust():
     if not (client and EX_INFO_READY): return
     try:
@@ -601,8 +699,9 @@ def init_loop():
 
 def run_bot():
     enviar_telegram(
-        f"🤖 Bot spot activo. Posiciones cada {FAST_SEC}s, compras cada {BUY_SEC}s, limpieza cada {DUST_MIN}min. "
-        f"TP 5%, SL 2%, órdenes 15–20 USDC. Sin stables↔stables. Modo agresivo={AGGRESSIVE_MODE}"
+        f"🤖 Bot spot activo. Posiciones {FAST_SEC}s, compras {BUY_SEC}s, limpieza {DUST_MIN}min. "
+        f"TP {TAKE_PROFIT*100:.1f}%, ROTATE {ROTATE_PROFIT*100:.1f}%, Trail {TRAIL_ACTIVATE*100:.1f}/{TRAIL_PCT*100:.1f}%. "
+        f"Órdenes 15–20. Sin stables↔stables."
     )
     scheduler = BackgroundScheduler(timezone=TIMEZONE)
     scheduler.add_job(gestionar_posiciones, 'interval', seconds=FAST_SEC, max_instances=1)
