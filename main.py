@@ -273,13 +273,11 @@ def scan_candidatos():
     if not tickers:
         return []
 
-    # Sólo símbolos spot activos, con quote preferida, base NO stable y no en blacklist
+    # Filtro RELAJADO: status TRADING, quote preferida, base NO stable, no blacklist
     symbols_ok = set()
     for sym, meta in SYMBOL_MAP.items():
         if (meta["status"] == "TRADING"
             and meta["quote"] in PREFERRED_QUOTES
-            and meta.get("isSpotAllowed", False)
-            and ("SPOT" in meta.get("permissions", []))
             and meta["base"] not in STABLES
             and sym not in NOT_PERMITTED):
             symbols_ok.add(sym)
@@ -297,7 +295,7 @@ def scan_candidatos():
     reduced = []
     for q, arr in by_quote.items():
         arr.sort(key=lambda x: x[0], reverse=True)
-        # sube el techo por quote a 200 para más candidatos
+        # top 200 por quote para más candidatos
         reduced.extend([t for _, t in arr[:200]])
 
     for t in reduced:
@@ -399,11 +397,34 @@ def comprar_oportunidad_for_quote(quote, reg, balances):
             sym = symbol_exists(base, quote)
             if (sym and sym not in reg and sym not in NOT_PERMITTED):
                 meta = SYMBOL_MAP[sym]
-                if (meta.get("isSpotAllowed", False) and "SPOT" in meta.get("permissions", [])
-                    and meta["base"] not in STABLES):
+                if meta["status"] == "TRADING" and SYMBOL_MAP[sym]["base"] not in STABLES:
                     elegido = {"symbol": sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": 0}
                     logger.info(f"[ROTATE] Elegido fallback para rotación: {sym}")
                     break
+
+    # FORCE BUY: si no hay nada, elegir TOP por volumen en esta quote (sin RSI)
+    if not elegido and AGGRESSIVE_MODE:
+        logger.info(f"[FORCE] Rotación: forzando entrada por top volumen en {quote}")
+        tickers = safe_get_ticker_24h() or []
+        candidatos_force = []
+        for t in tickers:
+            sym = t["symbol"]
+            if sym in NOT_PERMITTED or sym not in SYMBOL_MAP:
+                continue
+            meta = SYMBOL_MAP[sym]
+            if (meta["status"] == "TRADING"
+                and meta["quote"] == quote
+                and meta["base"] not in STABLES):
+                try:
+                    vol = float(t.get("quoteVolume", 0.0))
+                    candidatos_force.append((vol, sym))
+                except Exception:
+                    continue
+        candidatos_force.sort(reverse=True)
+        if candidatos_force:
+            elegido_sym = candidatos_force[0][1]
+            elegido = {"symbol": elegido_sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": candidatos_force[0][0]}
+            logger.info(f"[FORCE] Elegido top volumen (rotación) {quote}: {elegido_sym}")
 
     if not elegido:
         return False
@@ -493,8 +514,7 @@ def comprar_oportunidad():
                     sym = symbol_exists(base, quote)
                     if (sym and sym not in reg and sym not in NOT_PERMITTED):
                         meta = SYMBOL_MAP[sym]
-                        if (meta.get("isSpotAllowed", False) and "SPOT" in meta.get("permissions", [])
-                            and meta["base"] not in STABLES):
+                        if meta["status"] == "TRADING" and SYMBOL_MAP[sym]["base"] not in STABLES:
                             try:
                                 kl = safe_get_klines(sym, Client.KLINE_INTERVAL_5MINUTE, 30)
                                 if not kl: continue
@@ -507,19 +527,42 @@ def comprar_oportunidad():
                             except Exception:
                                 continue
 
-            # FORCE BUY si pasa demasiado tiempo sin compras
+            # FORCE BUY si pasa demasiado tiempo sin compras: fallback o top volumen
             if not elegido and AGGRESSIVE_MODE and tiempo_sin_comprar >= FORCE_BUY_AFTER_SEC:
+                logger.info(f"[FORCE] Tiempo sin comprar={tiempo_sin_comprar:.0f}s -> Forzando entrada en {quote}")
+                # 1) Fallback sin RSI
                 for base in FALLBACK_SYMBOLS:
-                    if base in STABLES: 
+                    if base in STABLES:
                         continue
                     sym = symbol_exists(base, quote)
-                    if (sym and sym not in reg and sym not in NOT_PERMITTED):
+                    if sym and sym not in reg and sym not in NOT_PERMITTED:
                         meta = SYMBOL_MAP[sym]
-                        if (meta.get("isSpotAllowed", False) and "SPOT" in meta.get("permissions", [])
-                            and meta["base"] not in STABLES):
+                        if meta["status"] == "TRADING" and SYMBOL_MAP[sym]["base"] not in STABLES:
                             elegido = {"symbol": sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": 0}
-                            logger.info(f"[FORCE] Elegido por fuerza (fallback sin RSI): {sym}")
+                            logger.info(f"[FORCE] Elegido por fallback: {sym}")
                             break
+                # 2) Top volumen sin RSI
+                if not elegido:
+                    tickers = safe_get_ticker_24h() or []
+                    candidatos_force = []
+                    for t in tickers:
+                        sym = t["symbol"]
+                        if sym in NOT_PERMITTED or sym not in SYMBOL_MAP:
+                            continue
+                        meta = SYMBOL_MAP[sym]
+                        if (meta["status"] == "TRADING"
+                            and meta["quote"] == quote
+                            and meta["base"] not in STABLES):
+                            try:
+                                vol = float(t.get("quoteVolume", 0.0))
+                                candidatos_force.append((vol, sym))
+                            except Exception:
+                                continue
+                    candidatos_force.sort(reverse=True)
+                    if candidatos_force:
+                        elegido_sym = candidatos_force[0][1]
+                        elegido = {"symbol": elegido_sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": candidatos_force[0][0]}
+                        logger.info(f"[FORCE] Elegido top volumen {quote}: {elegido_sym}")
 
             if not elegido:
                 logger.info(f"Sin candidato para {quote}; saldo se mantiene hasta próximo ciclo.")
