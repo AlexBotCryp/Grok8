@@ -2,6 +2,7 @@ import os, time, json, logging, requests, pytz, numpy as np, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
+from time import monotonic
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -33,19 +34,25 @@ RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "30"))
 RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "70"))
 RSI_SELL_OVERBOUGHT = float(os.getenv("RSI_SELL_OVERBOUGHT", "68"))
 
-USE_FALLBACK = os.getenv("USE_FALLBACK", "true").lower() == "true"
-FALLBACK_SYMBOLS = [s.strip().upper() for s in os.getenv(
-    "FALLBACK_SYMBOLS", "BTC,ETH,SOL,BNB,MATIC,XRP,ADA,TRX,DOGE,LINK"
-).split(",") if s.strip()]
+# LLM (ChatGPT - OpenAI) config
+LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() == "true"   # activado por defecto
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+LLM_SCORE_THRESHOLD = float(os.getenv("LLM_SCORE_THRESHOLD", "58"))   # umbral de OK (permisivo)
+LLM_BLOCK_THRESHOLD = float(os.getenv("LLM_BLOCK_THRESHOLD", "28"))   # solo bloquea si ≤28 (muy negativo)
+LLM_MAX_CALLS_PER_MIN = int(os.getenv("LLM_MAX_CALLS_PER_MIN", "10")) # rate-limit suave
 
+# Zona horaria
 TZ_NAME = os.getenv("TZ", "Europe/Madrid")
 TIMEZONE = pytz.timezone(TZ_NAME)
 
+# Quotes preferidas (permitimos rotar vía cripto: USDC/USDT/BTC/ETH/BNB)
 PREFERRED_QUOTES = [q.strip().upper() for q in os.getenv(
-    "PREFERRED_QUOTES", "USDC,USDT"
+    "PREFERRED_QUOTES", "USDC,USDT,BTC,ETH,BNB"
 ).split(",") if q.strip()]
 
-# Ciclos rápidos (por defecto, más seguidos)
+# Ciclos / caché
 FAST_SEC = int(os.getenv("FAST_SEC", "10"))           # gestionar_posiciones
 BUY_SEC  = int(os.getenv("BUY_SEC", "20"))            # comprar_oportunidad
 DUST_MIN = int(os.getenv("DUST_MIN", "5"))            # limpiar_dust
@@ -79,6 +86,10 @@ CAND_CACHE = []
 LAST_BUY_TS = 0.0
 BUY_LOCK = threading.Lock()   # lock para evitar solapes
 
+# Rate-limit para LLM
+_llm_window = {"start": 0.0, "count": 0}
+_llm_lock = threading.Lock()
+
 # ───────────── TELEGRAM ─────────────
 def telegram_enabled():
     return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
@@ -111,6 +122,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     "positions_file_exists": os.path.exists(REGISTRO_FILE),
                     "pnl_file_exists": os.path.exists(PNL_DIARIO_FILE),
                     "blacklist_size": len(NOT_PERMITTED),
+                    "llm": "ON" if (LLM_ENABLED and bool(OPENAI_API_KEY)) else "OFF"
                 }
                 body = json.dumps(status).encode()
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
@@ -263,6 +275,65 @@ def calculate_rsi(closes, period=14):
         rsi = 100 - (100 / (1 + rs))
     return float(rsi)
 
+# ───────────── LLM (ChatGPT) ─────────────
+def llm_rate_ok() -> bool:
+    if not (LLM_ENABLED and OPENAI_API_KEY and OPENAI_MODEL):
+        return False
+    now = monotonic()
+    with _llm_lock:
+        if _llm_window["start"] == 0.0:
+            _llm_window["start"] = now
+        if now - _llm_window["start"] > 60.0:
+            _llm_window["start"] = now
+            _llm_window["count"] = 0
+        if _llm_window["count"] < LLM_MAX_CALLS_PER_MIN:
+            _llm_window["count"] += 1
+            return True
+        return False
+
+def llm_score_entry(symbol: str, quote: str, price: float, rsi: float, vol_quote: float, trend_hint: str) -> tuple:
+    """
+    Devuelve (score 0..100, reason).
+    Si LLM no disponible o rate-limit, devuelve (50, 'skip').
+    """
+    if not llm_rate_ok():
+        return 50.0, "skip"
+    try:
+        prompt = (
+            "Eres un asistente de trading spot para cripto con horizonte muy corto (scalping/rotación).\n"
+            "Evalúa si vale la pena COMPRAR ahora, buscando salidas rápidas con TP bajo y trailing.\n"
+            "Evita falsos rompimientos y velas exhaustas. Considera RSI y fuerza/volumen.\n"
+            f"Par: {symbol} (quote {quote})\n"
+            f"Precio: {price:.8f} | RSI(14): {rsi:.1f} | Volumen quote 24h: {vol_quote:.0f}\n"
+            f"Tendencia 5m: {trend_hint}\n"
+            "Devuelve SOLO JSON: {\"score\": 0-100, \"reason\": \"muy breve\"}"
+        )
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 80
+        }
+        resp = requests.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"]
+        # parseo flexible
+        try:
+            j = json.loads(text)
+            score = float(j.get("score", 50))
+            reason = str(j.get("reason", "")).strip()[:140]
+            return max(0.0, min(100.0, score)), reason
+        except Exception:
+            import re
+            m = re.search(r"(\d{1,3})", text)
+            score = float(m.group(1)) if m else 50.0
+            return max(0.0, min(100.0, score)), text[:140]
+    except Exception as e:
+        logger.debug(f"LLM fallo: {e}")
+        return 50.0, "error"
+
 # ───────────── ESTRATEGIA + CACHÉ ─────────────
 def scan_candidatos():
     if not (client and EX_INFO_READY):
@@ -398,19 +469,25 @@ def comprar_oportunidad_for_quote(quote, reg, balances):
         if base_asset in STABLES or elegido["symbol"] in NOT_PERMITTED:
             elegido = None
 
-    if not elegido and USE_FALLBACK:
-        for base in FALLBACK_SYMBOLS:
-            if base in STABLES:
-                continue
+    if not elegido:
+        # Fallback RSI suave a símbolos conocidos de alta liquidez
+        for base in ["BTC","ETH","SOL","BNB","MATIC","XRP","ADA","TRX","DOGE","LINK"]:
+            if base in STABLES: continue
             sym = symbol_exists(base, quote)
-            if (sym and sym not in reg and sym not in NOT_PERMITTED):
-                meta = SYMBOL_MAP[sym]
-                if meta["status"] == "TRADING" and SYMBOL_MAP[sym]["base"] not in STABLES:
-                    elegido = {"symbol": sym, "quote": quote, "rsi": 50.0, "lastPrice": 0, "quoteVolume": 0}
-                    logger.info(f"[ROTATE] Elegido fallback para rotación: {sym}")
-                    break
+            if (sym and sym not in reg and sym not in NOT_PERMITTED and SYMBOL_MAP[sym]["status"] == "TRADING"):
+                try:
+                    kl = safe_get_klines(sym, Client.KLINE_INTERVAL_5MINUTE, 30)
+                    if not kl: continue
+                    closes = [float(k[4]) for k in kl]
+                    rsi = calculate_rsi(closes, RSI_PERIOD)
+                    if 35 <= rsi <= 70:
+                        elegido = {"symbol": sym, "quote": quote, "rsi": rsi, "lastPrice": closes[-1], "quoteVolume": 0}
+                        logger.info(f"[ROTATE] Elegido fallback: {sym}")
+                        break
+                except Exception:
+                    continue
 
-    # FORCE BUY: si no hay nada, elegir TOP por volumen en esta quote (sin RSI)
+    # FORCE BUY: top por volumen en esta quote (sin RSI) si aún no hay
     if not elegido and AGGRESSIVE_MODE:
         logger.info(f"[FORCE] Rotación: forzando entrada por top volumen en {quote}")
         tickers = safe_get_ticker_24h() or []
@@ -442,6 +519,21 @@ def comprar_oportunidad_for_quote(quote, reg, balances):
     if not price:
         return False
     step, _, _ = get_filter_values_cached(symbol)
+
+    # === ChatGPT scoring (permisivo) ===
+    proceed_llm = True
+    if LLM_ENABLED and OPENAI_API_KEY:
+        trend_hint = "alcista"  # heurística simple
+        score, reason = llm_score_entry(symbol, quote, price, float(elegido.get("rsi", 50.0)), float(elegido.get("quoteVolume", 0.0)), trend_hint)
+        enviar_telegram(f"🧠 LLM {symbol} score={score:.1f} • {reason}")
+        logger.info(f"[LLM] {symbol} score={score:.1f} motivo={reason}")
+        # Lógica permisiva: solo bloquea si el LLM es MUY negativo
+        if score <= LLM_BLOCK_THRESHOLD:
+            proceed_llm = False
+            logger.info(f"[LLM] BLOQUEA {symbol} por score ≤ {LLM_BLOCK_THRESHOLD}")
+
+    if not proceed_llm:
+        return False
 
     usd_orden = min(next_order_size(), disponible)
     qty = quantize_qty(usd_orden / price, step)
@@ -524,31 +616,28 @@ def comprar_oportunidad():
                         elegido = None
 
                 # Fallback con RSI suave
-                if not elegido and USE_FALLBACK:
-                    for base in FALLBACK_SYMBOLS:
-                        if base in STABLES:
-                            continue
+                if not elegido:
+                    for base in ["BTC","ETH","SOL","BNB","MATIC","XRP","ADA","TRX","DOGE","LINK"]:
+                        if base in STABLES: continue
                         sym = symbol_exists(base, quote)
-                        if (sym and sym not in reg and sym not in NOT_PERMITTED):
-                            meta = SYMBOL_MAP[sym]
-                            if meta["status"] == "TRADING" and SYMBOL_MAP[sym]["base"] not in STABLES:
-                                try:
-                                    kl = safe_get_klines(sym, Client.KLINE_INTERVAL_5MINUTE, 30)
-                                    if not kl: continue
-                                    closes = [float(k[4]) for k in kl]
-                                    rsi = calculate_rsi(closes, RSI_PERIOD)
-                                    if 35 <= rsi <= 65:
-                                        elegido = {"symbol": sym, "quote": quote, "rsi": rsi,
-                                                   "lastPrice": closes[-1], "quoteVolume": 0}
-                                        break
-                                except Exception:
-                                    continue
+                        if (sym and sym not in reg and sym not in NOT_PERMITTED and SYMBOL_MAP[sym]["status"] == "TRADING"):
+                            try:
+                                kl = safe_get_klines(sym, Client.KLINE_INTERVAL_5MINUTE, 30)
+                                if not kl: continue
+                                closes = [float(k[4]) for k in kl]
+                                rsi = calculate_rsi(closes, RSI_PERIOD)
+                                if 35 <= rsi <= 70:
+                                    elegido = {"symbol": sym, "quote": quote, "rsi": rsi,
+                                               "lastPrice": closes[-1], "quoteVolume": 0}
+                                    break
+                            except Exception:
+                                continue
 
                 # FORCE BUY si pasa demasiado tiempo sin compras: fallback o top volumen
                 if not elegido and AGGRESSIVE_MODE and tiempo_sin_comprar >= FORCE_BUY_AFTER_SEC:
                     logger.info(f"[FORCE] Tiempo sin comprar={tiempo_sin_comprar:.0f}s -> Forzando entrada en {quote}")
                     # 1) Fallback sin RSI
-                    for base in FALLBACK_SYMBOLS:
+                    for base in ["BTC","ETH","SOL","BNB","MATIC","XRP","ADA","TRX","DOGE","LINK"]:
                         if base in STABLES:
                             continue
                         sym = symbol_exists(base, quote)
@@ -589,6 +678,25 @@ def comprar_oportunidad():
                 price = obtener_precio(symbol)
                 if not price: break
                 step, _, _ = get_filter_values_cached(symbol)
+
+                # === ChatGPT scoring (permisivo) ===
+                proceed_llm = True
+                if LLM_ENABLED and OPENAI_API_KEY:
+                    trend_hint = "alcista" if elegido.get("lastPrice", price) >= price else "mixta"
+                    score, reason = llm_score_entry(symbol, quote, price, float(elegido.get("rsi", 50.0)), float(elegido.get("quoteVolume", 0.0)), trend_hint)
+                    enviar_telegram(f"🧠 LLM {symbol} score={score:.1f} • {reason}")
+                    logger.info(f"[LLM] {symbol} score={score:.1f} motivo={reason}")
+                    if score <= LLM_BLOCK_THRESHOLD:
+                        proceed_llm = False
+                        logger.info(f"[LLM] BLOQUEA {symbol} por score ≤ {LLM_BLOCK_THRESHOLD}")
+
+                if not proceed_llm:
+                    # busca otro candidato de la misma quote
+                    if len(candidatos) > 1:
+                        candidatos = candidatos[1:]
+                        continue
+                    else:
+                        break  # pasa a otra quote/ciclo
 
                 usd_orden = min(next_order_size(), disponible)
                 qty = quantize_qty(usd_orden / price, step)
@@ -695,7 +803,7 @@ def gestionar_posiciones():
                     f"🔴 Venta {symbol} qty={qty_q} @ {price:.8f} ({change*100:.2f}%) "
                     f"Motivo: {motivo} RSI:{rsi:.1f} | PnL: {realized:.4f} {quote} | PnL hoy: {total_pnl:.4f}"
                 )
-                # ROTACIÓN INMEDIATA
+                # ROTACIÓN INMEDIATA (misma quote que obtuvimos al vender)
                 balances = holdings_por_asset()
                 reg_tmp = leer_posiciones()
                 reg_tmp.pop(symbol, None)
@@ -779,9 +887,9 @@ def init_loop():
 
 def run_bot():
     enviar_telegram(
-        f"🤖 Bot spot activo. Posiciones {FAST_SEC}s, compras {BUY_SEC}s, limpieza {DUST_MIN}min. "
+        f"🤖 Bot spot activo + ChatGPT. Posiciones {FAST_SEC}s, compras {BUY_SEC}s, limpieza {DUST_MIN}min. "
         f"TP {TAKE_PROFIT*100:.1f}%, ROTATE {ROTATE_PROFIT*100:.1f}%, Trail {TRAIL_ACTIVATE*100:.1f}/{TRAIL_PCT*100:.1f}%. "
-        f"Órdenes 15–20. Sin stables↔stables."
+        f"Órdenes 15–20. Rotación vía USDC/USDT/BTC/ETH/BNB. LLM {'ON' if (LLM_ENABLED and OPENAI_API_KEY) else 'OFF'}."
     )
     scheduler = BackgroundScheduler(timezone=TIMEZONE)
     scheduler.add_job(gestionar_posiciones, 'interval', seconds=FAST_SEC, max_instances=1)
