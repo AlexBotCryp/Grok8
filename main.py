@@ -20,7 +20,7 @@ PORT = int(os.getenv("PORT", "10000"))  # Render Web Service
 
 # ───────────── ESTRATEGIA (agresiva, rotación continua) ─────────────
 USD_MIN = float(os.getenv("USD_MIN", "5"))     # órdenes pequeñas para que siempre se mueva
-USD_MAX = float(os.getenv("USD_MAX", "8"))
+USD_MAX = float(os.getenv("USD_MAX", "12"))
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.015"))      # 1.5% TP
 STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))          # -2% SL
 ROTATE_PROFIT = float(os.getenv("ROTATE_PROFIT", "0.006"))  # 0.6%: rotación rápida
@@ -39,14 +39,18 @@ AGGRESSIVE_MODE = os.getenv("AGGRESSIVE_MODE", "true").lower() == "true"
 FORCE_BUY_AFTER_SEC = int(os.getenv("FORCE_BUY_AFTER_SEC", "60"))  # 60s sin compras => fuerza
 MAX_BUY_ATTEMPTS_PER_QUOTE = int(os.getenv("MAX_BUY_ATTEMPTS_PER_QUOTE", "12"))
 
-# Quotes preferidas (empezamos con stables para moverse)
+# Quotes preferidas (incluye cripto-quotes para rotación directa)
 PREFERRED_QUOTES = [q.strip().upper() for q in os.getenv(
-    "PREFERRED_QUOTES", "USDC,USDT"
+    "PREFERRED_QUOTES", "USDC,USDT,BTC,ETH,BNB"
 ).split(",") if q.strip()]
 
 # Comisión de Binance (taker). Intentaremos leer la real por símbolo; fallback a esta:
 COMMISSION_DEFAULT = float(os.getenv("COMMISSION_DEFAULT", "0.001"))  # 0.1%
 SLIPPAGE_BUFFER_PCT = float(os.getenv("SLIPPAGE_BUFFER_PCT", "0.0005"))  # 0.05% colchón
+
+# Filtros (NOTIONAL/minQty) buffers
+NOTIONAL_BUFFER = float(os.getenv("NOTIONAL_BUFFER", "1.03"))  # 3% margen sobre minNotional
+MIN_QTY_BUFFER  = float(os.getenv("MIN_QTY_BUFFER", "1.0"))    # 1.0 = igual que minQty
 
 # LLM (ChatGPT - OpenAI) como filtro permisivo
 LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() == "true"
@@ -55,6 +59,9 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").stri
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 LLM_BLOCK_THRESHOLD = float(os.getenv("LLM_BLOCK_THRESHOLD", "10"))  # solo bloquea si <= 10 (muy feo)
 LLM_MAX_CALLS_PER_MIN = int(os.getenv("LLM_MAX_CALLS_PER_MIN", "10"))
+
+# Consolidación opcional a USDC (por defecto OFF para rotación cripto→cripto)
+CONSOLIDATE_TO_USDC = os.getenv("CONSOLIDATE_TO_USDC", "false").lower() == "true"
 
 # Zona horaria
 TZ_NAME = os.getenv("TZ", "Europe/Madrid")
@@ -223,13 +230,19 @@ def find_best_route(base_asset, target_quote_list):
 
 def get_filter_values(symbol):
     f = SYMBOL_MAP[symbol]["filters"]
-    lot = f.get("LOT_SIZE", {})
+    lot   = f.get("LOT_SIZE", {})
     price = f.get("PRICE_FILTER", {})
-    notional = f.get("MIN_NOTIONAL", {})
-    step = Decimal(lot.get("stepSize", "1"))
-    tick = Decimal(price.get("tickSize", "1"))
-    min_notional = float(notional.get("minNotional", "0"))
-    return step, tick, min_notional
+    # minNotional puede estar en MIN_NOTIONAL o NOTIONAL (depende del par/época)
+    if "MIN_NOTIONAL" in f:
+        min_notional = float(f["MIN_NOTIONAL"].get("minNotional", "0"))
+    elif "NOTIONAL" in f:
+        min_notional = float(f["NOTIONAL"].get("minNotional", "0"))
+    else:
+        min_notional = 0.0
+    step    = Decimal(lot.get("stepSize", "1"))
+    min_qty = float(lot.get("minQty", "0"))
+    tick    = Decimal(price.get("tickSize", "1"))
+    return step, tick, min_notional, min_qty
 
 def quantize_qty(qty, step: Decimal):
     if step == 0:
@@ -287,7 +300,7 @@ def obtener_precio(symbol):
             if client is None: break
 
 def min_usd_to_quote_amount(quote: str, usd_amount: float) -> float:
-    """Convierte monto en USD a unidades de 'quote' usando precio QUOTEUSDT si existe."""
+    """Convierte monto en USD a unidades de 'quote' usando QUOTEUSDT si existe."""
     if quote in ("USDT","USDC"): 
         return usd_amount
     sym = quote + "USDT"
@@ -298,13 +311,13 @@ def min_usd_to_quote_amount(quote: str, usd_amount: float) -> float:
     return usd_amount  # fallback
 
 # ───────────── FEE / COMISIÓN ─────────────
+FEE_CACHE = {}
 def get_commission_rate(symbol: str) -> float:
     """Intenta leer taker fee real; fallback COMMISSION_DEFAULT."""
     try:
         if symbol in FEE_CACHE:
             return FEE_CACHE[symbol]
         fees = client.get_trade_fee(symbol=symbol)
-        # API puede devolver lista; campos suelen venir como str o float
         if isinstance(fees, list) and fees:
             f = fees[0]
             taker = float(f.get("takerCommission", COMMISSION_DEFAULT))
@@ -312,7 +325,6 @@ def get_commission_rate(symbol: str) -> float:
             taker = float(fees.get("takerCommission", COMMISSION_DEFAULT))
         else:
             taker = COMMISSION_DEFAULT
-        # Si parece muy pequeña/0, usa default
         if taker <= 0 or taker > 0.01:
             taker = COMMISSION_DEFAULT
         FEE_CACHE[symbol] = taker
@@ -322,9 +334,7 @@ def get_commission_rate(symbol: str) -> float:
 
 def expected_net_after_fee(buy_price: float, cur_price: float, qty: float, fee_rate: float) -> float:
     """
-    Devuelve PnL neto (en moneda quote del símbolo) considerando comisiones de compra y venta.
-    net = qty*(cur_price - buy_price) - fee_rate*(buy_price*qty) - fee_rate*(cur_price*qty)
-    Además, resta pequeño buffer de slippage.
+    PnL neto (en moneda quote del símbolo) considerando comisiones de compra y venta + pequeño buffer de slippage.
     """
     if qty <= 0: return 0.0
     gross = qty * (cur_price - buy_price)
@@ -349,10 +359,6 @@ def llm_rate_ok() -> bool:
         return False
 
 def llm_score_entry(symbol: str, quote: str, price: float, rsi: float, vol_quote: float, trend_hint: str) -> tuple:
-    """
-    Devuelve (score 0..100, reason).
-    Si LLM no disponible o rate-limit, devuelve (50, 'skip').
-    """
     if not llm_rate_ok():
         return 50.0, "skip"
     try:
@@ -484,13 +490,66 @@ def free_base_qty(symbol: str) -> float:
     except Exception:
         return 0.0
 
-# ───────────── COMPRAS ─────────────
+# ───────────── SIZING (NOTIONAL/minQty) ─────────────
+def compute_order_qty(symbol: str, quote: str, price: float, quote_available: float, prefer_quote_amount: float) -> tuple[float, float]:
+    """
+    Calcula qty que cumpla NOTIONAL mínimo (con buffer), LOT_SIZE minQty y no exceda saldo.
+    Devuelve (qty, spend_in_quote). Si no se puede, (0.0, 0.0).
+    """
+    step, _, min_notional, min_qty = get_filter_values(symbol)
+    # objetivo inicial de gasto en quote
+    target_spend = max(prefer_quote_amount, min_notional * NOTIONAL_BUFFER)
+    spend = min(quote_available, target_spend)
+    if spend <= 0 or price <= 0:
+        return 0.0, 0.0
+
+    qty = quantize_qty(spend / price, step)
+    if qty < (min_qty * MIN_QTY_BUFFER):
+        # intenta subir el gasto si hay saldo
+        spend = min(quote_available, target_spend * 1.5)
+        qty = quantize_qty(spend / price, step)
+
+    # chequeos finales
+    if qty <= 0:
+        return 0.0, 0.0
+    if qty < (min_qty * MIN_QTY_BUFFER):
+        return 0.0, 0.0
+    if (qty * price) < (min_notional * NOTIONAL_BUFFER):
+        return 0.0, 0.0
+
+    return qty, spend
+
+# ───────────── LÓGICA DE COMPRAS ─────────────
+def quotes_ordenadas_por_saldo(balances: dict) -> list:
+    """
+    Devuelve las quotes preferidas ordenadas por 'poder de compra' aproximado en USD,
+    para que el bot empiece por donde realmente hay dinero (ej. BTC/ETH/BNB).
+    """
+    valores = []
+    for q in PREFERRED_QUOTES:
+        amt = float(balances.get(q, 0.0))
+        if amt <= 0: 
+            continue
+        # convierte quote->USD si hace falta
+        if q in ("USDT","USDC"):
+            usd_val = amt
+        else:
+            sym = q + "USDT"
+            if sym in SYMBOL_MAP and SYMBOL_MAP[sym]["status"] == "TRADING":
+                p = obtener_precio(sym) or 0.0
+                usd_val = amt * p if p > 0 else 0.0
+            else:
+                usd_val = 0.0
+        valores.append((usd_val, q))
+    valores.sort(reverse=True)
+    return [q for _, q in valores] or PREFERRED_QUOTES
+
 def comprar_oportunidad_for_quote(quote, reg, balances):
-    """Intenta gastar una orden (5–8 USD por defecto) en la quote indicada para rotación inmediata."""
+    """Intenta gastar una orden en la quote indicada (cripto o stable) para rotación inmediata."""
     if len(reg) >= MAX_OPEN_POSITIONS:
         return False
     disponible = float(balances.get(quote, 0.0))
-    if disponible < min(USD_MIN, USD_MAX):
+    if disponible <= 0:
         return False
 
     cand_all = get_candidates_cached()
@@ -551,9 +610,8 @@ def comprar_oportunidad_for_quote(quote, reg, balances):
     price = obtener_precio(symbol)
     if not price:
         return False
-    step, _, _ = get_filter_values(symbol)
 
-    # Scoring LLM permisivo (solo bloquea si muy negativo)
+    # === ChatGPT scoring (permisivo) ===
     proceed_llm = True
     if LLM_ENABLED and OPENAI_API_KEY:
         trend_hint = "alcista"
@@ -566,35 +624,30 @@ def comprar_oportunidad_for_quote(quote, reg, balances):
     if not proceed_llm:
         return False
 
-    # Dimensionar orden en términos de quote (si quote no es USD)
-    orden_en_quote = min_usd_to_quote_amount(quote, min(next_order_size(), disponible))
-    qty = quantize_qty(orden_en_quote / price, step)
+    # --- dimensionado por quote + notional ---
+    base_usd = min(next_order_size(), disponible)
+    orden_en_quote = min_usd_to_quote_amount(quote, base_usd)
+    qty, spend = compute_order_qty(symbol, quote, price, disponible, orden_en_quote)
     if qty <= 0:
+        logger.info(f"[NOTIONAL] {symbol}: no alcanza notional/minQty con saldo {disponible} {quote}")
         return False
 
-    # Rechazar compra si el TP % no cubre comisiones esperadas (neto > 0)
+    # Compra solo si TP cubre fees (net > 0)
     fee_rate = get_commission_rate(symbol)
     future_price = price * (1 + TAKE_PROFIT)
     net_tp = expected_net_after_fee(price, future_price, qty, fee_rate)
     if net_tp <= 0:
-        # prueba incremental si hay margen
-        orden_en_quote = min(max(orden_en_quote * 1.3, min(USD_MIN, USD_MAX)), disponible)
-        qty = quantize_qty(orden_en_quote / price, step)
-        net_tp = expected_net_after_fee(price, future_price, qty, fee_rate)
-        if qty <= 0 or net_tp <= 0:
-            logger.info(f"[NET] {symbol}: TP no cubre comisiones (net={net_tp:.6f} {quote}).")
-            return False
-
-    # Verificar minNotional
-    def min_notional_ok(symbol, price, qty):
-        _, _, min_notional = get_filter_values(symbol)
-        return (price * qty) >= min_notional * 1.02
-
-    if not min_notional_ok(symbol, price, qty):
-        orden_en_quote = min(max(orden_en_quote * 1.3, min(USD_MIN, USD_MAX)), disponible)
-        qty = quantize_qty(orden_en_quote / price, step)
-        if qty <= 0 or not min_notional_ok(symbol, price, qty):
-            logger.info(f"[ROTATE] {symbol}: no alcanza minNotional con saldo disponible.")
+        extra_target = min(disponible, spend * 1.3)
+        qty2, spend2 = compute_order_qty(symbol, quote, price, disponible, extra_target)
+        if qty2 > 0:
+            net_tp2 = expected_net_after_fee(price, future_price, qty2, fee_rate)
+            if net_tp2 > 0:
+                qty, spend = qty2, spend2
+            else:
+                logger.info(f"[NET] {symbol}: TP no cubre comisiones (net={net_tp2:.6f} {quote}).")
+                return False
+        else:
+            logger.info(f"[NET] {symbol}: no se pudo aumentar para cubrir fees/notional.")
             return False
 
     try:
@@ -638,20 +691,24 @@ def comprar_oportunidad():
         if len(reg) >= MAX_OPEN_POSITIONS: return
         balances = holdings_por_asset()
 
+        # Ordena las quotes por poder de compra real (para empezar por donde hay saldo)
+        quotes = quotes_ordenadas_por_saldo(balances)
         try:
-            dbg = {q: float(balances.get(q, 0.0)) for q in PREFERRED_QUOTES}
-            logger.info(f"[DEBUG] Saldos por quote: {dbg}")
+            dbg = {q: float(balances.get(q, 0.0)) for q in quotes}
+            logger.info(f"[DEBUG] Saldos por quote (ordenados): {dbg}")
         except Exception:
             pass
 
         now = time.time()
         tiempo_sin_comprar = now - LAST_BUY_TS if LAST_BUY_TS > 0 else 1e9
 
-        for quote in PREFERRED_QUOTES:
+        for quote in quotes:
             if len(reg) >= MAX_OPEN_POSITIONS: break
             disponible = float(balances.get(quote, 0.0))
+            if disponible <= 0:
+                continue
             intentos = 0
-            while disponible >= min(USD_MIN, USD_MAX) and len(reg) < MAX_OPEN_POSITIONS:
+            while disponible > 0 and len(reg) < MAX_OPEN_POSITIONS:
                 intentos += 1
                 if intentos > MAX_BUY_ATTEMPTS_PER_QUOTE: break
 
@@ -666,6 +723,7 @@ def comprar_oportunidad():
                         elegido = None
 
                 if not elegido:
+                    # Fallback
                     for base in ["BTC","ETH","SOL","BNB","MATIC","XRP","ADA","TRX","DOGE","LINK","TON","OP","ARB","SUI","APT"]:
                         if base in STABLES: continue
                         sym = symbol_exists(base, quote)
@@ -682,6 +740,7 @@ def comprar_oportunidad():
                             except Exception:
                                 continue
 
+                # FORCE BUY si pasa demasiado tiempo sin compras
                 if not elegido and AGGRESSIVE_MODE and tiempo_sin_comprar >= FORCE_BUY_AFTER_SEC:
                     logger.info(f"[FORCE] {quote}: {tiempo_sin_comprar:.0f}s sin compras -> Forzando entrada")
                     tickers = safe_get_ticker_24h() or []
@@ -706,13 +765,12 @@ def comprar_oportunidad():
                         logger.info(f"[FORCE] Elegido top volumen {quote}: {elegido_sym}")
 
                 if not elegido:
-                    logger.info(f"Sin candidato para {quote}; saldo se mantiene hasta próximo ciclo.")
+                    logger.info(f"Sin candidato para {quote}; paso a siguiente quote/ciclo.")
                     break
 
                 symbol = elegido["symbol"]
                 price = obtener_precio(symbol)
                 if not price: break
-                step, _, _ = get_filter_values(symbol)
 
                 # LLM permisivo
                 proceed_llm = True
@@ -724,7 +782,6 @@ def comprar_oportunidad():
                     if score <= LLM_BLOCK_THRESHOLD:
                         proceed_llm = False
                         logger.info(f"[LLM] BLOQUEA {symbol} por score ≤ {LLM_BLOCK_THRESHOLD}")
-
                 if not proceed_llm:
                     if len(candidatos) > 1:
                         candidatos = candidatos[1:]
@@ -732,30 +789,29 @@ def comprar_oportunidad():
                     else:
                         break
 
-                # Dimensionado por quote
-                orden_en_quote = min_usd_to_quote_amount(quote, min(next_order_size(), disponible))
-                qty = quantize_qty(orden_en_quote / price, step)
+                # --- dimensionado por quote + notional ---
+                base_usd = min(next_order_size(), disponible)
+                orden_en_quote = min_usd_to_quote_amount(quote, base_usd)
+                qty, spend = compute_order_qty(symbol, quote, price, disponible, orden_en_quote)
                 if qty <= 0:
+                    logger.info(f"[NOTIONAL] {symbol}: no alcanza notional/minQty con saldo {disponible} {quote}")
                     break
 
                 # Compra solo si TP cubre fees (net > 0)
                 fee_rate = get_commission_rate(symbol)
                 net_tp = expected_net_after_fee(price, price*(1+TAKE_PROFIT), qty, fee_rate)
                 if net_tp <= 0:
-                    orden_en_quote = min(max(orden_en_quote * 1.3, min(USD_MIN, USD_MAX)), disponible)
-                    qty = quantize_qty(orden_en_quote / price, step)
-                    net_tp = expected_net_after_fee(price, price*(1+TAKE_PROFIT), qty, fee_rate)
-                    if qty <= 0 or net_tp <= 0:
-                        logger.info(f"[NET] {symbol}: TP no cubre comisiones (net={net_tp:.6f} {quote}).")
-                        break
-
-                # minNotional
-                _, _, min_notional = get_filter_values(symbol)
-                if (price * qty) < min_notional * 1.02:
-                    orden_en_quote = min(max(orden_en_quote * 1.3, min(USD_MIN, USD_MAX)), disponible)
-                    qty = quantize_qty(orden_en_quote / price, step)
-                    if qty <= 0 or (price*qty) < min_notional * 1.02:
-                        logger.info(f"{symbol}: no alcanza minNotional.")
+                    extra_target = min(disponible, spend * 1.3)
+                    qty2, spend2 = compute_order_qty(symbol, quote, price, disponible, extra_target)
+                    if qty2 > 0:
+                        net_tp2 = expected_net_after_fee(price, price*(1+TAKE_PROFIT), qty2, fee_rate)
+                        if net_tp2 > 0:
+                            qty, spend = qty2, spend2
+                        else:
+                            logger.info(f"[NET] {symbol}: TP no cubre comisiones (net={net_tp2:.6f} {quote}).")
+                            break
+                    else:
+                        logger.info(f"[NET] {symbol}: no se pudo aumentar para cubrir fees/notional.")
                         break
 
                 try:
@@ -827,11 +883,11 @@ def gestionar_posiciones():
             tp = change >= TAKE_PROFIT and net_now >= 0
             rotate = change >= ROTATE_PROFIT and net_now >= 0
             ob = rsi >= RSI_SELL_OVERBOUGHT and net_now >= 0
-            sl = change <= STOP_LOSS  # SL ignora net (sal de pérdidas)
+            sl = change <= STOP_LOSS  # SL ignora net (salir aunque neto<0)
             debe_vender = tp or sl or ob or trail_hit or rotate
 
             if debe_vender:
-                step, _, _ = get_filter_values(symbol)
+                step, _, min_notional, min_qty = get_filter_values(symbol)
                 free_now = free_base_qty(symbol)
                 sell_qty = min(qty, free_now) * 0.999
                 qty_q = quantize_qty(sell_qty, step)
@@ -839,9 +895,7 @@ def gestionar_posiciones():
                     logger.info(f"{symbol}: saldo libre insuficiente para vender (free={free_now:.8f}, reg={qty:.8f})")
                     continue
 
-                # verifica minNotional para venta
-                _, _, min_notional = get_filter_values(symbol)
-                if (price * qty_q) < min_notional * 1.02:
+                if (price * qty_q) < (min_notional * NOTIONAL_BUFFER):
                     logger.info(f"{symbol}: venta no cumple minNotional (qty={qty_q}).")
                     continue
 
@@ -853,7 +907,7 @@ def gestionar_posiciones():
                     f"🔴 Venta {symbol} qty={qty_q} @ {price:.8f} ({change*100:.2f}%) "
                     f"Motivo:{motivo} RSI:{rsi:.1f} | PnL neto:{realized:.4f} {quote} | Hoy:{total_pnl:.4f}"
                 )
-                # ROTACIÓN inmediata en la misma quote
+                # ROTACIÓN inmediata: reutiliza la MISMA quote (puede ser BTC/ETH/BNB/USDT/USDC)
                 balances = holdings_por_asset()
                 reg_tmp = leer_posiciones()
                 reg_tmp.pop(symbol, None)
@@ -873,36 +927,47 @@ def gestionar_posiciones():
 
 # ───────────── LIMPIEZA / CONSOLIDACIÓN / RESUMEN ─────────────
 def limpiar_dust():
+    """Vende pequeños restos (no posiciones abiertas) hacia cualquier quote preferida disponible."""
     if not (client and EX_INFO_READY): return
     try:
         reg = leer_posiciones()
         activos_reg = {SYMBOL_MAP[s]["base"] for s in reg.keys() if s in SYMBOL_MAP}
         bals = holdings_por_asset()
+        # escoge la mejor quote destino según saldo (para no pararnos)
+        quotes_dest = quotes_ordenadas_por_saldo(bals)
         for asset, qty in bals.items():
-            if asset in PREFERRED_QUOTES or qty <= 0: continue
-            if asset in activos_reg: continue
-            if asset in STABLES:  # evitar base estable
+            if qty <= 0: continue
+            if asset in STABLES:  # no limpiar stables
                 continue
-            sym, q = find_best_route(asset, PREFERRED_QUOTES)
-            if not sym or sym in NOT_PERMITTED: continue
-            if SYMBOL_MAP[sym]["base"] in STABLES: continue
-            price = obtener_precio(sym)
-            if not price: continue
-            step, _, _ = get_filter_values(sym)
-            qty_sell = quantize_qty(qty, step)
-            if qty_sell <= 0: continue
-            _, _, min_notional = get_filter_values(sym)
-            if (price * qty_sell) < min_notional * 1.02: continue
-            try:
-                client.order_market_sell(symbol=sym, quantity=qty_sell)
-                enviar_telegram(f"🧹 Limpieza: vendido {qty_sell} {asset} -> {q}")
-            except BinanceAPIException as e:
-                if getattr(e, "code", None) == -2010:
-                    NOT_PERMITTED.add(sym)
-                    logger.warning(f"Blacklist por no permitido (limpieza): {sym}")
-                else:
-                    logger.debug(f"No se pudo limpiar {asset}: {e}")
-                backoff_sleep(e)
+            if asset in activos_reg:  # está en una posición abierta
+                continue
+            # busca la mejor ruta BASE->dest_quote
+            routed = False
+            for dest in quotes_dest:
+                sym = asset + dest
+                if sym not in SYMBOL_MAP or SYMBOL_MAP[sym]["status"] != "TRADING":
+                    continue
+                price = obtener_precio(sym)
+                if not price: continue
+                step, _, min_notional, min_qty = get_filter_values(sym)
+                qty_sell = quantize_qty(qty, step)
+                if qty_sell <= 0: continue
+                if (price * qty_sell) < min_notional * NOTIONAL_BUFFER: 
+                    continue
+                try:
+                    client.order_market_sell(symbol=sym, quantity=qty_sell)
+                    enviar_telegram(f"🧹 Limpieza: vendido {qty_sell} {asset} -> {dest} via {sym}")
+                    routed = True
+                    break
+                except BinanceAPIException as e:
+                    if getattr(e, "code", None) == -2010:
+                        NOT_PERMITTED.add(sym)
+                        logger.warning(f"Blacklist por no permitido (limpieza): {sym}")
+                    else:
+                        logger.debug(f"No se pudo limpiar {asset} via {sym}: {e}")
+                    backoff_sleep(e)
+            if not routed:
+                logger.debug(f"No se pudo rutear {asset} a quotes destino {quotes_dest}")
     except Exception as e:
         logger.debug(f"limpiar_dust error: {e}")
 
@@ -919,11 +984,10 @@ def consolidar_a_quote(target_quote="USDC"):
                 continue
             price = obtener_precio(sym)
             if not price: continue
-            step, _, _ = get_filter_values(sym)
+            step, _, min_notional, min_qty = get_filter_values(sym)
             qty_sell = quantize_qty(qty * 0.999, step)
             if qty_sell <= 0: continue
-            _, _, min_notional = get_filter_values(sym)
-            if (price * qty_sell) < min_notional * 1.02: 
+            if (price * qty_sell) < min_notional * NOTIONAL_BUFFER: 
                 continue
             try:
                 client.order_market_sell(symbol=sym, quantity=qty_sell)
@@ -973,7 +1037,7 @@ def next_order_size():
 
 def run_bot():
     enviar_telegram(
-        f"🤖 Bot spot activo (rotación continua + fees). Compras cada 20s, gestión cada 10s. "
+        f"🤖 Bot spot activo (rotación cripto→cripto + fees). Compras 20s, gestión 10s. "
         f"TP {TAKE_PROFIT*100:.1f}%, ROTATE {ROTATE_PROFIT*100:.1f}%, Trail {TRAIL_ACTIVATE*100:.1f}/{TRAIL_PCT*100:.1f}%. "
         f"Órdenes {USD_MIN}–{USD_MAX}. LLM {'ON' if (LLM_ENABLED and OPENAI_API_KEY) else 'OFF'}."
     )
@@ -981,7 +1045,8 @@ def run_bot():
     scheduler.add_job(gestionar_posiciones, 'interval', seconds=10, max_instances=1)
     scheduler.add_job(comprar_oportunidad,  'interval', seconds=20, max_instances=2, coalesce=True, misfire_grace_time=30)
     scheduler.add_job(limpiar_dust,         'interval', minutes=5, max_instances=1)
-    scheduler.add_job(lambda: consolidar_a_quote("USDC"), 'interval', minutes=2, max_instances=1)
+    if CONSOLIDATE_TO_USDC:
+        scheduler.add_job(lambda: consolidar_a_quote("USDC"), 'interval', minutes=3, max_instances=1)
     scheduler.add_job(resumen_diario,       'cron', hour=RESUMEN_HORA_LOCAL, minute=0)
     scheduler.add_job(load_exchange_info,   'interval', minutes=15)
     scheduler.start()
@@ -989,7 +1054,10 @@ def run_bot():
 def main():
     threading.Thread(target=init_loop, daemon=True).start()
     threading.Thread(target=run_bot, daemon=True).start()
-    run_http_server()
+    # HTTP health endpoint para Render
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info(f"HTTP server escuchando en 0.0.0.0:{PORT}")
+    server.serve_forever()
 
 if __name__ == "__main__":
     main()
