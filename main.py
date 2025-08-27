@@ -19,9 +19,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PORT = int(os.getenv("PORT", "10000"))
 
 # Estrategia / gestión
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.015"))      # 1.5%
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.015"))      # 2%
 STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))          # -2%
-ROTATE_PROFIT = float(os.getenv("ROTATE_PROFIT", "0.006"))  # 0.6% rotación rápida
+ROTATE_PROFIT = float(os.getenv("ROTATE_PROFIT", "0.006"))  # 0.8% rotación rápida
 TRAIL_ACTIVATE = float(os.getenv("TRAIL_ACTIVATE", "0.007"))
 TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.005"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
