@@ -282,32 +282,54 @@ def llm_rate_ok() -> bool:
         return False
 
 def llm_score_entry(symbol: str, quote: str, price: float, rsi: float, vol_quote: float, trend_hint: str):
-    if not llm_rate_ok(): return 50.0, "skip"
+    # si LLM desactivado o sin credenciales => score alto para no bloquear
+    if not (LLM_ENABLED and OPENAI_API_KEY and OPENAI_MODEL):
+        return 75.0, "llm_off"
+
+    # rate limit local
+    now = monotonic()
+    with _llm_lock:
+        if _llm_window["start"] == 0.0:
+            _llm_window["start"] = now
+        if now - _llm_window["start"] > 60.0:
+            _llm_window["start"] = now
+            _llm_window["count"] = 0
+        if _llm_window["count"] >= LLM_MAX_CALLS_PER_MIN:
+            return 60.0, "llm_ratelimit_local"
+        _llm_window["count"] += 1
+
     try:
         prompt = (
-            "Evalúa compra spot a corto plazo. Evita velas exhaustas. Considera RSI, fuerza, volumen.\n"
-            f"Par: {symbol} (quote {quote}) Precio: {price:.8f} | RSI14: {rsi:.1f} | Vol24h: {vol_quote:.0f}\n"
-            f"Tendencia 5m: {trend_hint}\n"
-            "Responde SOLO JSON: {\"score\":0-100,\"reason\":\"breve\"}"
+            "Eres un asistente de trading spot intradía. Evalúa si conviene ENTRAR ahora.\n"
+            "Considera RSI(14), fuerza reciente y volumen; evita rupturas exhaustas.\n"
+            f"Par: {symbol} (quote {quote}), precio {price:.8f}, RSI {rsi:.1f}, Vol24h {vol_quote:.0f}, tendencia 5m {trend_hint}.\n"
+            'Devuelve SOLO JSON como {"score":0-100,"reason":"breve"}'
         )
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-        payload = {"model": OPENAI_MODEL, "messages":[{"role":"user","content":prompt}], "temperature":0.2, "max_tokens":80}
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 80,
+            # Fuerza JSON para evitar parseos raros
+            "response_format": {"type": "json_object"}
+        }
         resp = requests.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=15)
+        if resp.status_code == 401:
+            return 75.0, "llm_unauthorized"   # clave mala -> no bloquear
+        if resp.status_code == 404:
+            return 70.0, "llm_model_not_found" # modelo no habilitado
         resp.raise_for_status()
         data = resp.json()
         text = data["choices"][0]["message"]["content"]
-        try:
-            j = json.loads(text)
-            score = float(j.get("score", 50)); reason = str(j.get("reason",""))[:140]
-            return max(0, min(100, score)), reason
-        except Exception:
-            import re
-            m = re.search(r"(\d{1,3})", text); score = float(m.group(1)) if m else 50.0
-            return max(0, min(100, score)), text[:140]
+        j = json.loads(text)
+        score = float(j.get("score", 50))
+        reason = str(j.get("reason", "")).strip()[:140]
+        return max(0.0, min(100.0, score)), reason or "ok"
     except Exception as e:
+        # fallback permisivo para no frenar la operativa
         logger.debug(f"LLM fallo: {e}")
-        return 50.0, "error"
-
+        return 75.0, "llm_error_fallback"
 # ───────── Scan/candidatos ─────────
 def safe_get_ticker_24h():
     return client.get_ticker()
