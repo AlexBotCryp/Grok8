@@ -233,18 +233,44 @@ def min_usd_to_quote_amount(quote: str, usd_amount: float) -> float:
     return usd_amount
 
 def min_eur_to_quote_amount(quote: str, eur_amount: float) -> float:
-    eur_usdt_sym = "EURUSDT"
-    if eur_usdt_sym not in SYMBOL_MAP: return 0.0
-    eur_usdt = obtener_precio(eur_usdt_sym)
-    if not eur_usdt or eur_usdt <= 0: return 0.0
-    if quote in ("USDT","USDC"): return eur_amount * eur_usdt
-    if quote == "EUR": return eur_amount
-    q_usdt_sym = quote + "USDT"
-    if q_usdt_sym in SYMBOL_MAP and SYMBOL_MAP[q_usdt_sym]["status"] == "TRADING":
-        q_usdt = obtener_precio(q_usdt_sym)
-        if q_usdt and q_usdt > 0:
-            return (eur_amount * eur_usdt) / q_usdt
-    return 0.0
+    """
+    Convierte EUR -> unidades de la quote (USDT/USDC/BTC/ETH/BNB...).
+    Intenta EURUSDT, si no EURUSDC. Para quote≠USDT/USDC usa QUOTEUSDT o QUOTEUSDC.
+    Si no hay precios válidos, devuelve 0 para forzar SKIP.
+    """
+    # 1) EUR -> USDT (preferido)
+    eur_usdts = []
+    if "EURUSDT" in SYMBOL_MAP and SYMBOL_MAP["EURUSDT"]["status"] == "TRADING":
+        try:
+            eur_usdts.append(obtener_precio("EURUSDT"))
+        except Exception:
+            pass
+    if "EURUSDC" in SYMBOL_MAP and SYMBOL_MAP["EURUSDC"]["status"] == "TRADING":
+        try:
+            eur_usdts.append(obtener_precio("EURUSDC"))
+        except Exception:
+            pass
+    eur_usdt = max([p for p in eur_usdts if p and p > 0], default=0.0)
+    if eur_usdt <= 0:
+        return 0.0  # sin referencia fiable, no comprar
+
+    if quote == "EUR":
+        return eur_amount
+    if quote in ("USDT", "USDC"):
+        return eur_amount * eur_usdt
+
+    # 2) USDT -> quote via QUOTEUSDT o QUOTEUSDC
+    for base in ("USDT", "USDC"):
+        sym = quote + base
+        if sym in SYMBOL_MAP and SYMBOL_MAP[sym]["status"] == "TRADING":
+            try:
+                q_usd = obtener_precio(sym)
+                if q_usd and q_usd > 0:
+                    return (eur_amount * eur_usdt) / q_usd
+            except Exception:
+                continue
+
+    return 0.0  # no pudimos convertir
 
 # ───────── Fees / PnL ─────────
 def get_commission_rate(symbol: str) -> float:
