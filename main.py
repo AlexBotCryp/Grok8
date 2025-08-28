@@ -1,4 +1,4 @@
-import os, time, json, logging, requests, pytz, numpy as np, threading, math
+import os, time, json, logging, requests, pytz, numpy as np, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -7,7 +7,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ───────── CONFIG ─────────
+# ───────── CONFIGURACIÓN ─────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("bot-spot")
@@ -16,14 +16,14 @@ API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-PORT = int(os.getenv("PORT", "10000"))
+PORT = int(os.getenv("PORT", "10000"))  # Render health port
 
-# Estrategia / gestión
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.015"))      # 2%
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))          # -2%
-ROTATE_PROFIT = float(os.getenv("ROTATE_PROFIT", "0.006"))  # 0.8% rotación rápida
-TRAIL_ACTIVATE = float(os.getenv("TRAIL_ACTIVATE", "0.007"))
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.005"))
+# Estrategia
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.015"))      # 1.5%
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))          # -2.0%
+ROTATE_PROFIT = float(os.getenv("ROTATE_PROFIT", "0.006"))  # 0.6% rotación rápida
+TRAIL_ACTIVATE = float(os.getenv("TRAIL_ACTIVATE", "0.007"))# activa trailing a +0.7%
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.005"))          # trailing 0.5%
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
 
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "30000"))
@@ -32,29 +32,29 @@ RSI_BUY_MIN = float(os.getenv("RSI_BUY_MIN", "30"))
 RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "70"))
 RSI_SELL_OVERBOUGHT = float(os.getenv("RSI_SELL_OVERBOUGHT", "68"))
 
-# Mínimo por orden en euros y % de saldo a usar (100%)
+# Mínimo por orden en euros + porcentaje de saldo a usar (1.0 = 100%)
 MIN_EUR_ORDER = float(os.getenv("MIN_EUR_ORDER", "20"))
-FULL_BALANCE_SPEND_FRACTION = float(os.getenv("FULL_BALANCE_SPEND_FRACTION", "1.0"))  # 1.0 = 100%
+FULL_BALANCE_SPEND_FRACTION = float(os.getenv("FULL_BALANCE_SPEND_FRACTION", "1.0"))
 
-# Quotes preferidas (incluye cripto para rotación directa)
+# Quotes preferidas (pueden ser stables o cripto para rotación directa)
 PREFERRED_QUOTES = [q.strip().upper() for q in os.getenv(
     "PREFERRED_QUOTES", "USDC,USDT,BTC,ETH,BNB"
 ).split(",") if q.strip()]
 
 # Comisión / slippage
-COMMISSION_DEFAULT = float(os.getenv("COMMISSION_DEFAULT", "0.001"))  # 0.1% taker
+COMMISSION_DEFAULT = float(os.getenv("COMMISSION_DEFAULT", "0.001"))  # 0.1%
 SLIPPAGE_BUFFER_PCT = float(os.getenv("SLIPPAGE_BUFFER_PCT", "0.0005"))  # 0.05%
 
 # Filtros (NOTIONAL/minQty) buffers
-NOTIONAL_BUFFER = float(os.getenv("NOTIONAL_BUFFER", "1.03"))  # +3%
-MIN_QTY_BUFFER  = float(os.getenv("MIN_QTY_BUFFER", "1.0"))
+NOTIONAL_BUFFER = float(os.getenv("NOTIONAL_BUFFER", "1.03"))  # +3% margen
+MIN_QTY_BUFFER  = float(os.getenv("MIN_QTY_BUFFER", "1.0"))    # 1.0 = igual al minQty
 
-# Nunca pararse
+# Para que no se pare
 AGGRESSIVE_MODE = os.getenv("AGGRESSIVE_MODE", "true").lower() == "true"
 FORCE_BUY_AFTER_SEC = int(os.getenv("FORCE_BUY_AFTER_SEC", "60"))
 MAX_BUY_ATTEMPTS_PER_QUOTE = int(os.getenv("MAX_BUY_ATTEMPTS_PER_QUOTE", "12"))
 
-# LLM (opcional)
+# LLM (opcional) con diagnóstico
 LLM_ENABLED = os.getenv("LLM_ENABLED", "false").lower() == "true"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
@@ -64,11 +64,11 @@ LLM_MAX_CALLS_PER_MIN = int(os.getenv("LLM_MAX_CALLS_PER_MIN", "10"))
 _llm_window = {"start": 0.0, "count": 0}
 _llm_lock = threading.Lock()
 
-# Infra
+# Zona horaria
 TZ_NAME = os.getenv("TZ", "Europe/Madrid")
 TIMEZONE = pytz.timezone(TZ_NAME)
 
-# Varios
+# Otros
 STABLES = [s.strip().upper() for s in os.getenv(
     "STABLES",
     "USDT,USDC,FDUSD,TUSD,BUSD,DAI,USDP,USTC,EUR,TRY,GBP,BRL,ARS"
@@ -78,6 +78,7 @@ NOT_PERMITTED = set()
 REGISTRO_FILE = "registro.json"
 PNL_DIARIO_FILE = "pnl_diario.json"
 
+# Estado
 client = None
 EX_INFO_READY = False
 SYMBOL_MAP = {}
@@ -89,28 +90,40 @@ BUY_LOCK = threading.Lock()
 
 # ───────── Telegram ─────────
 def enviar_telegram(msg: str):
-    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        return
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID): return
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "disable_web_page_preview": True}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "disable_web_page_preview": True},
+            timeout=10
+        )
     except Exception as e:
         logger.warning(f"Telegram error: {e}")
 
-# ───────── HTTP health ─────────
+# ───────── HTTP Health ─────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path in ("/health","/"):
-            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
-        else:
+        try:
+            if self.path in ("/health", "/"):
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
+            if self.path == "/llmtest":
+                if not (LLM_ENABLED and OPENAI_API_KEY and OPENAI_MODEL):
+                    self.send_response(200); self.end_headers(); self.wfile.write(b"llm_off"); return
+                score, reason = llm_score_entry("BTCUSDT","USDT", 65000.0, 50.0, 1_000_000_000.0, "mixta")
+                out = json.dumps({"score": score, "reason": reason}).encode()
+                self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
+                self.wfile.write(out); return
             self.send_response(404); self.end_headers()
+        except Exception as e:
+            logger.error(f"Health error: {e}")
+            self.send_response(500); self.end_headers()
 
 def run_http_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
     logger.info(f"HTTP server escuchando en 0.0.0.0:{PORT}")
     server.serve_forever()
 
-# ───────── Utils ─────────
+# ───────── Utilidades ─────────
 def cargar_json(path, default):
     try:
         if os.path.exists(path):
@@ -143,7 +156,7 @@ def init_binance_client():
     global client
     if client: return
     if not (API_KEY and API_SECRET):
-      logger.error("Faltan BINANCE_API_KEY/BINANCE_API_SECRET"); return
+        logger.error("Faltan BINANCE_API_KEY/BINANCE_API_SECRET"); return
     client = Client(API_KEY, API_SECRET)
     client.ping()
     logger.info("Binance client OK.")
@@ -154,7 +167,10 @@ def load_exchange_info():
     SYMBOL_MAP.clear()
     for s in info["symbols"]:
         filters = {f["filterType"]: f for f in s.get("filters", [])}
-        SYMBOL_MAP[s["symbol"]] = {"base": s["baseAsset"], "quote": s["quoteAsset"], "status": s["status"], "filters": filters}
+        SYMBOL_MAP[s["symbol"]] = {
+            "base": s["baseAsset"], "quote": s["quoteAsset"],
+            "status": s["status"], "filters": filters
+        }
     EX_INFO_READY = True
     logger.info(f"exchangeInfo cargada: {len(SYMBOL_MAP)} símbolos.")
 
@@ -163,7 +179,6 @@ def get_filter_values(symbol):
     f = SYMBOL_MAP[symbol]["filters"]
     lot   = f.get("LOT_SIZE", {})
     price = f.get("PRICE_FILTER", {})
-    # minNotional puede venir en MIN_NOTIONAL o NOTIONAL
     if "MIN_NOTIONAL" in f:
         min_notional = float(f["MIN_NOTIONAL"].get("minNotional", "0"))
     elif "NOTIONAL" in f:
@@ -177,23 +192,19 @@ def get_filter_values(symbol):
 
 def step_decimals(step: Decimal) -> int:
     s = format(step, 'f')
-    if '.' in s:
-        return len(s.split('.')[1].rstrip('0'))
+    if '.' in s: return len(s.split('.')[1].rstrip('0'))
     return 0
 
 def format_qty(symbol: str, qty_float: float) -> str:
-    """Cuantiza a stepSize y devuelve string con el nº exacto de decimales permitido (evita -1100)."""
+    """Cuantiza por stepSize y devuelve string con decimales exactos (evita -1100)."""
     step, _, _, _ = get_filter_values(symbol)
     try:
         q = (Decimal(str(qty_float)) / step).to_integral_value(rounding=ROUND_DOWN) * step
     except InvalidOperation:
         q = Decimal(0)
     decs = step_decimals(step)
-    # Fuerza formato fijo; evita notación científica
     s = f"{q:.{decs}f}"
-    # Evita '0.000000' quedando en '0' si decs=0
     if '.' in s:
-        # recorta ceros de la derecha pero mantén al menos un decimal si step tiene decimales
         s = s.rstrip('0')
         if s.endswith('.'):
             s = s + '0' * max(1, decs)
@@ -234,45 +245,35 @@ def min_usd_to_quote_amount(quote: str, usd_amount: float) -> float:
 
 def min_eur_to_quote_amount(quote: str, eur_amount: float) -> float:
     """
-    Convierte EUR -> unidades de la quote (USDT/USDC/BTC/ETH/BNB...).
-    Intenta EURUSDT, si no EURUSDC. Para quote≠USDT/USDC usa QUOTEUSDT o QUOTEUSDC.
+    EUR -> unidades de la quote (USDT/USDC/BTC/ETH/BNB...).
+    Usa EURUSDT / EURUSDC como referencia y QUOTEUSDT/QUOTEUSDC para otras quotes.
     Si no hay precios válidos, devuelve 0 para forzar SKIP.
     """
-    # 1) EUR -> USDT (preferido)
-    eur_usdts = []
+    refs = []
     if "EURUSDT" in SYMBOL_MAP and SYMBOL_MAP["EURUSDT"]["status"] == "TRADING":
-        try:
-            eur_usdts.append(obtener_precio("EURUSDT"))
-        except Exception:
-            pass
+        try: refs.append(obtener_precio("EURUSDT"))
+        except Exception: pass
     if "EURUSDC" in SYMBOL_MAP and SYMBOL_MAP["EURUSDC"]["status"] == "TRADING":
-        try:
-            eur_usdts.append(obtener_precio("EURUSDC"))
-        except Exception:
-            pass
-    eur_usdt = max([p for p in eur_usdts if p and p > 0], default=0.0)
-    if eur_usdt <= 0:
-        return 0.0  # sin referencia fiable, no comprar
+        try: refs.append(obtener_precio("EURUSDC"))
+        except Exception: pass
+    eur_usd = max([p for p in refs if p and p > 0], default=0.0)
+    if eur_usd <= 0: return 0.0
 
-    if quote == "EUR":
-        return eur_amount
-    if quote in ("USDT", "USDC"):
-        return eur_amount * eur_usdt
+    if quote == "EUR": return eur_amount
+    if quote in ("USDT","USDC"): return eur_amount * eur_usd
 
-    # 2) USDT -> quote via QUOTEUSDT o QUOTEUSDC
-    for base in ("USDT", "USDC"):
+    for base in ("USDT","USDC"):
         sym = quote + base
         if sym in SYMBOL_MAP and SYMBOL_MAP[sym]["status"] == "TRADING":
             try:
                 q_usd = obtener_precio(sym)
                 if q_usd and q_usd > 0:
-                    return (eur_amount * eur_usdt) / q_usd
+                    return (eur_amount * eur_usd) / q_usd
             except Exception:
                 continue
+    return 0.0
 
-    return 0.0  # no pudimos convertir
-
-# ───────── Fees / PnL ─────────
+# ───────── Fees / PnL neto ─────────
 def get_commission_rate(symbol: str) -> float:
     try:
         if symbol in FEE_CACHE: return FEE_CACHE[symbol]
@@ -295,7 +296,7 @@ def expected_net_after_fee(buy_price: float, cur_price: float, qty: float, fee_r
     slip  = SLIPPAGE_BUFFER_PCT * (cur_price * qty)
     return gross - fees - slip
 
-# ───────── LLM (opcional) ─────────
+# ───────── LLM (ChatGPT) con diagnóstico ─────────
 def llm_rate_ok() -> bool:
     if not (LLM_ENABLED and OPENAI_API_KEY and OPENAI_MODEL): return False
     now = monotonic()
@@ -313,22 +314,14 @@ def llm_score_entry(symbol: str, quote: str, price: float, rsi: float, vol_quote
         return 75.0, "llm_off"
 
     # rate limit local
-    now = monotonic()
-    with _llm_lock:
-        if _llm_window["start"] == 0.0:
-            _llm_window["start"] = now
-        if now - _llm_window["start"] > 60.0:
-            _llm_window["start"] = now
-            _llm_window["count"] = 0
-        if _llm_window["count"] >= LLM_MAX_CALLS_PER_MIN:
-            return 60.0, "llm_ratelimit_local"
-        _llm_window["count"] += 1
+    if not llm_rate_ok():
+        return 60.0, "llm_ratelimit_local"
 
     try:
         prompt = (
             "Eres un asistente de trading spot intradía. Evalúa si conviene ENTRAR ahora.\n"
             "Considera RSI(14), fuerza reciente y volumen; evita rupturas exhaustas.\n"
-            f"Par: {symbol} (quote {quote}), precio {price:.8f}, RSI {rsi:.1f}, Vol24h {vol_quote:.0f}, tendencia 5m {trend_hint}.\n"
+            f"Par: {symbol} (quote {quote}) | precio {price:.8f} | RSI {rsi:.1f} | Vol24h {vol_quote:.0f} | tendencia 5m {trend_hint}.\n"
             'Devuelve SOLO JSON como {"score":0-100,"reason":"breve"}'
         )
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -336,26 +329,33 @@ def llm_score_entry(symbol: str, quote: str, price: float, rsi: float, vol_quote
             "model": OPENAI_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
-            "max_tokens": 80,
-            # Fuerza JSON para evitar parseos raros
-            "response_format": {"type": "json_object"}
+            "max_tokens": 60,
+            "response_format": {"type": "json_object"}  # fuerza JSON válido
         }
-        resp = requests.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=15)
-        if resp.status_code == 401:
-            return 75.0, "llm_unauthorized"   # clave mala -> no bloquear
-        if resp.status_code == 404:
-            return 70.0, "llm_model_not_found" # modelo no habilitado
-        resp.raise_for_status()
+        url = f"{OPENAI_BASE_URL}/chat/completions"
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        body_preview = ""
+        try:
+            body_preview = resp.text[:300]
+        except Exception:
+            body_preview = "<no body>"
+        if resp.status_code != 200:
+            logger.error(f"[LLM] HTTP {resp.status_code} body={body_preview}")
+            if resp.status_code == 401: return 75.0, "llm_unauthorized"
+            if resp.status_code == 404: return 70.0, "llm_model_not_found"
+            if resp.status_code == 429: return 65.0, "llm_rate_limited"
+            return 70.0, f"llm_http_{resp.status_code}"
+
         data = resp.json()
         text = data["choices"][0]["message"]["content"]
         j = json.loads(text)
-        score = float(j.get("score", 50))
-        reason = str(j.get("reason", "")).strip()[:140]
-        return max(0.0, min(100.0, score)), reason or "ok"
+        score = float(j.get("score", 75))
+        reason = str(j.get("reason", "ok"))[:140]
+        return max(0.0, min(100.0, score)), reason
     except Exception as e:
-        # fallback permisivo para no frenar la operativa
-        logger.debug(f"LLM fallo: {e}")
+        logger.error(f"[LLM] exception: {e}")
         return 75.0, "llm_error_fallback"
+
 # ───────── Scan/candidatos ─────────
 def safe_get_ticker_24h():
     return client.get_ticker()
@@ -432,24 +432,20 @@ def free_base_qty(symbol: str) -> float:
 # ───────── Sizing con notional/minQty ─────────
 def compute_order_qty(symbol: str, quote: str, price: float, quote_available: float, prefer_quote_amount: float):
     step, _, min_notional, min_qty = get_filter_values(symbol)
-    # al menos el mínimo por eur y usar todo el saldo (prefer ya viene calculado)
     target_spend = max(prefer_quote_amount, min_notional * NOTIONAL_BUFFER)
     spend = min(quote_available, target_spend)
     if spend <= 0 or price <= 0:
         return 0.0, 0.0
-    # cuantiza
     try:
         raw = Decimal(str(spend)) / Decimal(str(price))
         qty_dec = (raw / step).to_integral_value(rounding=ROUND_DOWN) * step
     except InvalidOperation:
         return 0.0, 0.0
     qty = float(qty_dec)
-    # validaciones
     if qty < (min_qty * MIN_QTY_BUFFER): return 0.0, 0.0
     if (qty * price) < (min_notional * NOTIONAL_BUFFER): return 0.0, 0.0
-    return qty, float(qty_dec * step * 0 + spend)  # spend aproximado (no se usa estrictamente)
+    return qty, float(spend)
 
-# ───────── Quotes ordenadas por saldo (en USD aprox) ─────────
 def quotes_ordenadas_por_saldo(balances: dict) -> list:
     vals = []
     for q in PREFERRED_QUOTES:
@@ -468,10 +464,15 @@ def quotes_ordenadas_por_saldo(balances: dict) -> list:
 
 # ───────── Comprar oportunidad ─────────
 def comprar_oportunidad():
+    """
+    Abre nuevas posiciones si:
+      - Hay saldo en una quote ≥ MIN_EUR_ORDER (equivalente en esa quote)
+      - Pasa filtros de notional/minQty y TP neto > 0 tras fees/slippage
+      - LLM (si activo) no bloquea (umbral muy permisivo)
+    """
     global LAST_BUY_TS
     if not EX_INFO_READY: return
-    if not BUY_LOCK.acquire(blocking=False):
-        return
+    if not BUY_LOCK.acquire(blocking=False): return
     try:
         reg = leer_posiciones()
         if len(reg) >= MAX_OPEN_POSITIONS: return
@@ -486,8 +487,14 @@ def comprar_oportunidad():
             disponible = float(balances.get(quote, 0.0))
             if disponible <= 0: continue
 
-            # Mínimo 20€ convertido a la quote y 100% del saldo
+            # Mínimo 20 € convertidos a la quote y usar 100% del saldo
             min_eur_quote = min_eur_to_quote_amount(quote, MIN_EUR_ORDER)
+            if min_eur_quote <= 0:
+                logger.info(f"[SKIP] No hay precio EUR->{quote} fiable; salto la quote.")
+                continue
+            if disponible < min_eur_quote:
+                logger.info(f"[SKIP] {quote}: saldo {disponible:.8f} < mínimo {MIN_EUR_ORDER}€ eq ({min_eur_quote:.8f} {quote}).")
+                continue
             prefer_amount = max(min_eur_quote, disponible * FULL_BALANCE_SPEND_FRACTION)
 
             intentos = 0
@@ -500,7 +507,6 @@ def comprar_oportunidad():
                 elegido = candidatos[0] if candidatos else None
 
                 if not elegido and AGGRESSIVE_MODE and tiempo_sin_comprar >= FORCE_BUY_AFTER_SEC:
-                    # force-buy: top volumen de esa quote
                     tickers = safe_get_ticker_24h() or []
                     top = []
                     for t in tickers:
@@ -508,7 +514,7 @@ def comprar_oportunidad():
                         if sym in NOT_PERMITTED or sym not in SYMBOL_MAP: continue
                         meta = SYMBOL_MAP[sym]
                         if (meta["status"]=="TRADING" and meta["quote"]==quote and meta["base"] not in STABLES):
-                            vol = float(t.get("quoteVolume",0.0))
+                            vol = float(t.get("quoteVolume",0.0) or 0.0)
                             top.append((vol, sym))
                     top.sort(reverse=True)
                     if top:
@@ -528,31 +534,35 @@ def comprar_oportunidad():
                 # LLM (opcional) muy permisivo
                 proceed_llm = True
                 if LLM_ENABLED and OPENAI_API_KEY:
-                    score, reason = llm_score_entry(symbol, quote, price, float(elegido.get("rsi", 50.0)), float(elegido.get("quoteVolume", 0.0)), "mixta")
+                    score, reason = llm_score_entry(
+                        symbol, quote, price,
+                        float(elegido.get("rsi", 50.0)),
+                        float(elegido.get("quoteVolume", 0.0)),
+                        "mixta"
+                    )
                     logger.info(f"[LLM] {symbol} score={score:.1f} {reason}")
                     if score <= LLM_BLOCK_THRESHOLD: proceed_llm = False
                 if not proceed_llm:
                     if len(candidatos) > 1:
-                        candidatos = candidatos[1:]
-                        continue
+                        candidatos = candidatos[1:]; continue
                     break
 
-                qty, spend = compute_order_qty(symbol, quote, price, disponible, prefer_amount)
+                # Sizing y validaciones
+                qty, _spend = compute_order_qty(symbol, quote, price, disponible, prefer_amount)
                 if qty <= 0:
+                    logger.info(f"[NOTIONAL] {symbol}: no alcanza minNotional/minQty con prefer={prefer_amount:.8f} {quote}.")
                     break
 
-                # TP neto debe ser positivo tras fees
+                # TP neto positivo tras fees/slippage
                 fee_rate = get_commission_rate(symbol)
                 net_tp = expected_net_after_fee(price, price*(1+TAKE_PROFIT), qty, fee_rate)
                 if net_tp <= 0:
+                    logger.info(f"[NET] {symbol}: TP neto <= 0, descarto entrada.")
                     break
 
-                # Formatear cantidad EXACTA (evita -1100)
-                qty_str = format_qty(symbol, qty)
-
+                qty_str = format_qty(symbol, qty)  # evita -1100
                 try:
                     orden = client.order_market_buy(symbol=symbol, quantity=qty_str)
-                    # usar executedQty si está
                     filled = float(orden.get("executedQty", qty))
                     last_price = obtener_precio(symbol) or price
                     reg[symbol] = {
@@ -570,14 +580,11 @@ def comprar_oportunidad():
                 except BinanceAPIException as e:
                     logger.error(f"Compra error {symbol}: {e}")
                     if getattr(e, "code", None) == -2010:
-                        NOT_PERMITTED.add(symbol)
-                        logger.warning(f"Blacklist: {symbol}")
-                    backoff_sleep(e)
-                    break
+                        NOT_PERMITTED.add(symbol); logger.warning(f"Blacklist: {symbol}")
+                    backoff_sleep(e); break
                 except Exception as e:
                     logger.error(f"Compra error {symbol}: {e}")
-                    backoff_sleep(e)
-                    break
+                    backoff_sleep(e); break
     finally:
         try: BUY_LOCK.release()
         except Exception: pass
@@ -592,20 +599,18 @@ def gestionar_posiciones():
         try:
             qty = float(data["qty"]); buy = float(data["buy_price"])
             peak = float(data.get("peak", buy)); quote = data["quote"]
-            price = obtener_precio(symbol); 
+            price = obtener_precio(symbol)
             if not price: nuevos[symbol]=data; continue
             change = (price - buy)/buy
             peak = max(peak, price)
             trailing_active = (peak - buy)/buy >= TRAIL_ACTIVATE
             trail_hit = trailing_active and (price <= peak*(1-TRAIL_PCT))
 
-            # RSI
             kl = safe_get_klines(symbol, Client.KLINE_INTERVAL_5MINUTE, 60)
             if not kl: nuevos[symbol]=data; continue
             closes = [float(k[4]) for k in kl]
             rsi = calculate_rsi(closes, RSI_PERIOD)
 
-            # Neto tras fees
             fee_rate = get_commission_rate(symbol)
             net_now = expected_net_after_fee(buy, price, qty, fee_rate)
 
@@ -620,11 +625,9 @@ def gestionar_posiciones():
                 free_now = free_base_qty(symbol)
                 sell_qty = min(qty, free_now) * 0.999
                 if sell_qty <= 0: continue
-                qty_str = format_qty(symbol, sell_qty)  # <—— FORMATEO
-                # Verifica notional antes de enviar
+                qty_str = format_qty(symbol, sell_qty)
                 if (price * float(qty_str)) < (min_notional * NOTIONAL_BUFFER):
-                    logger.info(f"{symbol}: venta no cumple minNotional.")
-                    continue
+                    logger.info(f"{symbol}: venta no cumple minNotional."); continue
                 client.order_market_sell(symbol=symbol, quantity=qty_str)
                 realized = expected_net_after_fee(buy, price, float(qty_str), fee_rate)
                 total = actualizar_pnl_diario(realized)
@@ -633,11 +636,8 @@ def gestionar_posiciones():
                     f"🔴 Venta {symbol} qty={qty_str} @ {price:.8f} ({change*100:.2f}%) "
                     f"Motivo:{motivo} RSI:{rsi:.1f} | PnL neto:{realized:.4f} {quote} | Hoy:{total:.4f}"
                 )
-                # quitar posición y rotar inmediatamente en la misma quote
-                reg2 = leer_posiciones()
-                reg2.pop(symbol, None); escribir_posiciones(reg2)
-                balances = holdings_por_asset()
-                # intenta rotar de inmediato usando la misma quote
+                # elimina posición y rota en la MISMA quote (cripto→cripto)
+                reg2 = leer_posiciones(); reg2.pop(symbol, None); escribir_posiciones(reg2)
                 comprar_oportunidad()
             else:
                 data["peak"] = float(peak)
@@ -648,9 +648,9 @@ def gestionar_posiciones():
             logger.error(f"Gestion error {symbol}: {e}"); backoff_sleep(e); nuevos[symbol]=data
     escribir_posiciones(nuevos)
 
-# ───────── Resumen / limpieza ─────────
+# ───────── Limpieza / resumen ─────────
 def limpiar_dust():
-    # Mantén libre de restos que no estén en posiciones (rotación cripto→cripto ya la hace el ciclo normal)
+    # opcional: vender restos minúsculos; lo dejamos vacío para evitar gastos innecesarios
     pass
 
 def resumen_diario():
@@ -668,7 +668,7 @@ def resumen_diario():
     except Exception as e:
         logger.warning(f"Resumen diario error: {e}")
 
-# ───────── Loop / scheduler ─────────
+# ───────── Scheduler / main ─────────
 def run_bot():
     enviar_telegram(
         f"🤖 Bot activo: min {MIN_EUR_ORDER}€ por orden, gasto {FULL_BALANCE_SPEND_FRACTION*100:.0f}% del saldo quote, "
