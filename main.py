@@ -406,16 +406,19 @@ def evaluate_and_trade():
             rsi_val  = r[-1]; atrp = atr_pct(h, l, c, period=14)
 
             # Señales más flexibles + cruce EMA
-            ema_cross_up = (ema_f[-2] <= ema_s[-2]) and (ema_f[-1] > ema_s[-1])
-            base_signal = (
-                (trend_up and rsi_val > 50) or    # tendencia + momentum
-                (rsi_val < 32 and trend_up) or    # rebote en sobreventa dentro de tendencia
-                ema_cross_up                      # cruce EMA9>EMA21
-            )
+ema_cross_up = (ema_f[-2] <= ema_s[-2]) and (ema_f[-1] > ema_s[-1])
 
-            if REQUIRE_VOL_SPIKE and not vol_ok:
-                if DEBUG: print(f"[SKIP] {sym} volumen insuficiente (gate activo)", flush=True)
-                continue
+# Señal base sin exigir volumen:
+base_signal = (
+    (trend_up and rsi_val > 50) or    # tendencia + momentum
+    (rsi_val < 35) or                 # rebote simple en zona baja
+    ema_cross_up                      # cruce EMA9>EMA21
+)
+
+# Si decides exigir volumen, filtra aquí:
+if REQUIRE_VOL_SPIKE and not vol_ok:
+    if DEBUG: print(f"[SKIP] {sym} volumen insuficiente (gate activo)", flush=True)
+    continue
 
             if DEBUG:
                 print(f"[SIG] {sym} price={price:.6f} rsi={rsi_val:.2f} "
