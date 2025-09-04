@@ -1,4 +1,4 @@
-import os, json, time, math, threading
+import os, json, time, threading
 from datetime import datetime, date
 from decimal import Decimal, ROUND_DOWN
 import numpy as np
@@ -7,7 +7,7 @@ from dateutil import tz
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
-# NEW: import guard para OpenAI y fallback limpio
+# OpenAI client (Grok compatible). Si falta el paquete, seguimos sin Grok.
 try:
     from openai import OpenAI
 except Exception:
@@ -15,13 +15,13 @@ except Exception:
 
 STATE_PATH = "state.json"
 
-# ---------- Utilidades ----------
+# ------------------ Utilidades ------------------
 def env(key, default=None):
-    v = os.getenv(key, default)
-    return v
+    return os.getenv(key, default)
 
 def parse_float(s, default=0.0):
-    if s is None: return float(default)
+    if s is None:
+        return float(default)
     try:
         return float(str(s).replace(",", "."))
     except Exception:
@@ -32,25 +32,25 @@ def now_ts():
 
 def load_state():
     if not os.path.exists(STATE_PATH):
-        return {"positions":{}, "pnl_history":{}, "tokens_used":0}
-    with open(STATE_PATH,"r") as f:
+        return {"positions": {}, "pnl_history": {}, "tokens_used": 0}
+    with open(STATE_PATH, "r") as f:
         return json.load(f)
 
 def save_state(st):
     tmp = STATE_PATH + ".tmp"
-    with open(tmp,"w") as f:
+    with open(tmp, "w") as f:
         json.dump(st, f, indent=2, sort_keys=True)
     os.replace(tmp, STATE_PATH)
 
 def send_telegram(msg):
     token = env("TG_BOT_TOKEN")
     chat = env("TG_CHAT_ID")
-    if not token or not chat: 
+    if not token or not chat:
         return False, "TOKEN o CHAT_ID vacío"
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id":chat,"text":msg[:4000]}
+            data={"chat_id": chat, "text": msg[:4000]}
         )
         ok = r.status_code == 200 and r.json().get("ok", False)
         return ok, (None if ok else r.text)
@@ -58,9 +58,7 @@ def send_telegram(msg):
         return False, repr(e)
 
 def tg_autotest():
-    """Prueba Telegram al arrancar y muestra errores útiles."""
-    enabled = bool(env("TG_BOT_TOKEN")) and bool(env("TG_CHAT_ID"))
-    if not enabled:
+    if not (env("TG_BOT_TOKEN") and env("TG_CHAT_ID")):
         print("[TG] Desactivado: falta TG_BOT_TOKEN o TG_CHAT_ID")
         return
     ok, err = send_telegram(f"🤖 Bot iniciando {now_ts()} (autotest)")
@@ -69,48 +67,49 @@ def tg_autotest():
     else:
         print(f"[TG] ERROR: {err}")
 
-# ---------- Config ----------
+# ------------------ Configuración ------------------
 BINANCE_API_KEY = env("BINANCE_API_KEY")
 BINANCE_API_SECRET = env("BINANCE_API_SECRET")
 
-SYMBOLS = [s.strip().upper() for s in env("SYMBOLS","BTCUSDC,DOGEUSDC,TRXUSDC").split(",") if s.strip()]
-INTERVAL = env("INTERVAL","3m")
-CANDLES = int(env("CANDLES","200"))
+SYMBOLS = [s.strip().upper() for s in env("SYMBOLS", "BTCUSDC,DOGEUSDC,TRXUSDC").split(",") if s.strip()]
+INTERVAL = env("INTERVAL", "3m")
+CANDLES = int(env("CANDLES", "200"))
 
-RSI_LEN = int(env("RSI_LEN","14"))
-EMA_FAST = int(env("EMA_FAST","9"))
-EMA_SLOW = int(env("EMA_SLOW","21"))
-VOL_SPIKE = parse_float(env("VOL_SPIKE","1.20"),1.20)
+RSI_LEN = int(env("RSI_LEN", "14"))
+EMA_FAST = int(env("EMA_FAST", "9"))
+EMA_SLOW = int(env("EMA_SLOW", "21"))
+VOL_SPIKE = parse_float(env("VOL_SPIKE", "1.20"), 1.20)  # volumen actual > 1.2 * media
 
-MIN_EXPECTED_GAIN_PCT = parse_float(env("MIN_EXPECTED_GAIN_PCT","0.05"),0.05)
-TAKE_PROFIT_PCT = parse_float(env("TAKE_PROFIT_PCT","0.006"),0.006)
-STOP_LOSS_PCT = parse_float(env("STOP_LOSS_PCT","0.008"),0.008)
-TRAIL_PCT = parse_float(env("TRAIL_PCT","0.004"),0.004)
-MIN_ORDER_USD = parse_float(env("MIN_ORDER_USD","20"),20)
-ALLOCATION_PCT = parse_float(env("ALLOCATION_PCT","1.0"),1.0)
-DAILY_MAX_LOSS_USD = parse_float(env("DAILY_MAX_LOSS_USD","25"),25)
-FEE_PCT = parse_float(env("FEE_PCT","0.001"),0.001)
+MIN_EXPECTED_GAIN_PCT = parse_float(env("MIN_EXPECTED_GAIN_PCT", "0.05"), 0.05)  # por ATR%
+TAKE_PROFIT_PCT = parse_float(env("TAKE_PROFIT_PCT", "0.006"), 0.006)
+STOP_LOSS_PCT = parse_float(env("STOP_LOSS_PCT", "0.008"), 0.008)
+TRAIL_PCT = parse_float(env("TRAIL_PCT", "0.004"), 0.004)
+MIN_ORDER_USD = parse_float(env("MIN_ORDER_USD", "20"), 20)
+ALLOCATION_PCT = parse_float(env("ALLOCATION_PCT", "1.0"), 1.0)  # usar 100% del USDC
+DAILY_MAX_LOSS_USD = parse_float(env("DAILY_MAX_LOSS_USD", "25"), 25)
+FEE_PCT = parse_float(env("FEE_PCT", "0.001"), 0.001)  # aprox 0.1% por lado
 
-LOOP_SECONDS = int(env("LOOP_SECONDS","45"))
+LOOP_SECONDS = int(env("LOOP_SECONDS", "45"))
 
-GROK_ENABLE = env("GROK_ENABLE","true").lower() == "true"
-GROK_BASE_URL = env("GROK_BASE_URL","https://api.x.ai/v1")
+GROK_ENABLE = env("GROK_ENABLE", "true").lower() == "true"
+GROK_BASE_URL = env("GROK_BASE_URL", "https://api.x.ai/v1")
 GROK_API_KEY = env("GROK_API_KEY")
-GROK_MODEL = env("GROK_MODEL","grok-beta")
-MAX_TOKENS_DAILY = int(env("MAX_TOKENS_DAILY","2000"))
+GROK_MODEL = env("GROK_MODEL", "grok")  # modelo por defecto
+GROK_MODELS_FALLBACK = [GROK_MODEL, "grok", "grok-2-latest", "grok-2-mini"]
+_current_grok_model_idx = 0
+MAX_TOKENS_DAILY = int(env("MAX_TOKENS_DAILY", "2000"))
 
-# ---------- Clientes ----------
+# ------------------ Clientes ------------------
 client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
 
-# NEW: creación robusta del cliente Grok con fallback
 llm = None
 if GROK_ENABLE and GROK_API_KEY and OpenAI is not None:
     try:
-        # Nota: fijamos compat con httpx 0.27.2 en requirements.
+        # Compatibilizado con httpx==0.27.2 en requirements.txt
         llm = OpenAI(api_key=GROK_API_KEY, base_url=GROK_BASE_URL)
-        print("[GROK] Cliente inicializado")
+        print(f"[GROK] Cliente inicializado (modelo preferido: {GROK_MODEL})")
     except Exception as e:
-        print(f"[GROK] Deshabilitado por error de init: {repr(e)}")
+        print(f"[GROK] Deshabilitado por init error: {repr(e)}")
         GROK_ENABLE = False
 else:
     if not GROK_API_KEY:
@@ -118,54 +117,54 @@ else:
     elif OpenAI is None:
         print("[GROK] Deshabilitado: paquete openai no disponible")
 
-# ---------- Indicadores ----------
+# ------------------ Indicadores ------------------
 def ema(arr, period):
     arr = np.asarray(arr, dtype=float)
-    k = 2/(period+1)
-    ema_vals = np.zeros_like(arr)
-    ema_vals[0] = arr[0]
-    for i in range(1,len(arr)):
-        ema_vals[i] = arr[i]*k + ema_vals[i-1]*(1-k)
-    return ema_vals
+    k = 2 / (period + 1)
+    out = np.zeros_like(arr)
+    out[0] = arr[0]
+    for i in range(1, len(arr)):
+        out[i] = arr[i] * k + out[i - 1] * (1 - k)
+    return out
 
 def rsi(arr, period=14):
     arr = np.asarray(arr, dtype=float)
     delta = np.diff(arr)
-    up = np.where(delta>0, delta, 0.0)
-    down = np.where(delta<0, -delta, 0.0)
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
     roll_up = ema(up, period)
     roll_down = ema(down, period)
-    rs = np.divide(roll_up, roll_down, out=np.zeros_like(roll_up), where=roll_down!=0)
-    rsi = 100 - (100/(1+rs))
-    rsi = np.insert(rsi,0,50.0)
-    return rsi
+    rs = np.divide(roll_up, roll_down, out=np.zeros_like(roll_up), where=roll_down != 0)
+    rsi_vals = 100 - (100 / (1 + rs))
+    rsi_vals = np.insert(rsi_vals, 0, 50.0)
+    return rsi_vals
 
 def atr_pct(highs, lows, closes, period=14):
-    highs, lows, closes = map(lambda x: np.asarray(x, dtype=float), (highs,lows,closes))
+    highs, lows, closes = map(lambda x: np.asarray(x, dtype=float), (highs, lows, closes))
     trs = []
-    for i in range(1,len(closes)):
-        h, l, c1 = highs[i], lows[i], closes[i-1]
-        tr = max(h-l, abs(h-c1), abs(l-c1))
+    for i in range(1, len(closes)):
+        h, l, c1 = highs[i], lows[i], closes[i - 1]
+        tr = max(h - l, abs(h - c1), abs(l - c1))
         trs.append(tr)
     if not trs:
         return 0.0
     atr = ema(np.array(trs), period)[-1]
-    pct = atr / float(closes[-1])
-    return pct
+    return atr / float(closes[-1])
 
-# ---------- Mercado ----------
+# ------------------ Mercado ------------------
 _symbol_info_cache = {}
+
 def get_symbol_info(sym):
     if sym in _symbol_info_cache:
         return _symbol_info_cache[sym]
     info = client.get_symbol_info(sym)
     if not info:
         raise RuntimeError(f"Symbol info not found for {sym}")
-    f = {flt["filterType"]:flt for flt in info["filters"]}
+    f = {flt["filterType"]: flt for flt in info["filters"]}
     step = Decimal(f["LOT_SIZE"]["stepSize"])
     min_qty = Decimal(f["LOT_SIZE"]["minQty"])
-    min_notional = Decimal(f.get("MIN_NOTIONAL", {}).get("minNotional","5"))
-    _symbol_info_cache[sym] = {"step":step,"min_qty":min_qty,"min_notional":min_notional}
+    min_notional = Decimal(f.get("MIN_NOTIONAL", {}).get("minNotional", "5"))
+    _symbol_info_cache[sym] = {"step": step, "min_qty": min_qty, "min_notional": min_notional}
     return _symbol_info_cache[sym]
 
 def round_step(qty, step):
@@ -174,11 +173,11 @@ def round_step(qty, step):
 
 def fetch_klines(sym, interval, limit):
     ks = client.get_klines(symbol=sym, interval=interval, limit=limit)
-    o,h,l,c,v = [],[],[],[],[]
+    o, h, l, c, v = [], [], [], [], []
     for k in ks:
         o.append(float(k[1])); h.append(float(k[2])); l.append(float(k[3]))
         c.append(float(k[4])); v.append(float(k[5]))
-    return o,h,l,c,v
+    return o, h, l, c, v
 
 def get_price(sym):
     return float(client.get_symbol_ticker(symbol=sym)["price"])
@@ -187,54 +186,66 @@ def get_free_usdc():
     bal = client.get_asset_balance(asset="USDC")
     return float(bal["free"]) if bal else 0.0
 
-# ---------- Grok ----------
+# ------------------ Grok ------------------
 def grok_decide(payload_dict):
+    global _current_grok_model_idx
     if not (GROK_ENABLE and llm):
         return "HOLD"
+
     st = load_state()
-    if st.get("tokens_used",0) > MAX_TOKENS_DAILY:
+    if st.get("tokens_used", 0) > MAX_TOKENS_DAILY:
         return "HOLD"
+
     prompt = (
         "Eres un asistente de trading spot cripto. Analiza el JSON y responde SOLO una palabra: BUY, SELL o HOLD.\n"
         "Compra solo si hay confluencia fuerte y potencial razonable. Evita sobreoperar.\n"
         "JSON:\n" + json.dumps(payload_dict, ensure_ascii=False)
     )
-    try:
-        resp = llm.chat.completions.create(
-            model=GROK_MODEL,
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.1,
-            max_tokens=4
-        )
-        text = resp.choices[0].message.content.strip().upper()
-        used = len(prompt)//3 + 4
-        st["tokens_used"] = st.get("tokens_used",0) + used
-        save_state(st)
-        if "BUY" in text: return "BUY"
-        if "SELL" in text: return "SELL"
-        return "HOLD"
-    except Exception as e:
-        print(f"[GROK] fallo decide: {repr(e)}")
-        return "HOLD"
 
-# ---------- PnL / control diario ----------
+    for attempt in range(_current_grok_model_idx, len(GROK_MODELS_FALLBACK)):
+        model_name = GROK_MODELS_FALLBACK[attempt]
+        try:
+            resp = llm.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=4
+            )
+            text = (resp.choices[0].message.content or "").strip().upper()
+            used = len(prompt) // 3 + 4
+            st["tokens_used"] = st.get("tokens_used", 0) + used
+            save_state(st)
+            _current_grok_model_idx = attempt
+            if "BUY" in text: return "BUY"
+            if "SELL" in text: return "SELL"
+            return "HOLD"
+        except Exception as e:
+            err = repr(e)
+            if ("404" in err or "Not found" in err or "model" in err.lower() or "401" in err):
+                continue
+            break
+
+    print("[GROK] deshabilitado (no se pudo usar ningún modelo de fallback)")
+    return "HOLD"
+
+# ------------------ PnL y control diario ------------------
 def today_key():
     return date.today().isoformat()
 
 def add_realized_pnl(amount_usd):
     st = load_state()
     day = today_key()
-    d = st.get("pnl_history",{})
-    d[day] = round(d.get(day,0.0) + float(amount_usd), 6)
+    d = st.get("pnl_history", {})
+    d[day] = round(d.get(day, 0.0) + float(amount_usd), 6)
     st["pnl_history"] = d
     save_state(st)
 
 def reached_daily_loss():
     st = load_state()
-    pnl = st.get("pnl_history",{}).get(today_key(), 0.0)
+    pnl = st.get("pnl_history", {}).get(today_key(), 0.0)
     return pnl <= -abs(DAILY_MAX_LOSS_USD)
 
-# ---------- Órdenes ----------
+# ------------------ Órdenes ------------------
 def place_buy(sym, quote_qty):
     info = get_symbol_info(sym)
     price = get_price(sym)
@@ -251,17 +262,15 @@ def place_sell(sym, qty):
     order = client.order_market_sell(symbol=sym, quantity=qty)
     return order
 
-# ---------- Estrategia ----------
+# ------------------ Estrategia principal ------------------
 def evaluate_and_trade():
     if reached_daily_loss():
         return
 
     st = load_state()
-    usdc = get_free_usdc()
-
     for sym in SYMBOLS:
         try:
-            o,h,l,c,v = fetch_klines(sym, INTERVAL, CANDLES)
+            o, h, l, c, v = fetch_klines(sym, INTERVAL, CANDLES)
             closes = np.array(c, dtype=float)
             vols = np.array(v, dtype=float)
             price = float(closes[-1])
@@ -269,10 +278,11 @@ def evaluate_and_trade():
             r = rsi(closes, RSI_LEN)
             ema_f = ema(closes, EMA_FAST)
             ema_s = ema(closes, EMA_SLOW)
-            vol_ok = vols[-1] > VOL_SPIKE * (vols[-50:-1].mean() if len(vols) > 50 else vols.mean())
+            vol_base = vols[-50:-1].mean() if len(vols) > 50 else (vols.mean() if len(vols) else 0.0)
+            vol_ok = vols[-1] > VOL_SPIKE * max(vol_base, 1e-9)
             trend_up = ema_f[-1] > ema_s[-1]
             rsi_val = r[-1]
-            atrp = atr_pct(h,l,c, period=14)
+            atrp = atr_pct(h, l, c, period=14)
 
             expected_gain_ok = atrp >= MIN_EXPECTED_GAIN_PCT
 
@@ -293,7 +303,7 @@ def evaluate_and_trade():
 
                 if price >= tp_price:
                     place_sell(sym, qty)
-                    pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
+                    pnl = (price * (1 - FEE_PCT) - entry * (1 + FEE_PCT)) * qty
                     add_realized_pnl(pnl)
                     st["positions"].pop(sym, None)
                     save_state(st)
@@ -302,7 +312,7 @@ def evaluate_and_trade():
 
                 if best > entry and price <= best * (1 - TRAIL_PCT):
                     place_sell(sym, qty)
-                    pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
+                    pnl = (price * (1 - FEE_PCT) - entry * (1 + FEE_PCT)) * qty
                     add_realized_pnl(pnl)
                     st["positions"].pop(sym, None)
                     save_state(st)
@@ -311,23 +321,23 @@ def evaluate_and_trade():
 
                 if price <= sl_price:
                     place_sell(sym, qty)
-                    pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
+                    pnl = (price * (1 - FEE_PCT) - entry * (1 + FEE_PCT)) * qty
                     add_realized_pnl(pnl)
                     st["positions"].pop(sym, None)
                     save_state(st)
                     send_telegram(f"❌ SELL SL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
-                if GROK_ENABLE and not reached_daily_loss():
+                if GROK_ENABLE:
                     features = {
-                        "symbol":sym, "price":price, "entry":entry,
-                        "rsi":rsi_val, "ema_fast":float(ema_f[-1]), "ema_slow":float(ema_s[-1]),
-                        "atr_pct":atrp, "vol_ok":bool(vol_ok), "unrealized_pct": (price/entry - 1)
+                        "symbol": sym, "price": price, "entry": entry,
+                        "rsi": rsi_val, "ema_fast": float(ema_f[-1]), "ema_slow": float(ema_s[-1]),
+                        "atr_pct": atrp, "vol_ok": bool(vol_ok), "unrealized_pct": (price / entry - 1)
                     }
                     decision = grok_decide(features)
-                    if decision == "SELL" and (price/entry - 1) > 0:
+                    if decision == "SELL" and (price / entry - 1) > 0:
                         place_sell(sym, qty)
-                        pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
+                        pnl = (price * (1 - FEE_PCT) - entry * (1 + FEE_PCT)) * qty
                         add_realized_pnl(pnl)
                         st["positions"].pop(sym, None)
                         save_state(st)
@@ -342,10 +352,10 @@ def evaluate_and_trade():
             decision = "BUY"
             if GROK_ENABLE:
                 features = {
-                    "symbol":sym, "price":price, "rsi":rsi_val,
-                    "ema_fast":float(ema_f[-1]), "ema_slow":float(ema_s[-1]),
-                    "atr_pct":atrp, "vol_ok":bool(vol_ok),
-                    "min_expected_gain_pct":MIN_EXPECTED_GAIN_PCT
+                    "symbol": sym, "price": price, "rsi": rsi_val,
+                    "ema_fast": float(ema_f[-1]), "ema_slow": float(ema_s[-1]),
+                    "atr_pct": atrp, "vol_ok": bool(vol_ok),
+                    "min_expected_gain_pct": MIN_EXPECTED_GAIN_PCT
                 }
                 decision = grok_decide(features)
             if decision != "BUY":
@@ -355,21 +365,20 @@ def evaluate_and_trade():
             if usdc < MIN_ORDER_USD:
                 continue
 
-            quote_qty = usdc * ALLOCATION_PCT
-            quote_qty = max(MIN_ORDER_USD, quote_qty * 0.995)
+            quote_qty = max(MIN_ORDER_USD, usdc * ALLOCATION_PCT * 0.995)
 
             info = get_symbol_info(sym)
             if Decimal(str(quote_qty)) < info["min_notional"]:
                 quote_qty = float(info["min_notional"]) + 1.0
 
-            order, qty, entry = place_buy(sym, quote_qty)
+            order, qty, raw_entry = place_buy(sym, quote_qty)
             st["positions"][sym] = {
-                "entry": entry*(1+FEE_PCT),
+                "entry": raw_entry * (1 + FEE_PCT),  # entrada con comisión
                 "qty": qty,
-                "best": entry
+                "best": raw_entry
             }
             save_state(st)
-            send_telegram(f"🟢 BUY {sym} {qty} @ {entry:.8f} | Notional ≈ {qty*entry:.2f} USDC")
+            send_telegram(f"🟢 BUY {sym} {qty} @ {raw_entry:.8f} | Notional ≈ {qty*raw_entry:.2f} USDC")
 
         except BinanceAPIException as be:
             if be.code == -1003:
@@ -381,6 +390,7 @@ def evaluate_and_trade():
             send_telegram(f"⚠️ Error {sym}: {repr(e)}")
             time.sleep(2)
 
+# ------------------ Reseteo nocturno tokens ------------------
 def midnight_reset_tokens():
     while True:
         now = datetime.now(tz=tz.tzlocal())
@@ -391,11 +401,10 @@ def midnight_reset_tokens():
             time.sleep(60)
         time.sleep(20)
 
+# ------------------ Main ------------------
 def main():
-    tg_autotest()  # NEW: prueba TG al inicio
-    ok, _ = send_telegram("🤖 Bot iniciado.")
-    if not ok:
-        print("[TG] No se pudo enviar mensaje de inicio (ver logs arriba).")
+    tg_autotest()
+    send_telegram("🤖 Bot iniciado.")
     threading.Thread(target=midnight_reset_tokens, daemon=True).start()
     while True:
         try:
