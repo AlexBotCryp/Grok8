@@ -33,7 +33,8 @@ def parse_float(s, default=0.0):
         return float(default)
 
 def now_ts():
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    dt = datetime.now(timezone.utc).replace(microsecond=0)
+    return dt.isoformat().replace("+00:00", "Z")
 
 def load_state():
     if not os.path.exists(STATE_PATH):
