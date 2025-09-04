@@ -2,7 +2,6 @@ import os, json, time, threading
 from datetime import datetime, date
 from decimal import Decimal, ROUND_DOWN
 import numpy as np
-import requests
 from dateutil import tz
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -12,6 +11,12 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
+
+# ---- stdlib HTTP (para Telegram) ----
+import urllib.request
+import urllib.parse
+import urllib.error
+import ssl
 
 STATE_PATH = "state.json"
 
@@ -42,30 +47,73 @@ def save_state(st):
         json.dump(st, f, indent=2, sort_keys=True)
     os.replace(tmp, STATE_PATH)
 
-def send_telegram(msg):
+# ------------------ Telegram (solo stdlib) ------------------
+def tg_http(method, params: dict):
     token = env("TG_BOT_TOKEN")
-    chat = env("TG_CHAT_ID")
-    if not token or not chat:
-        return False, "TOKEN o CHAT_ID vacío"
+    if not token:
+        return False, {"error": "Falta TG_BOT_TOKEN"}, None
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(params or {}).encode("utf-8")
+    # SSL por defecto del sistema
+    ctx = ssl.create_default_context()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat, "text": msg[:4000]}
-        )
-        ok = r.status_code == 200 and r.json().get("ok", False)
-        return ok, (None if ok else r.text)
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            try:
+                js = json.loads(body)
+            except Exception:
+                js = {"ok": False, "raw": body}
+            ok = (resp.status == 200) and bool(js.get("ok"))
+            return ok, (None if ok else js), (js if ok else None)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+            js = json.loads(body)
+        except Exception:
+            js = {"ok": False, "status": e.code, "raw": str(e)}
+        return False, js, None
     except Exception as e:
-        return False, repr(e)
+        return False, {"ok": False, "error": repr(e)}, None
+
+def tg_send(msg: str):
+    chat = env("TG_CHAT_ID")
+    if not chat:
+        return False, "CHAT_ID vacío"
+    ok, err, _ = tg_http("sendMessage", {"chat_id": chat, "text": msg[:4000]})
+    if not ok:
+        print(f"[TG] sendMessage ERROR -> {err}")
+    return ok, (None if ok else err)
 
 def tg_autotest():
-    if not (env("TG_BOT_TOKEN") and env("TG_CHAT_ID")):
-        print("[TG] Desactivado: falta TG_BOT_TOKEN o TG_CHAT_ID")
+    token = env("TG_BOT_TOKEN")
+    chat = env("TG_CHAT_ID")
+    if not token:
+        print("[TG] Desactivado: falta TG_BOT_TOKEN")
         return
-    ok, err = send_telegram(f"🤖 Bot iniciando {now_ts()} (autotest)")
-    if ok:
-        print("[TG] OK: mensaje de prueba enviado")
-    else:
-        print(f"[TG] ERROR: {err}")
+    # 1) getMe
+    ok, err, data = tg_http("getMe", {})
+    if not ok:
+        print(f"[TG] getMe ERROR -> {err}")
+        return
+    me = data.get("result", {})
+    print(f"[TG] getMe OK. Bot: @{me.get('username')} (id {me.get('id')})")
+    # 2) getChat (si hay chat)
+    if chat:
+        okc, errc, datac = tg_http("getChat", {"chat_id": chat})
+        if okc:
+            title = datac.get("result", {}).get("title") or datac.get("result", {}).get("username") or datac.get("result", {}).get("first_name")
+            print(f"[TG] getChat OK. Chat detectado: {title} (id {chat})")
+        else:
+            print(f"[TG] getChat ERROR -> {errc}  (¿El bot está dentro del chat? ¿ID correcto?)")
+    # 3) Mensaje de prueba
+    if chat:
+        okm, errm = tg_send(f"🤖 Autotest {now_ts()} — hola, Alex.")
+        if okm:
+            print("[TG] sendMessage OK (mensaje de prueba enviado)")
+        else:
+            print(f"[TG] sendMessage ERROR -> {errm}")
 
 # ------------------ Configuración ------------------
 BINANCE_API_KEY = env("BINANCE_API_KEY")
@@ -307,7 +355,7 @@ def evaluate_and_trade():
                     add_realized_pnl(pnl)
                     st["positions"].pop(sym, None)
                     save_state(st)
-                    send_telegram(f"✅ SELL TP {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
+                    tg_send(f"✅ SELL TP {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
                 if best > entry and price <= best * (1 - TRAIL_PCT):
@@ -316,7 +364,7 @@ def evaluate_and_trade():
                     add_realized_pnl(pnl)
                     st["positions"].pop(sym, None)
                     save_state(st)
-                    send_telegram(f"⚠️ SELL TRAIL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
+                    tg_send(f"⚠️ SELL TRAIL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
                 if price <= sl_price:
@@ -325,7 +373,7 @@ def evaluate_and_trade():
                     add_realized_pnl(pnl)
                     st["positions"].pop(sym, None)
                     save_state(st)
-                    send_telegram(f"❌ SELL SL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
+                    tg_send(f"❌ SELL SL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
                 if GROK_ENABLE:
@@ -341,7 +389,7 @@ def evaluate_and_trade():
                         add_realized_pnl(pnl)
                         st["positions"].pop(sym, None)
                         save_state(st)
-                        send_telegram(f"🤖 SELL by Grok {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
+                        tg_send(f"🤖 SELL by Grok {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                 continue
 
             # --- Señal de compra ---
@@ -378,16 +426,16 @@ def evaluate_and_trade():
                 "best": raw_entry
             }
             save_state(st)
-            send_telegram(f"🟢 BUY {sym} {qty} @ {raw_entry:.8f} | Notional ≈ {qty*raw_entry:.2f} USDC")
+            tg_send(f"🟢 BUY {sym} {qty} @ {raw_entry:.8f} | Notional ≈ {qty*raw_entry:.2f} USDC")
 
         except BinanceAPIException as be:
             if be.code == -1003:
-                send_telegram("⛔️ IP baneada por peso de peticiones. Sube LOOP_SECONDS o usa websockets.")
+                tg_send("⛔️ IP baneada por peso de peticiones. Sube LOOP_SECONDS o usa websockets.")
             else:
-                send_telegram(f"⚠️ BinanceAPIException {sym}: {be.status_code} {be.message}")
+                tg_send(f"⚠️ BinanceAPIException {sym}: {be.status_code} {be.message}")
             time.sleep(5)
         except Exception as e:
-            send_telegram(f"⚠️ Error {sym}: {repr(e)}")
+            tg_send(f"⚠️ Error {sym}: {repr(e)}")
             time.sleep(2)
 
 # ------------------ Reseteo nocturno tokens ------------------
@@ -404,13 +452,13 @@ def midnight_reset_tokens():
 # ------------------ Main ------------------
 def main():
     tg_autotest()
-    send_telegram("🤖 Bot iniciado.")
+    tg_send("🤖 Bot iniciado.")
     threading.Thread(target=midnight_reset_tokens, daemon=True).start()
     while True:
         try:
             evaluate_and_trade()
         except Exception as e:
-            send_telegram(f"🔥 Loop error: {repr(e)}")
+            tg_send(f"🔥 Loop error: {repr(e)}")
         time.sleep(LOOP_SECONDS)
 
 if __name__ == "__main__":
