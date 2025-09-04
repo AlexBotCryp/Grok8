@@ -6,7 +6,12 @@ import requests
 from dateutil import tz
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-from openai import OpenAI
+
+# NEW: import guard para OpenAI y fallback limpio
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 STATE_PATH = "state.json"
 
@@ -40,12 +45,29 @@ def save_state(st):
 def send_telegram(msg):
     token = env("TG_BOT_TOKEN")
     chat = env("TG_CHAT_ID")
-    if not token or not chat: return
+    if not token or not chat: 
+        return False, "TOKEN o CHAT_ID vacío"
     try:
-        requests.get(f"https://api.telegram.org/bot{token}/sendMessage",
-                     params={"chat_id":chat,"text":msg[:4000]})
-    except Exception:
-        pass
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id":chat,"text":msg[:4000]}
+        )
+        ok = r.status_code == 200 and r.json().get("ok", False)
+        return ok, (None if ok else r.text)
+    except Exception as e:
+        return False, repr(e)
+
+def tg_autotest():
+    """Prueba Telegram al arrancar y muestra errores útiles."""
+    enabled = bool(env("TG_BOT_TOKEN")) and bool(env("TG_CHAT_ID"))
+    if not enabled:
+        print("[TG] Desactivado: falta TG_BOT_TOKEN o TG_CHAT_ID")
+        return
+    ok, err = send_telegram(f"🤖 Bot iniciando {now_ts()} (autotest)")
+    if ok:
+        print("[TG] OK: mensaje de prueba enviado")
+    else:
+        print(f"[TG] ERROR: {err}")
 
 # ---------- Config ----------
 BINANCE_API_KEY = env("BINANCE_API_KEY")
@@ -79,9 +101,22 @@ MAX_TOKENS_DAILY = int(env("MAX_TOKENS_DAILY","2000"))
 
 # ---------- Clientes ----------
 client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+
+# NEW: creación robusta del cliente Grok con fallback
 llm = None
-if GROK_ENABLE and GROK_API_KEY:
-    llm = OpenAI(api_key=GROK_API_KEY, base_url=GROK_BASE_URL)
+if GROK_ENABLE and GROK_API_KEY and OpenAI is not None:
+    try:
+        # Nota: fijamos compat con httpx 0.27.2 en requirements.
+        llm = OpenAI(api_key=GROK_API_KEY, base_url=GROK_BASE_URL)
+        print("[GROK] Cliente inicializado")
+    except Exception as e:
+        print(f"[GROK] Deshabilitado por error de init: {repr(e)}")
+        GROK_ENABLE = False
+else:
+    if not GROK_API_KEY:
+        print("[GROK] Deshabilitado: falta GROK_API_KEY")
+    elif OpenAI is None:
+        print("[GROK] Deshabilitado: paquete openai no disponible")
 
 # ---------- Indicadores ----------
 def ema(arr, period):
@@ -102,7 +137,7 @@ def rsi(arr, period=14):
     roll_down = ema(down, period)
     rs = np.divide(roll_up, roll_down, out=np.zeros_like(roll_up), where=roll_down!=0)
     rsi = 100 - (100/(1+rs))
-    rsi = np.insert(rsi,0,50.0)  # pad
+    rsi = np.insert(rsi,0,50.0)
     return rsi
 
 def atr_pct(highs, lows, closes, period=14):
@@ -126,7 +161,6 @@ def get_symbol_info(sym):
     info = client.get_symbol_info(sym)
     if not info:
         raise RuntimeError(f"Symbol info not found for {sym}")
-    # Extract filters
     f = {flt["filterType"]:flt for flt in info["filters"]}
     step = Decimal(f["LOT_SIZE"]["stepSize"])
     min_qty = Decimal(f["LOT_SIZE"]["minQty"])
@@ -139,7 +173,6 @@ def round_step(qty, step):
     return float(q)
 
 def fetch_klines(sym, interval, limit):
-    # Returns time, open, high, low, close, volume
     ks = client.get_klines(symbol=sym, interval=interval, limit=limit)
     o,h,l,c,v = [],[],[],[],[]
     for k in ks:
@@ -156,15 +189,15 @@ def get_free_usdc():
 
 # ---------- Grok ----------
 def grok_decide(payload_dict):
-    """Llama a Grok SOLO cuando hay señal técnica previa y limita tokens/día."""
-    if not llm: return "HOLD"
+    if not (GROK_ENABLE and llm):
+        return "HOLD"
     st = load_state()
     if st.get("tokens_used",0) > MAX_TOKENS_DAILY:
         return "HOLD"
     prompt = (
-    "Eres un asistente de trading spot cripto. Analiza el JSON y responde SOLO una palabra: BUY, SELL o HOLD.\n"
-    "Compra solo si hay confluencia fuerte y potencial razonable. Evita sobreoperar.\n"
-    "JSON:\n" + json.dumps(payload_dict, ensure_ascii=False)
+        "Eres un asistente de trading spot cripto. Analiza el JSON y responde SOLO una palabra: BUY, SELL o HOLD.\n"
+        "Compra solo si hay confluencia fuerte y potencial razonable. Evita sobreoperar.\n"
+        "JSON:\n" + json.dumps(payload_dict, ensure_ascii=False)
     )
     try:
         resp = llm.chat.completions.create(
@@ -174,7 +207,6 @@ def grok_decide(payload_dict):
             max_tokens=4
         )
         text = resp.choices[0].message.content.strip().upper()
-        # Estimación de tokens muy burda
         used = len(prompt)//3 + 4
         st["tokens_used"] = st.get("tokens_used",0) + used
         save_state(st)
@@ -182,6 +214,7 @@ def grok_decide(payload_dict):
         if "SELL" in text: return "SELL"
         return "HOLD"
     except Exception as e:
+        print(f"[GROK] fallo decide: {repr(e)}")
         return "HOLD"
 
 # ---------- PnL / control diario ----------
@@ -203,7 +236,6 @@ def reached_daily_loss():
 
 # ---------- Órdenes ----------
 def place_buy(sym, quote_qty):
-    """Compra a mercado por importe en USDC (quoteQty)."""
     info = get_symbol_info(sym)
     price = get_price(sym)
     qty = quote_qty / price
@@ -222,7 +254,7 @@ def place_sell(sym, qty):
 # ---------- Estrategia ----------
 def evaluate_and_trade():
     if reached_daily_loss():
-        return  # pausa por pérdida diaria
+        return
 
     st = load_state()
     usdc = get_free_usdc()
@@ -237,34 +269,29 @@ def evaluate_and_trade():
             r = rsi(closes, RSI_LEN)
             ema_f = ema(closes, EMA_FAST)
             ema_s = ema(closes, EMA_SLOW)
-            vol_ok = vols[-1] > VOL_SPIKE * vols[-50:-1].mean() if len(vols) > 50 else True
+            vol_ok = vols[-1] > VOL_SPIKE * (vols[-50:-1].mean() if len(vols) > 50 else vols.mean())
             trend_up = ema_f[-1] > ema_s[-1]
             rsi_val = r[-1]
             atrp = atr_pct(h,l,c, period=14)
 
-            # Potencial esperado (volatilidad reciente)
             expected_gain_ok = atrp >= MIN_EXPECTED_GAIN_PCT
 
             pos = st["positions"].get(sym)
             in_pos = pos is not None
 
-            # ----- Gestión en posición -----
+            # --- Gestión en posición ---
             if in_pos:
                 entry = pos["entry"]
                 qty = pos["qty"]
                 best = pos.get("best", entry)
-                # take profit
                 tp_price = entry * (1 + TAKE_PROFIT_PCT)
-                # hard stop
                 sl_price = entry * (1 - STOP_LOSS_PCT)
 
-                # trailing si en verde
                 if price > best:
                     best = price
                     pos["best"] = best
 
                 if price >= tp_price:
-                    # vender por TP
                     place_sell(sym, qty)
                     pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
                     add_realized_pnl(pnl)
@@ -273,7 +300,6 @@ def evaluate_and_trade():
                     send_telegram(f"✅ SELL TP {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
-                # trailing stop si subió y retrocede TRAIL_PCT desde el máximo
                 if best > entry and price <= best * (1 - TRAIL_PCT):
                     place_sell(sym, qty)
                     pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
@@ -283,7 +309,6 @@ def evaluate_and_trade():
                     send_telegram(f"⚠️ SELL TRAIL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
-                # stop loss duro
                 if price <= sl_price:
                     place_sell(sym, qty)
                     pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
@@ -293,7 +318,6 @@ def evaluate_and_trade():
                     send_telegram(f"❌ SELL SL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
-                # Opcional: Grok puede sugerir salida anticipada
                 if GROK_ENABLE and not reached_daily_loss():
                     features = {
                         "symbol":sym, "price":price, "entry":entry,
@@ -310,14 +334,11 @@ def evaluate_and_trade():
                         send_telegram(f"🤖 SELL by Grok {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                 continue
 
-            # ----- Búsqueda de compra -----
-            # Señal técnica básica (confluencia)
+            # --- Señal de compra ---
             base_signal = (trend_up and rsi_val > 45 and vol_ok) or (rsi_val < 30 and trend_up and vol_ok)
-            # Exigimos potencial por volatilidad
             if not (base_signal and expected_gain_ok):
                 continue
 
-            # Llama a Grok solo si pasa el filtro técnico
             decision = "BUY"
             if GROK_ENABLE:
                 features = {
@@ -327,27 +348,23 @@ def evaluate_and_trade():
                     "min_expected_gain_pct":MIN_EXPECTED_GAIN_PCT
                 }
                 decision = grok_decide(features)
-
             if decision != "BUY":
                 continue
 
-            # Monto a comprar
-            usdc = get_free_usdc()  # refresca
+            usdc = get_free_usdc()
             if usdc < MIN_ORDER_USD:
                 continue
 
             quote_qty = usdc * ALLOCATION_PCT
-            # deja un pequeño colchón para comisiones/decimales
             quote_qty = max(MIN_ORDER_USD, quote_qty * 0.995)
 
-            # Validación contra minNotional
             info = get_symbol_info(sym)
             if Decimal(str(quote_qty)) < info["min_notional"]:
                 quote_qty = float(info["min_notional"]) + 1.0
 
             order, qty, entry = place_buy(sym, quote_qty)
             st["positions"][sym] = {
-                "entry": entry*(1+FEE_PCT),  # entra con comisión
+                "entry": entry*(1+FEE_PCT),
                 "qty": qty,
                 "best": entry
             }
@@ -356,7 +373,7 @@ def evaluate_and_trade():
 
         except BinanceAPIException as be:
             if be.code == -1003:
-                send_telegram("⛔️ IP baneada por peso de peticiones. Aumenta LOOP_SECONDS o usa websockets.")
+                send_telegram("⛔️ IP baneada por peso de peticiones. Sube LOOP_SECONDS o usa websockets.")
             else:
                 send_telegram(f"⚠️ BinanceAPIException {sym}: {be.status_code} {be.message}")
             time.sleep(5)
@@ -367,7 +384,6 @@ def evaluate_and_trade():
 def midnight_reset_tokens():
     while True:
         now = datetime.now(tz=tz.tzlocal())
-        # a medianoche local, resetea tokens_used
         if now.hour == 0 and now.minute < 1:
             st = load_state()
             st["tokens_used"] = 0
@@ -376,7 +392,10 @@ def midnight_reset_tokens():
         time.sleep(20)
 
 def main():
-    send_telegram("🤖 Bot iniciado.")
+    tg_autotest()  # NEW: prueba TG al inicio
+    ok, _ = send_telegram("🤖 Bot iniciado.")
+    if not ok:
+        print("[TG] No se pudo enviar mensaje de inicio (ver logs arriba).")
     threading.Thread(target=midnight_reset_tokens, daemon=True).start()
     while True:
         try:
