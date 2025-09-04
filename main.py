@@ -1,5 +1,5 @@
 import os, json, time, threading, sys
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
 import ssl
 import urllib.request, urllib.parse, urllib.error
@@ -39,7 +39,13 @@ def now_ts():
 
 def load_state():
     if not os.path.exists(STATE_PATH):
-        return {"positions": {}, "pnl_history": {}, "tokens_used": 0}
+        return {
+            "positions": {},            # sym -> {entry, qty, best, opened_at, last_sell_at}
+            "pnl_history": {}, 
+            "tokens_used": 0,
+            "last_open": {},            # sym -> iso datetime
+            "last_close": {},           # sym -> iso datetime
+        }
     with open(STATE_PATH, "r") as f:
         return json.load(f)
 
@@ -47,6 +53,12 @@ def save_state(st):
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w") as f: json.dump(st, f, indent=2, sort_keys=True)
     os.replace(tmp, STATE_PATH)
+
+def iso_to_dt(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z","+00:00"))
+    except Exception:
+        return None
 
 # ------------------ Mini HTTP (Render health) ------------------
 def start_http_server():
@@ -106,7 +118,11 @@ def tg_autotest():
 BINANCE_API_KEY = env("BINANCE_API_KEY")
 BINANCE_API_SECRET = env("BINANCE_API_SECRET")
 
+# Universo
+AUTO_UNIVERSE = env("AUTO_UNIVERSE","true").lower()=="true"
+UNIVERSE_MAX = int(env("UNIVERSE_MAX","40"))    # top N por volumen
 SYMBOLS = [s.strip().upper() for s in env("SYMBOLS","BTCUSDC,ETHUSDC,SOLUSDC,DOGEUSDC,TRXUSDC,BNBUSDC,LINKUSDC").split(",") if s.strip()]
+
 INTERVAL = env("INTERVAL","1m")
 CANDLES  = int(env("CANDLES","200"))
 
@@ -122,9 +138,14 @@ TAKE_PROFIT_PCT = parse_float(env("TAKE_PROFIT_PCT","0.006"), 0.006)  # 0.6%
 STOP_LOSS_PCT   = parse_float(env("STOP_LOSS_PCT","0.008"), 0.008)    # 0.8%
 TRAIL_PCT       = parse_float(env("TRAIL_PCT","0.004"), 0.004)        # 0.4%
 
-MIN_ORDER_USD   = parse_float(env("MIN_ORDER_USD","5"), 5)            # permite tickets pequeños si el par lo acepta
-ALLOCATION_PCT  = parse_float(env("ALLOCATION_PCT","0.25"), 0.25)     # no gastes todo en 1 trade
-MAX_BUYS_PER_LOOP = int(env("MAX_BUYS_PER_LOOP","3"))                  # varias compras por ciclo si hay señales
+MIN_ORDER_USD   = parse_float(env("MIN_ORDER_USD","5"), 5)            # tickets pequeños si el par lo acepta
+ALLOCATION_PCT  = parse_float(env("ALLOCATION_PCT","0.15"), 0.15)     # % por trade (diversifica)
+MAX_OPEN_POSITIONS = int(env("MAX_OPEN_POSITIONS","6"))
+MAX_SYMBOL_EXPOSURE_PCT = parse_float(env("MAX_SYMBOL_EXPOSURE_PCT","0.35"), 0.35)  # tope por símbolo sobre equity total
+MAX_BUYS_PER_LOOP = int(env("MAX_BUYS_PER_LOOP","3"))
+
+COOLDOWN_MIN = int(env("COOLDOWN_MIN","10"))           # min tras cerrar para volver a abrir el MISMO símbolo
+OPEN_COOLDOWN_MIN = int(env("OPEN_COOLDOWN_MIN","3"))  # min tras abrir para no reabrir en seguida
 
 DAILY_MAX_LOSS_USD = parse_float(env("DAILY_MAX_LOSS_USD","25"), 25)
 FEE_PCT = parse_float(env("FEE_PCT","0.001"), 0.001)
@@ -230,7 +251,6 @@ def kline_handler(msg):
         print(f"[WS] handler error: {repr(e)}", flush=True)
 
 def fetch_klines(sym, interval, limit):
-    """Devuelve (o,h,l,c,v) si hay barras suficientes; si no, None (para evitar errores)."""
     with MARKET_LOCK:
         buf = MARKET.get(sym)
         if not buf or len(buf.get("c",[])) < REQUIRED_BARS:
@@ -246,7 +266,36 @@ def get_last_price(sym, fallback_rest=True):
         return float(client.get_symbol_ticker(symbol=sym)["price"])
     raise RuntimeError(f"no price for {sym}")
 
-# ------------------ Balance ------------------
+# ------------------ Universo automático (opcional) ------------------
+def build_auto_universe():
+    global SYMBOLS
+    try:
+        ex = client.get_exchange_info()
+        usdc_syms = []
+        for s in ex["symbols"]:
+            try:
+                if s.get("quoteAsset")!="USDC": continue
+                if s.get("status")!="TRADING": continue
+                if s.get("permissions") and "SPOT" not in s["permissions"]: continue
+                sym = s["symbol"]
+                usdc_syms.append(sym)
+            except Exception:
+                continue
+        # ordenar por volumen 24h (ticker)
+        tickers = client.get_ticker()  # lista
+        vol_map = {t["symbol"]: float(t.get("quoteVolume",0.0)) for t in tickers}
+        usdc_syms.sort(key=lambda x: vol_map.get(x,0.0), reverse=True)
+        if UNIVERSE_MAX>0:
+            usdc_syms = usdc_syms[:UNIVERSE_MAX]
+        if usdc_syms:
+            SYMBOLS = usdc_syms
+            print(f"[UNIVERSE] AUTO: {len(SYMBOLS)} símbolos USDC top volumen", flush=True)
+        else:
+            print("[UNIVERSE] AUTO vacío; usando SYMBOLS env", flush=True)
+    except Exception as e:
+        print(f"[UNIVERSE] fallo auto: {repr(e)}; usando SYMBOLS env", flush=True)
+
+# ------------------ Balance / exposición ------------------
 BALANCE_CACHE = {"free": {}, "ts": 0.0}
 BALANCE_TTL = 20
 
@@ -262,11 +311,37 @@ def get_all_balances():
     BALANCE_CACHE["free"] = free; BALANCE_CACHE["ts"] = now
     return free
 
+def _invalidate_balance_cache():
+    BALANCE_CACHE["ts"] = 0.0
+
 def get_free_usdc():
     return get_all_balances().get("USDC", 0.0)
 
-def _invalidate_balance_cache():
-    BALANCE_CACHE["ts"] = 0.0
+def portfolio_value_usdc():
+    """USDC + sum(coin_qty * last_price in USDC) para todos los símbolos en MARKET."""
+    bals = get_all_balances()
+    total = float(bals.get("USDC", 0.0))
+    # mapea asset->qty (sin USDC)
+    for asset, qty in bals.items():
+        if asset in ("USDC","BUSD","USD"): continue
+        if qty <= 0: continue
+        sym = f"{asset}USDC"
+        try:
+            px = get_last_price(sym, fallback_rest=False)
+        except Exception:
+            try:
+                px = float(client.get_symbol_ticker(symbol=sym)["price"])
+            except Exception:
+                px = 0.0
+        total += qty * px
+    return total
+
+def symbol_exposure_usdc(symbol):
+    """Notional actual invertido en 'symbol' según posición abierta (state)."""
+    st = load_state()
+    pos = st.get("positions", {}).get(symbol)
+    if not pos: return 0.0
+    return float(pos["qty"]) * float(pos["entry"])
 
 # ------------------ PnL / riesgo ------------------
 def today_key(): return date.today().isoformat()
@@ -315,11 +390,28 @@ def seed_klines_once(symbols, interval, limit=200):
                     buf["ready"] = len(buf["c"]) >= REQUIRED_BARS
                 if DEBUG:
                     print(f"[SEED] {sym} {len(c)} velas (ready={buf['ready']})", flush=True)
-                time.sleep(0.12)
+                time.sleep(0.1)
             except Exception as e:
                 print(f"[SEED] fallo {sym}: {repr(e)}", flush=True)
     except Exception as e:
         print(f"[SEED] error general: {repr(e)}", flush=True)
+
+# ------------------ Cooldowns ------------------
+def cooldown_open_allowed(st, sym):
+    # cooldown tras abrir
+    ts = st.get("last_open", {}).get(sym)
+    if not ts: return True
+    dt = iso_to_dt(ts)
+    if not dt: return True
+    return (datetime.now(timezone.utc) - dt) >= timedelta(minutes=OPEN_COOLDOWN_MIN)
+
+def cooldown_reentry_after_close_allowed(st, sym):
+    # cooldown tras cerrar
+    ts = st.get("last_close", {}).get(sym)
+    if not ts: return True
+    dt = iso_to_dt(ts)
+    if not dt: return True
+    return (datetime.now(timezone.utc) - dt) >= timedelta(minutes=COOLDOWN_MIN)
 
 # ------------------ Estrategia ------------------
 def evaluate_and_trade():
@@ -329,6 +421,14 @@ def evaluate_and_trade():
 
     st = load_state()
     buys_this_loop = 0
+
+    # Control de nº de posiciones global
+    open_positions = len(st.get("positions", {}))
+    if open_positions >= MAX_OPEN_POSITIONS:
+        if DEBUG: print(f"[RISK] Máx posiciones abiertas alcanzado ({open_positions}/{MAX_OPEN_POSITIONS})", flush=True)
+
+    total_equity = portfolio_value_usdc()
+    if DEBUG: print(f"[EQ] Equity total ≈ {total_equity:.2f} USDC | open={open_positions}", flush=True)
 
     for sym in SYMBOLS:
         data = fetch_klines(sym, INTERVAL, CANDLES)
@@ -358,9 +458,9 @@ def evaluate_and_trade():
                 continue
 
             if DEBUG:
-                print(f"[SIG] {sym} price={price:.6f} rsi={rsi_val:.2f} ema_f={float(ema_f[-1]):.6f} "
-                      f"ema_s={float(ema_s[-1]):.6f} vol_ok={vol_ok} atr_pct={atrp:.4f} "
-                      f"ema_cross_up={ema_cross_up} trend_up={trend_up}", flush=True)
+                print(f"[SIG] {sym} px={price:.6f} rsi={rsi_val:.2f} ema_f={float(ema_f[-1]):.6f} "
+                      f"ema_s={float(ema_s[-1]):.6f} vol_ok={vol_ok} atr%={atrp:.4f} "
+                      f"cross_up={ema_cross_up} trend_up={trend_up}", flush=True)
 
             pos = st["positions"].get(sym)
             in_pos = pos is not None
@@ -377,21 +477,30 @@ def evaluate_and_trade():
                 if price >= tp_price:
                     place_sell(sym, qty)
                     pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
-                    add_realized_pnl(pnl); st["positions"].pop(sym, None); save_state(st)
+                    add_realized_pnl(pnl)
+                    st["positions"].pop(sym, None)
+                    st.setdefault("last_close",{})[sym] = now_ts()
+                    save_state(st)
                     tg_send(f"✅ SELL TP {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
                 if best > entry and price <= best * (1 - TRAIL_PCT):
                     place_sell(sym, qty)
                     pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
-                    add_realized_pnl(pnl); st["positions"].pop(sym, None); save_state(st)
+                    add_realized_pnl(pnl)
+                    st["positions"].pop(sym, None)
+                    st.setdefault("last_close",{})[sym] = now_ts()
+                    save_state(st)
                     tg_send(f"⚠️ SELL TRAIL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
                 if price <= sl_price:
                     place_sell(sym, qty)
                     pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
-                    add_realized_pnl(pnl); st["positions"].pop(sym, None); save_state(st)
+                    add_realized_pnl(pnl)
+                    st["positions"].pop(sym, None)
+                    st.setdefault("last_close",{})[sym] = now_ts()
+                    save_state(st)
                     tg_send(f"❌ SELL SL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
@@ -407,26 +516,57 @@ def evaluate_and_trade():
                 if DEBUG: print(f"[SKIP] {sym} ATR% insuficiente ({atrp:.4f} < {MIN_EXPECTED_GAIN_PCT})", flush=True)
                 continue
 
-            if buys_this_loop >= MAX_BUYS_PER_LOOP:
-                if DEBUG: print(f"[SKIP] {sym} límite de compras en este ciclo ({buys_this_loop}/{MAX_BUYS_PER_LOOP})", flush=True)
+            # Cap de número de posiciones abiertas
+            if open_positions >= MAX_OPEN_POSITIONS:
+                if DEBUG: print(f"[SKIP] {sym} límite global de posiciones ({open_positions}/{MAX_OPEN_POSITIONS})", flush=True)
                 continue
 
+            # Cooldowns por símbolo
+            if not cooldown_open_allowed(st, sym):
+                if DEBUG: print(f"[SKIP] {sym} cooldown tras abrir", flush=True)
+                continue
+            if not cooldown_reentry_after_close_allowed(st, sym):
+                if DEBUG: print(f"[SKIP] {sym} cooldown tras cerrar", flush=True)
+                continue
+
+            # Cap de exposición por símbolo
+            sym_exp = symbol_exposure_usdc(sym)
+            if total_equity > 0 and (sym_exp / total_equity) >= MAX_SYMBOL_EXPOSURE_PCT:
+                if DEBUG: print(f"[SKIP] {sym} exposición {sym_exp/total_equity:.2%} >= cap {MAX_SYMBOL_EXPOSURE_PCT:.0%}", flush=True)
+                continue
+
+            # Límite de compras por ciclo
+            if buys_this_loop >= MAX_BUYS_PER_LOOP:
+                if DEBUG: print(f"[SKIP] {sym} límite buys loop ({buys_this_loop}/{MAX_BUYS_PER_LOOP})", flush=True)
+                continue
+
+            # Balance y tamaño
             usdc = get_free_usdc()
             if DEBUG: print(f"[BAL] USDC libre ≈ {usdc:.2f}", flush=True)
             if usdc < MIN_ORDER_USD:
                 if DEBUG: print(f"[SKIP] {sym} USDC insuficiente ({usdc:.2f} < {MIN_ORDER_USD})", flush=True)
                 continue
 
-            quote_qty = max(MIN_ORDER_USD, usdc * ALLOCATION_PCT * 0.995)
-            info = get_symbol_info(sym)
-            if Decimal(str(quote_qty)) < info["min_notional"]:
-                quote_qty = float(info["min_notional"]) + 1.0
+            # Calcula notional respetando cap por símbolo
+            desired = max(MIN_ORDER_USD, usdc * ALLOCATION_PCT * 0.995)
+            if total_equity > 0:
+                max_more_for_symbol = MAX_SYMBOL_EXPOSURE_PCT * total_equity - sym_exp
+                if max_more_for_symbol <= 0:
+                    if DEBUG: print(f"[SKIP] {sym} cap por símbolo alcanzado", flush=True)
+                    continue
+                desired = min(desired, max_more_for_symbol)
 
-            order, qty, raw_entry = place_buy(sym, quote_qty)
-            st["positions"][sym] = {"entry": raw_entry*(1+FEE_PCT), "qty": qty, "best": raw_entry}
+            info = get_symbol_info(sym)
+            if Decimal(str(desired)) < info["min_notional"]:
+                desired = float(info["min_notional"]) + 1.0
+
+            order, qty, raw_entry = place_buy(sym, desired)
+            st["positions"][sym] = {"entry": raw_entry*(1+FEE_PCT), "qty": qty, "best": raw_entry, "opened_at": now_ts()}
+            st.setdefault("last_open",{})[sym] = now_ts()
             save_state(st)
             tg_send(f"🟢 BUY {sym} {qty} @ {raw_entry:.8f} | Notional ≈ {qty*raw_entry:.2f} USDC")
             buys_this_loop += 1
+            open_positions += 1
 
         except BinanceAPIException as be:
             if be.code == -1003:
@@ -447,6 +587,11 @@ def heartbeat():
 # ------------------ Main ------------------
 def main():
     print(f"[BOOT] {now_ts()} — starting...", flush=True)
+
+    # Universo auto (opcional)
+    if AUTO_UNIVERSE:
+        build_auto_universe()
+
     start_http_server()
     tg_autotest()
 
@@ -460,16 +605,17 @@ def main():
     if SEED_KLINES_ON_START:
         seed_klines_once(SYMBOLS, INTERVAL, limit=CANDLES)
 
-    # Compra forzada opcional (quítalo después de probar)
+    # Compra forzada opcional (quítalo después)
     if FORCE_BUY_SYMBOL and FORCE_BUY_SYMBOL in SYMBOLS and FORCE_BUY_USD > 0:
         try:
             info = get_symbol_info(FORCE_BUY_SYMBOL)
-            quote_qty = max(MIN_ORDER_USD, FORCE_BUY_USD)
-            if Decimal(str(quote_qty)) < info["min_notional"]:
-                quote_qty = float(info["min_notional"]) + 1.0
-            order, qty, raw_entry = place_buy(FORCE_BUY_SYMBOL, quote_qty)
+            desired = max(MIN_ORDER_USD, FORCE_BUY_USD)
+            if Decimal(str(desired)) < info["min_notional"]:
+                desired = float(info["min_notional"]) + 1.0
+            order, qty, raw_entry = place_buy(FORCE_BUY_SYMBOL, desired)
             st = load_state()
-            st["positions"][FORCE_BUY_SYMBOL] = {"entry": raw_entry*(1+FEE_PCT), "qty": qty, "best": raw_entry}
+            st["positions"][FORCE_BUY_SYMBOL] = {"entry": raw_entry*(1+FEE_PCT), "qty": qty, "best": raw_entry, "opened_at": now_ts()}
+            st.setdefault("last_open",{})[FORCE_BUY_SYMBOL] = now_ts()
             save_state(st)
             tg_send(f"🧪 BUY FORZADO {FORCE_BUY_SYMBOL} {qty} @ {raw_entry:.8f} | Notional ≈ {qty*raw_entry:.2f} USDC")
             print(f"[FORCE] buy {FORCE_BUY_SYMBOL} ok", flush=True)
