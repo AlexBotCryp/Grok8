@@ -3,6 +3,7 @@ from datetime import datetime, date, timezone
 from decimal import Decimal, ROUND_DOWN
 import ssl
 import urllib.request, urllib.parse, urllib.error
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import numpy as np
 from dateutil import tz
@@ -45,6 +46,31 @@ def save_state(st):
     with open(tmp, "w") as f:
         json.dump(st, f, indent=2, sort_keys=True)
     os.replace(tmp, STATE_PATH)
+
+# ===================== Mini HTTP server (para Web Service) =====================
+def start_http_server():
+    """Pequeño servidor para mantener vivo un Web Service en Render."""
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in ("/", "/health"):
+                body = f"OK {now_ts()}".encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, fmt, *args):
+            # Silenciar logs por request
+            return
+
+    port = int(os.getenv("PORT", "10000"))
+    httpd = HTTPServer(("0.0.0.0", port), Handler)
+    print(f"[HTTP] Listening on 0.0.0.0:{port}")
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
 
 # ===================== Telegram (stdlib) =====================
 def tg_http(method, params: dict):
@@ -132,9 +158,11 @@ ALLOCATION_PCT  = parse_float(env("ALLOCATION_PCT", "1.0"), 1.0)  # usar 100% de
 DAILY_MAX_LOSS_USD = parse_float(env("DAILY_MAX_LOSS_USD", "25"), 25)
 FEE_PCT = parse_float(env("FEE_PCT", "0.001"), 0.001)  # aprox 0.1% por lado
 
-LOOP_SECONDS = int(env("LOOP_SECONDS", "60"))  # subido para reducir peso
+# Recomendado para Web Service: 60–90s
+LOOP_SECONDS = int(env("LOOP_SECONDS", "60"))
 
-GROK_ENABLE  = env("GROK_ENABLE", "true").lower() == "true"
+# Grok (opcional)
+GROK_ENABLE  = env("GROK_ENABLE", "false").lower() == "true"
 GROK_BASE_URL = env("GROK_BASE_URL", "https://api.x.ai/v1")
 GROK_API_KEY  = env("GROK_API_KEY")
 GROK_MODEL    = env("GROK_MODEL", "grok")
@@ -154,10 +182,8 @@ if GROK_ENABLE and GROK_API_KEY and OpenAI is not None:
         print(f"[GROK] Deshabilitado por init error: {repr(e)}")
         GROK_ENABLE = False
 else:
-    if not GROK_API_KEY:
+    if GROK_ENABLE and not GROK_API_KEY:
         print("[GROK] Deshabilitado: falta GROK_API_KEY")
-    elif OpenAI is None:
-        print("[GROK] Deshabilitado: paquete openai no disponible")
 
 # ===================== Indicadores =====================
 def ema(arr, period):
@@ -250,7 +276,6 @@ def kline_handler(msg):
         print(f"[WS] handler error: {repr(e)}")
 
 def fetch_klines(sym, interval, limit):
-    # Leer del buffer WS (sin REST)
     with MARKET_LOCK:
         buf = MARKET.get(sym)
         if not buf or not buf["ready"]:
@@ -267,7 +292,7 @@ def get_price(sym):
         buf = MARKET.get(sym)
         if buf and buf["c"]:
             return float(buf["c"][-1])
-    # Fallback extremo (evitar): REST sólo si no hay WS
+    # Fallback (evitar): REST solo si no hay WS
     return float(client.get_symbol_ticker(symbol=sym)["price"])
 
 # ---- Caché de balance ----
@@ -381,11 +406,11 @@ def evaluate_and_trade():
             vols   = np.array(v, dtype=float)
             price  = float(closes[-1])
 
-            r       = rsi(closes, RSI_LEN)
-            ema_f   = ema(closes, EMA_FAST)
-            ema_s   = ema(closes, EMA_SLOW)
+            r        = rsi(closes, RSI_LEN)
+            ema_f    = ema(closes, EMA_FAST)
+            ema_s    = ema(closes, EMA_SLOW)
             vol_base = vols[-50:-1].mean() if len(vols) > 50 else (vols.mean() if len(vols) else 0.0)
-            vol_ok  = vols[-1] > VOL_SPIKE * max(vol_base, 1e-9)
+            vol_ok   = vols[-1] > VOL_SPIKE * max(vol_base, 1e-9)
             trend_up = ema_f[-1] > ema_s[-1]
             rsi_val  = r[-1]
             atrp     = atr_pct(h, l, c, period=14)
@@ -496,7 +521,7 @@ def evaluate_and_trade():
             tg_send(f"⚠️ Error {sym}: {repr(e)}")
             time.sleep(2)
 
-# ===================== Reseteo tokens y WS =====================
+# ===================== Reseteo tokens / WS / Heartbeat =====================
 def midnight_reset_tokens():
     while True:
         now = datetime.now(tz=tz.tzlocal())
@@ -513,16 +538,27 @@ def start_streams(twm: ThreadedWebsocketManager):
         twm.start_kline_socket(callback=kline_handler, symbol=sym.lower(), interval=INTERVAL)
     print("[WS] Streams iniciados")
 
+def heartbeat():
+    while True:
+        print(f"[HB] alive {now_ts()} — symbols: {','.join(SYMBOLS)}")
+        time.sleep(60)
+
 # ===================== Main =====================
 def main():
+    start_http_server()  # <- necesario si usas Web Service
     tg_autotest()
     tg_send("🤖 Bot iniciado.")
+
     # WebSockets
     twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
     twm.start()
     start_streams(twm)
 
+    # Threads auxiliares
     threading.Thread(target=midnight_reset_tokens, daemon=True).start()
+    threading.Thread(target=heartbeat, daemon=True).start()
+
+    # Loop principal
     while True:
         try:
             evaluate_and_trade()
