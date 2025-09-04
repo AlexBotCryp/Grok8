@@ -135,18 +135,19 @@ def tg_autotest():
 BINANCE_API_KEY = env("BINANCE_API_KEY")
 BINANCE_API_SECRET = env("BINANCE_API_SECRET")
 
-# Watchlist
-SYMBOLS = [s.strip().upper() for s in env("SYMBOLS", "BTCUSDC,ETHUSDC,SOLUSDC,DOGEUSDC,TRXUSDC").split(",") if s.strip()]
-INTERVAL = env("INTERVAL", "3m")
+# Watchlist (puedes ampliar)
+SYMBOLS = [s.strip().upper() for s in env("SYMBOLS", "BTCUSDC,ETHUSDC,SOLUSDC,DOGEUSDC,TRXUSDC,BNBUSDC,LINKUSDC").split(",") if s.strip()]
+INTERVAL = env("INTERVAL", "1m")   # más señales por defecto
 CANDLES  = int(env("CANDLES", "200"))
 
 # Señales
 RSI_LEN  = int(env("RSI_LEN", "14"))
 EMA_FAST = int(env("EMA_FAST", "9"))
 EMA_SLOW = int(env("EMA_SLOW", "21"))
-VOL_SPIKE = parse_float(env("VOL_SPIKE", "1.10"), 1.10)   # más permisivo
 
-MIN_EXPECTED_GAIN_PCT = parse_float(env("MIN_EXPECTED_GAIN_PCT", "0.03"), 0.03)  # más permisivo
+VOL_SPIKE = parse_float(env("VOL_SPIKE", "0.95"), 0.95)                 # relajado
+MIN_EXPECTED_GAIN_PCT = parse_float(env("MIN_EXPECTED_GAIN_PCT", "0.0015"), 0.0015)  # ~0.15% ATR
+REQUIRE_VOL_SPIKE = env("REQUIRE_VOL_SPIKE", "false").lower() == "true"  # volumen opcional por defecto
 
 # Gestión
 TAKE_PROFIT_PCT = parse_float(env("TAKE_PROFIT_PCT", "0.006"), 0.006)
@@ -373,10 +374,19 @@ def seed_klines_once(symbols, interval, limit=200):
     except Exception as e:
         print(f"[SEED] error general: {repr(e)}", flush=True)
 
+# ===================== PnL / control diario =====================
+def today_key():
+    return date.today().isoformat()
+
+def add_realized_pnl(amount_usd):
+    st = load_state(); day = today_key()
+    d = st.get("pnl_history", {}); d[day] = round(d.get(day, 0.0) + float(amount_usd), 6)
+    st["pnl_history"] = d; save_state(st)
+
 # ===================== Estrategia principal =====================
 def evaluate_and_trade():
     st = load_state()
-    if st.get("pnl_history", {}).get(date.today().isoformat(), 0.0) <= -abs(DAILY_MAX_LOSS_USD):
+    if st.get("pnl_history", {}).get(today_key(), 0.0) <= -abs(DAILY_MAX_LOSS_USD):
         if DEBUG: print("[RISK] límite diario de pérdida alcanzado", flush=True)
         return
 
@@ -395,10 +405,23 @@ def evaluate_and_trade():
             trend_up = ema_f[-1] > ema_s[-1]
             rsi_val  = r[-1]; atrp = atr_pct(h, l, c, period=14)
 
+            # Señales más flexibles + cruce EMA
+            ema_cross_up = (ema_f[-2] <= ema_s[-2]) and (ema_f[-1] > ema_s[-1])
+            base_signal = (
+                (trend_up and rsi_val > 50) or    # tendencia + momentum
+                (rsi_val < 32 and trend_up) or    # rebote en sobreventa dentro de tendencia
+                ema_cross_up                      # cruce EMA9>EMA21
+            )
+
+            if REQUIRE_VOL_SPIKE and not vol_ok:
+                if DEBUG: print(f"[SKIP] {sym} volumen insuficiente (gate activo)", flush=True)
+                continue
+
             if DEBUG:
                 print(f"[SIG] {sym} price={price:.6f} rsi={rsi_val:.2f} "
                       f"ema_f={float(ema_f[-1]):.6f} ema_s={float(ema_s[-1]):.6f} "
-                      f"vol_ok={vol_ok} atr_pct={atrp:.4f}", flush=True)
+                      f"vol_ok={vol_ok} atr_pct={atrp:.4f} "
+                      f"ema_cross_up={ema_cross_up} trend_up={trend_up}", flush=True)
 
             pos = st["positions"].get(sym)
             in_pos = pos is not None
@@ -433,7 +456,7 @@ def evaluate_and_trade():
                     tg_send(f"❌ SELL SL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
-                # Señal de salida por Grok (opcional) si va en verde
+                # (Opcional) Salida por Grok si va en verde
                 if GROK_ENABLE:
                     features = {"symbol":sym,"price":price,"entry":entry,"rsi":rsi_val,
                                 "ema_fast":float(ema_f[-1]),"ema_slow":float(ema_s[-1]),
@@ -447,7 +470,6 @@ def evaluate_and_trade():
                 continue
 
             # ------- Entrada -------
-            base_signal = (trend_up and rsi_val > 45 and vol_ok) or (rsi_val < 30 and trend_up and vol_ok)
             if not base_signal:
                 if DEBUG: print(f"[SKIP] {sym} sin señal base", flush=True)
                 continue
