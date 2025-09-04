@@ -1,21 +1,35 @@
-import os, json, time, threading
+import os, json, time, threading, sys
 from datetime import datetime, date, timezone
 from decimal import Decimal, ROUND_DOWN
 import ssl
 import urllib.request, urllib.parse, urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# --------- for immediate logs even without -u (extra safety) ----------
+sys.stdout.reconfigure(line_buffering=True)
+
+print(">> Boot sequence starting...", flush=True)
+
 import numpy as np
 from dateutil import tz
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
-from binance.streams import ThreadedWebsocketManager
 
-# OpenAI (Grok compatible). Si falta el paquete, seguimos sin Grok.
+# Imports de Binance con diagnóstico
+try:
+    from binance.client import Client
+    from binance.exceptions import BinanceAPIException
+    from binance.streams import ThreadedWebsocketManager
+    print(">> Binance libs OK", flush=True)
+except Exception as e:
+    print(f">> ERROR importando binance libs: {repr(e)}", flush=True)
+    raise
+
+# OpenAI (Grok compatible)
 try:
     from openai import OpenAI
+    print(">> OpenAI client OK", flush=True)
 except Exception:
     OpenAI = None
+    print(">> OpenAI client no disponible (seguimos sin Grok)", flush=True)
 
 STATE_PATH = "state.json"
 
@@ -49,7 +63,7 @@ def save_state(st):
 
 # ===================== Mini HTTP server (para Web Service) =====================
 def start_http_server():
-    """Pequeño servidor para mantener vivo un Web Service en Render."""
+    """Mini servidor para healthchecks en Render."""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path in ("/", "/health"):
@@ -59,16 +73,12 @@ def start_http_server():
                 self.end_headers()
                 self.wfile.write(body)
             else:
-                self.send_response(404)
-                self.end_headers()
-
+                self.send_response(404); self.end_headers()
         def log_message(self, fmt, *args):
-            # Silenciar logs por request
             return
-
     port = int(os.getenv("PORT", "10000"))
     httpd = HTTPServer(("0.0.0.0", port), Handler)
-    print(f"[HTTP] Listening on 0.0.0.0:{port}")
+    print(f"[HTTP] Listening on 0.0.0.0:{port}", flush=True)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
 
@@ -107,58 +117,54 @@ def tg_send(msg: str):
         return False, "CHAT_ID vacío"
     ok, err, _ = tg_http("sendMessage", {"chat_id": chat, "text": msg[:4000]})
     if not ok:
-        print(f"[TG] sendMessage ERROR -> {err}")
+        print(f"[TG] sendMessage ERROR -> {err}", flush=True)
     return ok, (None if ok else err)
 
 def tg_autotest():
-    token = env("TG_BOT_TOKEN")
-    chat = env("TG_CHAT_ID")
+    token = env("TG_BOT_TOKEN"); chat = env("TG_CHAT_ID")
     if not token:
-        print("[TG] Desactivado: falta TG_BOT_TOKEN")
-        return
+        print("[TG] Desactivado: falta TG_BOT_TOKEN", flush=True); return
     ok, err, data = tg_http("getMe", {})
     if not ok:
-        print(f"[TG] getMe ERROR -> {err}")
-        return
+        print(f"[TG] getMe ERROR -> {err}", flush=True); return
     me = data.get("result", {})
-    print(f"[TG] getMe OK. Bot: @{me.get('username')} (id {me.get('id')})")
+    print(f"[TG] getMe OK. Bot: @{me.get('username')} (id {me.get('id')})", flush=True)
     if chat:
         okc, errc, datac = tg_http("getChat", {"chat_id": chat})
         if okc:
             title = datac.get("result", {}).get("title") or datac.get("result", {}).get("username") or datac.get("result", {}).get("first_name")
-            print(f"[TG] getChat OK. Chat detectado: {title} (id {chat})")
+            print(f"[TG] getChat OK. Chat detectado: {title} (id {chat})", flush=True)
         else:
-            print(f"[TG] getChat ERROR -> {errc}  (¿El bot está dentro del chat? ¿ID correcto?)")
+            print(f"[TG] getChat ERROR -> {errc}  (¿El bot está en el chat? ¿ID correcto?)", flush=True)
     if chat:
         okm, errm = tg_send(f"🤖 Autotest {now_ts()} — hola, Alex.")
         if okm:
-            print("[TG] sendMessage OK (mensaje de prueba enviado)")
+            print("[TG] sendMessage OK (mensaje de prueba enviado)", flush=True)
         else:
-            print(f"[TG] sendMessage ERROR -> {errm}")
+            print(f"[TG] sendMessage ERROR -> {errm}", flush=True)
 
 # ===================== Configuración =====================
 BINANCE_API_KEY = env("BINANCE_API_KEY")
 BINANCE_API_SECRET = env("BINANCE_API_SECRET")
 
 SYMBOLS = [s.strip().upper() for s in env("SYMBOLS", "BTCUSDC,DOGEUSDC,TRXUSDC").split(",") if s.strip()]
-INTERVAL = env("INTERVAL", "3m")     # 1m/3m/5m/15m...
+INTERVAL = env("INTERVAL", "3m")
 CANDLES  = int(env("CANDLES", "200"))
 
 RSI_LEN  = int(env("RSI_LEN", "14"))
 EMA_FAST = int(env("EMA_FAST", "9"))
 EMA_SLOW = int(env("EMA_SLOW", "21"))
-VOL_SPIKE = parse_float(env("VOL_SPIKE", "1.20"), 1.20)  # vol actual > 1.2 * media
+VOL_SPIKE = parse_float(env("VOL_SPIKE", "1.20"), 1.20)
 
-MIN_EXPECTED_GAIN_PCT = parse_float(env("MIN_EXPECTED_GAIN_PCT", "0.05"), 0.05)  # por ATR%
+MIN_EXPECTED_GAIN_PCT = parse_float(env("MIN_EXPECTED_GAIN_PCT", "0.05"), 0.05)
 TAKE_PROFIT_PCT = parse_float(env("TAKE_PROFIT_PCT", "0.006"), 0.006)
 STOP_LOSS_PCT   = parse_float(env("STOP_LOSS_PCT", "0.008"), 0.008)
 TRAIL_PCT       = parse_float(env("TRAIL_PCT", "0.004"), 0.004)
 MIN_ORDER_USD   = parse_float(env("MIN_ORDER_USD", "20"), 20)
-ALLOCATION_PCT  = parse_float(env("ALLOCATION_PCT", "1.0"), 1.0)  # usar 100% del USDC
+ALLOCATION_PCT  = parse_float(env("ALLOCATION_PCT", "1.0"), 1.0)
 DAILY_MAX_LOSS_USD = parse_float(env("DAILY_MAX_LOSS_USD", "25"), 25)
-FEE_PCT = parse_float(env("FEE_PCT", "0.001"), 0.001)  # aprox 0.1% por lado
+FEE_PCT = parse_float(env("FEE_PCT", "0.001"), 0.001)
 
-# Recomendado para Web Service: 60–90s
 LOOP_SECONDS = int(env("LOOP_SECONDS", "60"))
 
 # Grok (opcional)
@@ -171,26 +177,27 @@ _current_grok_model_idx = 0
 MAX_TOKENS_DAILY = int(env("MAX_TOKENS_DAILY", "2000"))
 
 # ===================== Clientes Binance/Grok =====================
+print(">> Creando cliente de Binance…", flush=True)
 client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+print(">> Cliente Binance OK", flush=True)
 
 llm = None
 if GROK_ENABLE and GROK_API_KEY and OpenAI is not None:
     try:
         llm = OpenAI(api_key=GROK_API_KEY, base_url=GROK_BASE_URL)
-        print(f"[GROK] Cliente inicializado (modelo preferido: {GROK_MODEL})")
+        print(f"[GROK] Cliente inicializado (modelo preferido: {GROK_MODEL})", flush=True)
     except Exception as e:
-        print(f"[GROK] Deshabilitado por init error: {repr(e)}")
+        print(f"[GROK] Deshabilitado por init error: {repr(e)}", flush=True)
         GROK_ENABLE = False
 else:
     if GROK_ENABLE and not GROK_API_KEY:
-        print("[GROK] Deshabilitado: falta GROK_API_KEY")
+        print("[GROK] Deshabilitado: falta GROK_API_KEY", flush=True)
 
 # ===================== Indicadores =====================
 def ema(arr, period):
     arr = np.asarray(arr, dtype=float)
     k = 2 / (period + 1)
-    out = np.zeros_like(arr)
-    out[0] = arr[0]
+    out = np.zeros_like(arr); out[0] = arr[0]
     for i in range(1, len(arr)):
         out[i] = arr[i] * k + out[i - 1] * (1 - k)
     return out
@@ -200,8 +207,7 @@ def rsi(arr, period=14):
     delta = np.diff(arr)
     up = np.where(delta > 0, delta, 0.0)
     down = np.where(delta < 0, -delta, 0.0)
-    roll_up = ema(up, period)
-    roll_down = ema(down, period)
+    roll_up = ema(up, period); roll_down = ema(down, period)
     rs = np.divide(roll_up, roll_down, out=np.zeros_like(roll_up), where=roll_down != 0)
     rsi_vals = 100 - (100 / (1 + rs))
     rsi_vals = np.insert(rsi_vals, 0, 50.0)
@@ -214,8 +220,7 @@ def atr_pct(highs, lows, closes, period=14):
         h, l, c1 = highs[i], lows[i], closes[i - 1]
         tr = max(h - l, abs(h - c1), abs(l - c1))
         trs.append(tr)
-    if not trs:
-        return 0.0
+    if not trs: return 0.0
     atr = ema(np.array(trs), period)[-1]
     return atr / float(closes[-1])
 
@@ -252,8 +257,7 @@ def kline_handler(msg):
     try:
         k = msg.get("data", {}).get("k", {})
         sym = k.get("s")
-        if not sym:
-            return
+        if not sym: return
         _ensure_symbol(sym)
         o = float(k["o"]); h = float(k["h"]); l = float(k["l"]); c = float(k["c"]); v = float(k["v"])
         closed = bool(k.get("x", False))
@@ -273,18 +277,14 @@ def kline_handler(msg):
             if len(buf["c"]) >= max(60, int(CANDLES*0.6)):
                 buf["ready"] = True
     except Exception as e:
-        print(f"[WS] handler error: {repr(e)}")
+        print(f"[WS] handler error: {repr(e)}", flush=True)
 
 def fetch_klines(sym, interval, limit):
     with MARKET_LOCK:
         buf = MARKET.get(sym)
         if not buf or not buf["ready"]:
             raise RuntimeError(f"WS no listo para {sym}")
-        o = buf["o"][-limit:]
-        h = buf["h"][-limit:]
-        l = buf["l"][-limit:]
-        c = buf["c"][-limit:]
-        v = buf["v"][-limit:]
+        o = buf["o"][-limit:]; h = buf["h"][-limit:]; l = buf["l"][-limit:]; c = buf["c"][-limit:]; v = buf["v"][-limit:]
         return o, h, l, c, v
 
 def get_price(sym):
@@ -292,8 +292,7 @@ def get_price(sym):
         buf = MARKET.get(sym)
         if buf and buf["c"]:
             return float(buf["c"][-1])
-    # Fallback (evitar): REST solo si no hay WS
-    return float(client.get_symbol_ticker(symbol=sym)["price"])
+    return float(client.get_symbol_ticker(symbol=sym)["price"])  # fallback extremo
 
 # ---- Caché de balance ----
 BALANCE_CACHE = {"free": 0.0, "ts": 0.0}
@@ -305,8 +304,7 @@ def get_free_usdc():
         return BALANCE_CACHE["free"]
     bal = client.get_asset_balance(asset="USDC")
     free = float(bal["free"]) if bal else 0.0
-    BALANCE_CACHE["free"] = free
-    BALANCE_CACHE["ts"] = now
+    BALANCE_CACHE["free"] = free; BALANCE_CACHE["ts"] = now
     return free
 
 def _invalidate_balance_cache():
@@ -315,18 +313,14 @@ def _invalidate_balance_cache():
 # ===================== Grok =====================
 def grok_decide(payload_dict):
     global _current_grok_model_idx
-    if not (GROK_ENABLE and llm):
-        return "HOLD"
+    if not (GROK_ENABLE and llm): return "HOLD"
     st = load_state()
-    if st.get("tokens_used", 0) > MAX_TOKENS_DAILY:
-        return "HOLD"
-
+    if st.get("tokens_used", 0) > MAX_TOKENS_DAILY: return "HOLD"
     prompt = (
         "Eres un asistente de trading spot cripto. Analiza el JSON y responde SOLO una palabra: BUY, SELL o HOLD.\n"
         "Compra solo si hay confluencia fuerte y potencial razonable. Evita sobreoperar.\n"
         "JSON:\n" + json.dumps(payload_dict, ensure_ascii=False)
     )
-
     for attempt in range(_current_grok_model_idx, len(GROK_MODELS_FALLBACK)):
         model_name = GROK_MODELS_FALLBACK[attempt]
         try:
@@ -349,8 +343,7 @@ def grok_decide(payload_dict):
             if ("404" in err or "Not found" in err or "model" in err.lower() or "401" in err):
                 continue
             break
-
-    print("[GROK] deshabilitado (no se pudo usar ningún modelo de fallback)")
+    print("[GROK] deshabilitado (no se pudo usar ningún modelo de fallback)", flush=True)
     return "HOLD"
 
 # ===================== PnL / control diario =====================
@@ -358,21 +351,24 @@ def today_key():
     return date.today().isoformat()
 
 def add_realized_pnl(amount_usd):
-    st = load_state()
-    day = today_key()
-    d = st.get("pnl_history", {})
-    d[day] = round(d.get(day, 0.0) + float(amount_usd), 6)
-    st["pnl_history"] = d
-    save_state(st)
+    st = load_state(); day = today_key()
+    d = st.get("pnl_history", {}); d[day] = round(d.get(day, 0.0) + float(amount_usd), 6)
+    st["pnl_history"] = d; save_state(st)
 
 def reached_daily_loss():
-    st = load_state()
-    pnl = st.get("pnl_history", {}).get(today_key(), 0.0)
+    st = load_state(); pnl = st.get("pnl_history", {}).get(today_key(), 0.0)
     return pnl <= -abs(DAILY_MAX_LOSS_USD)
 
 # ===================== Órdenes =====================
+def get_symbol_info_safe(sym):
+    try:
+        return get_symbol_info(sym)
+    except Exception as e:
+        print(f"[MARKET] get_symbol_info error {sym}: {repr(e)}", flush=True)
+        raise
+
 def place_buy(sym, quote_qty):
-    info = get_symbol_info(sym)
+    info = get_symbol_info_safe(sym)
     price = get_price(sym)
     qty = quote_qty / price
     qty = round_step(qty, info["step"])
@@ -383,7 +379,7 @@ def place_buy(sym, quote_qty):
     return order, qty, price
 
 def place_sell(sym, qty):
-    info = get_symbol_info(sym)
+    info = get_symbol_info_safe(sym)
     qty = round_step(qty, info["step"])
     order = client.order_market_sell(symbol=sym, quantity=qty)
     _invalidate_balance_cache()
@@ -391,15 +387,11 @@ def place_sell(sym, qty):
 
 # ===================== Estrategia principal =====================
 def evaluate_and_trade():
-    if reached_daily_loss():
-        return
-
+    if reached_daily_loss(): return
     st = load_state()
     for sym in SYMBOLS:
-        # Espera pasiva a que el WS tenga datos suficientes
         with MARKET_LOCK:
-            if not MARKET.get(sym, {}).get("ready", False):
-                continue
+            if not MARKET.get(sym, {}).get("ready", False): continue
         try:
             o, h, l, c, v = fetch_klines(sym, INTERVAL, CANDLES)
             closes = np.array(c, dtype=float)
@@ -420,45 +412,27 @@ def evaluate_and_trade():
             pos = st["positions"].get(sym)
             in_pos = pos is not None
 
-            # ---- Gestión en posición ----
             if in_pos:
-                entry = pos["entry"]
-                qty   = pos["qty"]
-                best  = pos.get("best", entry)
+                entry = pos["entry"]; qty = pos["qty"]; best = pos.get("best", entry)
                 tp_price = entry * (1 + TAKE_PROFIT_PCT)
                 sl_price = entry * (1 - STOP_LOSS_PCT)
-
                 if price > best:
-                    best = price
-                    pos["best"] = best
-
+                    best = price; pos["best"] = best
                 if price >= tp_price:
                     place_sell(sym, qty)
-                    pnl = (price * (1 - FEE_PCT) - entry * (1 + FEE_PCT)) * qty
-                    add_realized_pnl(pnl)
-                    st["positions"].pop(sym, None)
-                    save_state(st)
-                    tg_send(f"✅ SELL TP {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
-                    continue
-
+                    pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
+                    add_realized_pnl(pnl); st["positions"].pop(sym, None); save_state(st)
+                    tg_send(f"✅ SELL TP {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC"); continue
                 if best > entry and price <= best * (1 - TRAIL_PCT):
                     place_sell(sym, qty)
-                    pnl = (price * (1 - FEE_PCT) - entry * (1 + FEE_PCT)) * qty
-                    add_realized_pnl(pnl)
-                    st["positions"].pop(sym, None)
-                    save_state(st)
-                    tg_send(f"⚠️ SELL TRAIL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
-                    continue
-
+                    pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
+                    add_realized_pnl(pnl); st["positions"].pop(sym, None); save_state(st)
+                    tg_send(f"⚠️ SELL TRAIL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC"); continue
                 if price <= sl_price:
                     place_sell(sym, qty)
-                    pnl = (price * (1 - FEE_PCT) - entry * (1 + FEE_PCT)) * qty
-                    add_realized_pnl(pnl)
-                    st["positions"].pop(sym, None)
-                    save_state(st)
-                    tg_send(f"❌ SELL SL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
-                    continue
-
+                    pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
+                    add_realized_pnl(pnl); st["positions"].pop(sym, None); save_state(st)
+                    tg_send(f"❌ SELL SL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC"); continue
                 if GROK_ENABLE:
                     features = {
                         "symbol": sym, "price": price, "entry": entry,
@@ -466,19 +440,16 @@ def evaluate_and_trade():
                         "atr_pct": atrp, "vol_ok": bool(vol_ok), "unrealized_pct": (price / entry - 1)
                     }
                     decision = grok_decide(features)
-                    if decision == "SELL" and (price / entry - 1) > 0:
+                    if decision == "SELL" and (price/entry - 1) > 0:
                         place_sell(sym, qty)
-                        pnl = (price * (1 - FEE_PCT) - entry * (1 + FEE_PCT)) * qty
-                        add_realized_pnl(pnl)
-                        st["positions"].pop(sym, None)
-                        save_state(st)
+                        pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
+                        add_realized_pnl(pnl); st["positions"].pop(sym, None); save_state(st)
                         tg_send(f"🤖 SELL by Grok {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                 continue
 
-            # ---- Señal de compra ----
+            # Señal de compra
             base_signal = (trend_up and rsi_val > 45 and vol_ok) or (rsi_val < 30 and trend_up and vol_ok)
-            if not (base_signal and expected_gain_ok):
-                continue
+            if not (base_signal and expected_gain_ok): continue
 
             decision = "BUY"
             if GROK_ENABLE:
@@ -489,12 +460,10 @@ def evaluate_and_trade():
                     "min_expected_gain_pct": MIN_EXPECTED_GAIN_PCT
                 }
                 decision = grok_decide(features)
-            if decision != "BUY":
-                continue
+            if decision != "BUY": continue
 
             usdc = get_free_usdc()
-            if usdc < MIN_ORDER_USD:
-                continue
+            if usdc < MIN_ORDER_USD: continue
 
             quote_qty = max(MIN_ORDER_USD, usdc * ALLOCATION_PCT * 0.995)
 
@@ -503,11 +472,7 @@ def evaluate_and_trade():
                 quote_qty = float(info["min_notional"]) + 1.0
 
             order, qty, raw_entry = place_buy(sym, quote_qty)
-            st["positions"][sym] = {
-                "entry": raw_entry * (1 + FEE_PCT),  # entrada con comisión
-                "qty": qty,
-                "best": raw_entry
-            }
+            st["positions"][sym] = {"entry": raw_entry*(1+FEE_PCT), "qty": qty, "best": raw_entry}
             save_state(st)
             tg_send(f"🟢 BUY {sym} {qty} @ {raw_entry:.8f} | Notional ≈ {qty*raw_entry:.2f} USDC")
 
@@ -518,36 +483,33 @@ def evaluate_and_trade():
                 tg_send(f"⚠️ BinanceAPIException {sym}: {be.status_code} {be.message}")
             time.sleep(5)
         except Exception as e:
-            tg_send(f"⚠️ Error {sym}: {repr(e)}")
-            time.sleep(2)
+            tg_send(f"⚠️ Error {sym}: {repr(e)}"); time.sleep(2)
 
 # ===================== Reseteo tokens / WS / Heartbeat =====================
 def midnight_reset_tokens():
     while True:
         now = datetime.now(tz=tz.tzlocal())
         if now.hour == 0 and now.minute < 1:
-            st = load_state()
-            st["tokens_used"] = 0
-            save_state(st)
+            st = load_state(); st["tokens_used"] = 0; save_state(st)
             time.sleep(60)
         time.sleep(20)
 
-def start_streams(twm: ThreadedWebsocketManager):
+def start_streams(twm: 'ThreadedWebsocketManager'):
     for sym in SYMBOLS:
         _ensure_symbol(sym)
         twm.start_kline_socket(callback=kline_handler, symbol=sym.lower(), interval=INTERVAL)
-    print("[WS] Streams iniciados")
+    print("[WS] Streams iniciados", flush=True)
 
 def heartbeat():
     while True:
-        print(f"[HB] alive {now_ts()} — symbols: {','.join(SYMBOLS)}")
+        print(f"[HB] alive {now_ts()} — symbols: {','.join(SYMBOLS)}", flush=True)
         time.sleep(60)
 
 # ===================== Main =====================
 def main():
-    start_http_server()  # <- necesario si usas Web Service
-    tg_autotest()
-    tg_send("🤖 Bot iniciado.")
+    print(f"[BOOT] {now_ts()} — starting...", flush=True)
+    start_http_server()  # <- imprescindible si es Web Service
+    tg_autotest(); tg_send("🤖 Bot iniciado.")
 
     # WebSockets
     twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
@@ -563,9 +525,10 @@ def main():
         try:
             evaluate_and_trade()
         except Exception as e:
+            print(f"[MAIN LOOP] error: {repr(e)}", flush=True)
             tg_send(f"🔥 Loop error: {repr(e)}")
         time.sleep(LOOP_SECONDS)
 
 if __name__ == "__main__":
-    print(f"[{now_ts()}] Starting...")
+    print(f"[{now_ts()}] Starting entrypoint", flush=True)
     main()
