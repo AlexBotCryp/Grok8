@@ -17,7 +17,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from binance.streams import ThreadedWebsocketManager
 
-# ===== OpenAI opcional (para Grok; desactivado por defecto) =====
+# ===== OpenAI opcional (Grok; desactivado por defecto) =====
 try:
     from openai import OpenAI
 except Exception:
@@ -122,8 +122,10 @@ TAKE_PROFIT_PCT = parse_float(env("TAKE_PROFIT_PCT","0.006"), 0.006)  # 0.6%
 STOP_LOSS_PCT   = parse_float(env("STOP_LOSS_PCT","0.008"), 0.008)    # 0.8%
 TRAIL_PCT       = parse_float(env("TRAIL_PCT","0.004"), 0.004)        # 0.4%
 
-MIN_ORDER_USD   = parse_float(env("MIN_ORDER_USD","20"), 20)
-ALLOCATION_PCT  = parse_float(env("ALLOCATION_PCT","1.0"), 1.0)
+MIN_ORDER_USD   = parse_float(env("MIN_ORDER_USD","5"), 5)            # permite tickets pequeños si el par lo acepta
+ALLOCATION_PCT  = parse_float(env("ALLOCATION_PCT","0.25"), 0.25)     # no gastes todo en 1 trade
+MAX_BUYS_PER_LOOP = int(env("MAX_BUYS_PER_LOOP","3"))                  # varias compras por ciclo si hay señales
+
 DAILY_MAX_LOSS_USD = parse_float(env("DAILY_MAX_LOSS_USD","25"), 25)
 FEE_PCT = parse_float(env("FEE_PCT","0.001"), 0.001)
 LOOP_SECONDS = int(env("LOOP_SECONDS","60"))
@@ -143,7 +145,18 @@ _current_grok_model_idx = 0
 MAX_TOKENS_DAILY = int(env("MAX_TOKENS_DAILY","2000"))
 
 # --------- cliente Binance ---------
+print(">> Creando cliente de Binance…", flush=True)
 client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+print(">> Cliente Binance OK", flush=True)
+
+llm = None
+if GROK_ENABLE and GROK_API_KEY and OpenAI is not None:
+    try:
+        llm = OpenAI(api_key=GROK_API_KEY, base_url=GROK_BASE_URL)
+        print(f"[GROK] Cliente inicializado (modelo {GROK_MODEL})", flush=True)
+    except Exception as e:
+        print(f"[GROK] Deshabilitado por init error: {repr(e)}", flush=True)
+        GROK_ENABLE = False
 
 # ------------------ Indicadores ------------------
 def ema(arr, p):
@@ -217,7 +230,7 @@ def kline_handler(msg):
         print(f"[WS] handler error: {repr(e)}", flush=True)
 
 def fetch_klines(sym, interval, limit):
-    """Devuelve (o,h,l,c,v) si hay barras suficientes; si no, None."""
+    """Devuelve (o,h,l,c,v) si hay barras suficientes; si no, None (para evitar errores)."""
     with MARKET_LOCK:
         buf = MARKET.get(sym)
         if not buf or len(buf.get("c",[])) < REQUIRED_BARS:
@@ -300,7 +313,7 @@ def seed_klines_once(symbols, interval, limit=200):
                     buf = MARKET[sym]
                     buf["o"] = o[-CANDLES:]; buf["h"] = h[-CANDLES:]; buf["l"] = l[-CANDLES:]; buf["c"] = c[-CANDLES:]; buf["v"] = v[-CANDLES:]
                     buf["ready"] = len(buf["c"]) >= REQUIRED_BARS
-                if env("DEBUG","true").lower()=="true":
+                if DEBUG:
                     print(f"[SEED] {sym} {len(c)} velas (ready={buf['ready']})", flush=True)
                 time.sleep(0.12)
             except Exception as e:
@@ -311,22 +324,23 @@ def seed_klines_once(symbols, interval, limit=200):
 # ------------------ Estrategia ------------------
 def evaluate_and_trade():
     if reached_daily_loss():
-        if env("DEBUG","true").lower()=="true": print("[RISK] límite diario de pérdida", flush=True)
+        if DEBUG: print("[RISK] límite diario de pérdida", flush=True)
         return
 
     st = load_state()
-    bought_this_loop = False
+    buys_this_loop = 0
 
     for sym in SYMBOLS:
         data = fetch_klines(sym, INTERVAL, CANDLES)
         if data is None:
-            if env("DEBUG","true").lower()=="true": print(f"[WAIT] {sym} esperando barras (need {REQUIRED_BARS})", flush=True)
+            if DEBUG: print(f"[WAIT] {sym} esperando barras (need {REQUIRED_BARS})", flush=True)
             continue
 
         try:
             o,h,l,c,v = data
             closes = np.array(c, float); vols = np.array(v, float); price = float(closes[-1])
 
+            # Indicadores
             r = rsi(closes, RSI_LEN)
             ema_f = ema(closes, EMA_FAST)
             ema_s = ema(closes, EMA_SLOW)
@@ -340,10 +354,10 @@ def evaluate_and_trade():
             base_signal = (trend_up and rsi_val > 50) or (rsi_val < 35) or ema_cross_up
 
             if REQUIRE_VOL_SPIKE and not vol_ok:
-                if env("DEBUG","true").lower()=="true": print(f"[SKIP] {sym} volumen insuficiente", flush=True)
+                if DEBUG: print(f"[SKIP] {sym} volumen insuficiente", flush=True)
                 continue
 
-            if env("DEBUG","true").lower()=="true":
+            if DEBUG:
                 print(f"[SIG] {sym} price={price:.6f} rsi={rsi_val:.2f} ema_f={float(ema_f[-1]):.6f} "
                       f"ema_s={float(ema_s[-1]):.6f} vol_ok={vol_ok} atr_pct={atrp:.4f} "
                       f"ema_cross_up={ema_cross_up} trend_up={trend_up}", flush=True)
@@ -381,27 +395,26 @@ def evaluate_and_trade():
                     tg_send(f"❌ SELL SL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
-                # guarda si hubo update de best
                 save_state(st)
                 continue
 
             # ----- Entrada -----
             if not base_signal:
-                if env("DEBUG","true").lower()=="true": print(f"[SKIP] {sym} sin señal base", flush=True)
+                if DEBUG: print(f"[SKIP] {sym} sin señal base", flush=True)
                 continue
 
             if atrp < MIN_EXPECTED_GAIN_PCT:
-                if env("DEBUG","true").lower()=="true": print(f"[SKIP] {sym} ATR% insuficiente ({atrp:.4f} < {MIN_EXPECTED_GAIN_PCT})", flush=True)
+                if DEBUG: print(f"[SKIP] {sym} ATR% insuficiente ({atrp:.4f} < {MIN_EXPECTED_GAIN_PCT})", flush=True)
                 continue
 
-            if bought_this_loop:
-                if env("DEBUG","true").lower()=="true": print(f"[SKIP] {sym} ya se compró en este ciclo", flush=True)
+            if buys_this_loop >= MAX_BUYS_PER_LOOP:
+                if DEBUG: print(f"[SKIP] {sym} límite de compras en este ciclo ({buys_this_loop}/{MAX_BUYS_PER_LOOP})", flush=True)
                 continue
 
             usdc = get_free_usdc()
-            if env("DEBUG","true").lower()=="true": print(f"[BAL] USDC libre ≈ {usdc:.2f}", flush=True)
+            if DEBUG: print(f"[BAL] USDC libre ≈ {usdc:.2f}", flush=True)
             if usdc < MIN_ORDER_USD:
-                if env("DEBUG","true").lower()=="true": print(f"[SKIP] {sym} USDC insuficiente ({usdc:.2f} < {MIN_ORDER_USD})", flush=True)
+                if DEBUG: print(f"[SKIP] {sym} USDC insuficiente ({usdc:.2f} < {MIN_ORDER_USD})", flush=True)
                 continue
 
             quote_qty = max(MIN_ORDER_USD, usdc * ALLOCATION_PCT * 0.995)
@@ -413,7 +426,7 @@ def evaluate_and_trade():
             st["positions"][sym] = {"entry": raw_entry*(1+FEE_PCT), "qty": qty, "best": raw_entry}
             save_state(st)
             tg_send(f"🟢 BUY {sym} {qty} @ {raw_entry:.8f} | Notional ≈ {qty*raw_entry:.2f} USDC")
-            bought_this_loop = True
+            buys_this_loop += 1
 
         except BinanceAPIException as be:
             if be.code == -1003:
@@ -447,7 +460,7 @@ def main():
     if SEED_KLINES_ON_START:
         seed_klines_once(SYMBOLS, INTERVAL, limit=CANDLES)
 
-    # Compra forzada opcional para validar (quítalo luego)
+    # Compra forzada opcional (quítalo después de probar)
     if FORCE_BUY_SYMBOL and FORCE_BUY_SYMBOL in SYMBOLS and FORCE_BUY_USD > 0:
         try:
             info = get_symbol_info(FORCE_BUY_SYMBOL)
