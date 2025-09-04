@@ -147,7 +147,7 @@ EMA_SLOW = int(env("EMA_SLOW", "21"))
 
 VOL_SPIKE = parse_float(env("VOL_SPIKE", "0.95"), 0.95)                 # relajado
 MIN_EXPECTED_GAIN_PCT = parse_float(env("MIN_EXPECTED_GAIN_PCT", "0.0015"), 0.0015)  # ~0.15% ATR
-REQUIRE_VOL_SPIKE = env("REQUIRE_VOL_SPIKE", "false").lower() == "true"  # volumen opcional por defecto
+REQUIRE_VOL_SPIKE = env("REQUIRE_VOL_SPIKE", "false").lower() == "true"
 
 # Gestión
 TAKE_PROFIT_PCT = parse_float(env("TAKE_PROFIT_PCT", "0.006"), 0.006)
