@@ -1,26 +1,24 @@
 import os, json, time, threading
 from datetime import datetime, date, timezone
 from decimal import Decimal, ROUND_DOWN
+import ssl
+import urllib.request, urllib.parse, urllib.error
+
 import numpy as np
 from dateutil import tz
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+from binance.streams import ThreadedWebsocketManager
 
-# OpenAI client (Grok compatible). Si falta el paquete, seguimos sin Grok.
+# OpenAI (Grok compatible). Si falta el paquete, seguimos sin Grok.
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
-# ---- stdlib HTTP (para Telegram) ----
-import urllib.request
-import urllib.parse
-import urllib.error
-import ssl
-
 STATE_PATH = "state.json"
 
-# ------------------ Utilidades ------------------
+# ===================== Utilidades =====================
 def env(key, default=None):
     return os.getenv(key, default)
 
@@ -31,9 +29,11 @@ def parse_float(s, default=0.0):
         return float(str(s).replace(",", "."))
     except Exception:
         return float(default)
+
 def now_ts():
     dt = datetime.now(timezone.utc).replace(microsecond=0)
     return dt.isoformat().replace("+00:00", "Z")
+
 def load_state():
     if not os.path.exists(STATE_PATH):
         return {"positions": {}, "pnl_history": {}, "tokens_used": 0}
@@ -46,14 +46,13 @@ def save_state(st):
         json.dump(st, f, indent=2, sort_keys=True)
     os.replace(tmp, STATE_PATH)
 
-# ------------------ Telegram (solo stdlib) ------------------
+# ===================== Telegram (stdlib) =====================
 def tg_http(method, params: dict):
     token = env("TG_BOT_TOKEN")
     if not token:
         return False, {"error": "Falta TG_BOT_TOKEN"}, None
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = urllib.parse.urlencode(params or {}).encode("utf-8")
-    # SSL por defecto del sistema
     ctx = ssl.create_default_context()
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -91,14 +90,12 @@ def tg_autotest():
     if not token:
         print("[TG] Desactivado: falta TG_BOT_TOKEN")
         return
-    # 1) getMe
     ok, err, data = tg_http("getMe", {})
     if not ok:
         print(f"[TG] getMe ERROR -> {err}")
         return
     me = data.get("result", {})
     print(f"[TG] getMe OK. Bot: @{me.get('username')} (id {me.get('id')})")
-    # 2) getChat (si hay chat)
     if chat:
         okc, errc, datac = tg_http("getChat", {"chat_id": chat})
         if okc:
@@ -106,7 +103,6 @@ def tg_autotest():
             print(f"[TG] getChat OK. Chat detectado: {title} (id {chat})")
         else:
             print(f"[TG] getChat ERROR -> {errc}  (¿El bot está dentro del chat? ¿ID correcto?)")
-    # 3) Mensaje de prueba
     if chat:
         okm, errm = tg_send(f"🤖 Autotest {now_ts()} — hola, Alex.")
         if okm:
@@ -114,45 +110,44 @@ def tg_autotest():
         else:
             print(f"[TG] sendMessage ERROR -> {errm}")
 
-# ------------------ Configuración ------------------
+# ===================== Configuración =====================
 BINANCE_API_KEY = env("BINANCE_API_KEY")
 BINANCE_API_SECRET = env("BINANCE_API_SECRET")
 
 SYMBOLS = [s.strip().upper() for s in env("SYMBOLS", "BTCUSDC,DOGEUSDC,TRXUSDC").split(",") if s.strip()]
-INTERVAL = env("INTERVAL", "3m")
-CANDLES = int(env("CANDLES", "200"))
+INTERVAL = env("INTERVAL", "3m")     # 1m/3m/5m/15m...
+CANDLES  = int(env("CANDLES", "200"))
 
-RSI_LEN = int(env("RSI_LEN", "14"))
+RSI_LEN  = int(env("RSI_LEN", "14"))
 EMA_FAST = int(env("EMA_FAST", "9"))
 EMA_SLOW = int(env("EMA_SLOW", "21"))
-VOL_SPIKE = parse_float(env("VOL_SPIKE", "1.20"), 1.20)  # volumen actual > 1.2 * media
+VOL_SPIKE = parse_float(env("VOL_SPIKE", "1.20"), 1.20)  # vol actual > 1.2 * media
 
 MIN_EXPECTED_GAIN_PCT = parse_float(env("MIN_EXPECTED_GAIN_PCT", "0.05"), 0.05)  # por ATR%
 TAKE_PROFIT_PCT = parse_float(env("TAKE_PROFIT_PCT", "0.006"), 0.006)
-STOP_LOSS_PCT = parse_float(env("STOP_LOSS_PCT", "0.008"), 0.008)
-TRAIL_PCT = parse_float(env("TRAIL_PCT", "0.004"), 0.004)
-MIN_ORDER_USD = parse_float(env("MIN_ORDER_USD", "20"), 20)
-ALLOCATION_PCT = parse_float(env("ALLOCATION_PCT", "1.0"), 1.0)  # usar 100% del USDC
+STOP_LOSS_PCT   = parse_float(env("STOP_LOSS_PCT", "0.008"), 0.008)
+TRAIL_PCT       = parse_float(env("TRAIL_PCT", "0.004"), 0.004)
+MIN_ORDER_USD   = parse_float(env("MIN_ORDER_USD", "20"), 20)
+ALLOCATION_PCT  = parse_float(env("ALLOCATION_PCT", "1.0"), 1.0)  # usar 100% del USDC
 DAILY_MAX_LOSS_USD = parse_float(env("DAILY_MAX_LOSS_USD", "25"), 25)
 FEE_PCT = parse_float(env("FEE_PCT", "0.001"), 0.001)  # aprox 0.1% por lado
 
-LOOP_SECONDS = int(env("LOOP_SECONDS", "45"))
+LOOP_SECONDS = int(env("LOOP_SECONDS", "60"))  # subido para reducir peso
 
-GROK_ENABLE = env("GROK_ENABLE", "true").lower() == "true"
+GROK_ENABLE  = env("GROK_ENABLE", "true").lower() == "true"
 GROK_BASE_URL = env("GROK_BASE_URL", "https://api.x.ai/v1")
-GROK_API_KEY = env("GROK_API_KEY")
-GROK_MODEL = env("GROK_MODEL", "grok")  # modelo por defecto
+GROK_API_KEY  = env("GROK_API_KEY")
+GROK_MODEL    = env("GROK_MODEL", "grok")
 GROK_MODELS_FALLBACK = [GROK_MODEL, "grok", "grok-2-latest", "grok-2-mini"]
 _current_grok_model_idx = 0
 MAX_TOKENS_DAILY = int(env("MAX_TOKENS_DAILY", "2000"))
 
-# ------------------ Clientes ------------------
+# ===================== Clientes Binance/Grok =====================
 client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
 
 llm = None
 if GROK_ENABLE and GROK_API_KEY and OpenAI is not None:
     try:
-        # Compatibilizado con httpx==0.27.2 en requirements.txt
         llm = OpenAI(api_key=GROK_API_KEY, base_url=GROK_BASE_URL)
         print(f"[GROK] Cliente inicializado (modelo preferido: {GROK_MODEL})")
     except Exception as e:
@@ -164,7 +159,7 @@ else:
     elif OpenAI is None:
         print("[GROK] Deshabilitado: paquete openai no disponible")
 
-# ------------------ Indicadores ------------------
+# ===================== Indicadores =====================
 def ema(arr, period):
     arr = np.asarray(arr, dtype=float)
     k = 2 / (period + 1)
@@ -198,13 +193,13 @@ def atr_pct(highs, lows, closes, period=14):
     atr = ema(np.array(trs), period)[-1]
     return atr / float(closes[-1])
 
-# ------------------ Mercado ------------------
+# ===================== Mercado: WS + cachés =====================
 _symbol_info_cache = {}
 
 def get_symbol_info(sym):
     if sym in _symbol_info_cache:
         return _symbol_info_cache[sym]
-    info = client.get_symbol_info(sym)
+    info = client.get_symbol_info(sym)  # una sola vez por símbolo
     if not info:
         raise RuntimeError(f"Symbol info not found for {sym}")
     f = {flt["filterType"]: flt for flt in info["filters"]}
@@ -218,27 +213,85 @@ def round_step(qty, step):
     q = (Decimal(qty) / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
     return float(q)
 
+# ---- WebSocket buffers ----
+MARKET = {}  # sym -> {"o":[], "h":[], "l":[], "c":[], "v":[], "ready": False}
+MARKET_LOCK = threading.Lock()
+
+def _ensure_symbol(sym):
+    with MARKET_LOCK:
+        if sym not in MARKET:
+            MARKET[sym] = {"o": [], "h": [], "l": [], "c": [], "v": [], "ready": False}
+
+def kline_handler(msg):
+    try:
+        k = msg.get("data", {}).get("k", {})
+        sym = k.get("s")
+        if not sym:
+            return
+        _ensure_symbol(sym)
+        o = float(k["o"]); h = float(k["h"]); l = float(k["l"]); c = float(k["c"]); v = float(k["v"])
+        closed = bool(k.get("x", False))
+        with MARKET_LOCK:
+            buf = MARKET[sym]
+            if closed or not buf["c"]:
+                buf["o"].append(o); buf["h"].append(h); buf["l"].append(l); buf["c"].append(c); buf["v"].append(v)
+            else:
+                buf["o"][-1] = o
+                buf["h"][-1] = max(buf["h"][-1], h)
+                buf["l"][-1] = min(buf["l"][-1], l)
+                buf["c"][-1] = c
+                buf["v"][-1] = v
+            for key in ("o","h","l","c","v"):
+                if len(buf[key]) > CANDLES:
+                    buf[key] = buf[key][-CANDLES:]
+            if len(buf["c"]) >= max(60, int(CANDLES*0.6)):
+                buf["ready"] = True
+    except Exception as e:
+        print(f"[WS] handler error: {repr(e)}")
+
 def fetch_klines(sym, interval, limit):
-    ks = client.get_klines(symbol=sym, interval=interval, limit=limit)
-    o, h, l, c, v = [], [], [], [], []
-    for k in ks:
-        o.append(float(k[1])); h.append(float(k[2])); l.append(float(k[3]))
-        c.append(float(k[4])); v.append(float(k[5]))
-    return o, h, l, c, v
+    # Leer del buffer WS (sin REST)
+    with MARKET_LOCK:
+        buf = MARKET.get(sym)
+        if not buf or not buf["ready"]:
+            raise RuntimeError(f"WS no listo para {sym}")
+        o = buf["o"][-limit:]
+        h = buf["h"][-limit:]
+        l = buf["l"][-limit:]
+        c = buf["c"][-limit:]
+        v = buf["v"][-limit:]
+        return o, h, l, c, v
 
 def get_price(sym):
+    with MARKET_LOCK:
+        buf = MARKET.get(sym)
+        if buf and buf["c"]:
+            return float(buf["c"][-1])
+    # Fallback extremo (evitar): REST sólo si no hay WS
     return float(client.get_symbol_ticker(symbol=sym)["price"])
 
-def get_free_usdc():
-    bal = client.get_asset_balance(asset="USDC")
-    return float(bal["free"]) if bal else 0.0
+# ---- Caché de balance ----
+BALANCE_CACHE = {"free": 0.0, "ts": 0.0}
+BALANCE_TTL = 60  # segundos
 
-# ------------------ Grok ------------------
+def get_free_usdc():
+    now = time.time()
+    if now - BALANCE_CACHE["ts"] < BALANCE_TTL:
+        return BALANCE_CACHE["free"]
+    bal = client.get_asset_balance(asset="USDC")
+    free = float(bal["free"]) if bal else 0.0
+    BALANCE_CACHE["free"] = free
+    BALANCE_CACHE["ts"] = now
+    return free
+
+def _invalidate_balance_cache():
+    BALANCE_CACHE["ts"] = 0.0
+
+# ===================== Grok =====================
 def grok_decide(payload_dict):
     global _current_grok_model_idx
     if not (GROK_ENABLE and llm):
         return "HOLD"
-
     st = load_state()
     if st.get("tokens_used", 0) > MAX_TOKENS_DAILY:
         return "HOLD"
@@ -275,7 +328,7 @@ def grok_decide(payload_dict):
     print("[GROK] deshabilitado (no se pudo usar ningún modelo de fallback)")
     return "HOLD"
 
-# ------------------ PnL y control diario ------------------
+# ===================== PnL / control diario =====================
 def today_key():
     return date.today().isoformat()
 
@@ -292,7 +345,7 @@ def reached_daily_loss():
     pnl = st.get("pnl_history", {}).get(today_key(), 0.0)
     return pnl <= -abs(DAILY_MAX_LOSS_USD)
 
-# ------------------ Órdenes ------------------
+# ===================== Órdenes =====================
 def place_buy(sym, quote_qty):
     info = get_symbol_info(sym)
     price = get_price(sym)
@@ -301,46 +354,52 @@ def place_buy(sym, quote_qty):
     if qty < float(info["min_qty"]):
         raise RuntimeError(f"Qty {qty} < min_qty for {sym}")
     order = client.order_market_buy(symbol=sym, quantity=qty)
+    _invalidate_balance_cache()
     return order, qty, price
 
 def place_sell(sym, qty):
     info = get_symbol_info(sym)
     qty = round_step(qty, info["step"])
     order = client.order_market_sell(symbol=sym, quantity=qty)
+    _invalidate_balance_cache()
     return order
 
-# ------------------ Estrategia principal ------------------
+# ===================== Estrategia principal =====================
 def evaluate_and_trade():
     if reached_daily_loss():
         return
 
     st = load_state()
     for sym in SYMBOLS:
+        # Espera pasiva a que el WS tenga datos suficientes
+        with MARKET_LOCK:
+            if not MARKET.get(sym, {}).get("ready", False):
+                continue
         try:
             o, h, l, c, v = fetch_klines(sym, INTERVAL, CANDLES)
             closes = np.array(c, dtype=float)
-            vols = np.array(v, dtype=float)
-            price = float(closes[-1])
+            vols   = np.array(v, dtype=float)
+            price  = float(closes[-1])
 
-            r = rsi(closes, RSI_LEN)
-            ema_f = ema(closes, EMA_FAST)
-            ema_s = ema(closes, EMA_SLOW)
+            r       = rsi(closes, RSI_LEN)
+            ema_f   = ema(closes, EMA_FAST)
+            ema_s   = ema(closes, EMA_SLOW)
             vol_base = vols[-50:-1].mean() if len(vols) > 50 else (vols.mean() if len(vols) else 0.0)
-            vol_ok = vols[-1] > VOL_SPIKE * max(vol_base, 1e-9)
+            vol_ok  = vols[-1] > VOL_SPIKE * max(vol_base, 1e-9)
             trend_up = ema_f[-1] > ema_s[-1]
-            rsi_val = r[-1]
-            atrp = atr_pct(h, l, c, period=14)
+            rsi_val  = r[-1]
+            atrp     = atr_pct(h, l, c, period=14)
 
             expected_gain_ok = atrp >= MIN_EXPECTED_GAIN_PCT
 
             pos = st["positions"].get(sym)
             in_pos = pos is not None
 
-            # --- Gestión en posición ---
+            # ---- Gestión en posición ----
             if in_pos:
                 entry = pos["entry"]
-                qty = pos["qty"]
-                best = pos.get("best", entry)
+                qty   = pos["qty"]
+                best  = pos.get("best", entry)
                 tp_price = entry * (1 + TAKE_PROFIT_PCT)
                 sl_price = entry * (1 - STOP_LOSS_PCT)
 
@@ -391,7 +450,7 @@ def evaluate_and_trade():
                         tg_send(f"🤖 SELL by Grok {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                 continue
 
-            # --- Señal de compra ---
+            # ---- Señal de compra ----
             base_signal = (trend_up and rsi_val > 45 and vol_ok) or (rsi_val < 30 and trend_up and vol_ok)
             if not (base_signal and expected_gain_ok):
                 continue
@@ -429,7 +488,7 @@ def evaluate_and_trade():
 
         except BinanceAPIException as be:
             if be.code == -1003:
-                tg_send("⛔️ IP baneada por peso de peticiones. Sube LOOP_SECONDS o usa websockets.")
+                tg_send("⛔️ IP baneada por peso REST. Ya usamos WebSocket; espera a que se levante el ban.")
             else:
                 tg_send(f"⚠️ BinanceAPIException {sym}: {be.status_code} {be.message}")
             time.sleep(5)
@@ -437,7 +496,7 @@ def evaluate_and_trade():
             tg_send(f"⚠️ Error {sym}: {repr(e)}")
             time.sleep(2)
 
-# ------------------ Reseteo nocturno tokens ------------------
+# ===================== Reseteo tokens y WS =====================
 def midnight_reset_tokens():
     while True:
         now = datetime.now(tz=tz.tzlocal())
@@ -448,10 +507,21 @@ def midnight_reset_tokens():
             time.sleep(60)
         time.sleep(20)
 
-# ------------------ Main ------------------
+def start_streams(twm: ThreadedWebsocketManager):
+    for sym in SYMBOLS:
+        _ensure_symbol(sym)
+        twm.start_kline_socket(callback=kline_handler, symbol=sym.lower(), interval=INTERVAL)
+    print("[WS] Streams iniciados")
+
+# ===================== Main =====================
 def main():
     tg_autotest()
     tg_send("🤖 Bot iniciado.")
+    # WebSockets
+    twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+    twm.start()
+    start_streams(twm)
+
     threading.Thread(target=midnight_reset_tokens, daemon=True).start()
     while True:
         try:
