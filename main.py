@@ -1,472 +1,345 @@
-# main.py
-# Bot “cesta 1-2” con uso ~100% del saldo, filtros de entrada (RSI/EMA/ATR),
-# trailing con beneficio real, control de comisiones, cooldown por símbolo
-# y manejo de stepSize/minNotional para evitar "dust".
-#
-# Requisitos:
-#   python-binance==1.0.19
-#   pandas, numpy, requests
-#
-# ENV requeridas:
-#   BINANCE_API_KEY, BINANCE_API_SECRET
-#   TELEGRAM_TOKEN (opcional), TELEGRAM_CHAT_ID (opcional)
-# Opcionales:
-#   WATCHLIST = "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,DOGEUSDC,TRXUSDC,XRPUSDC,ADAUSDC"
-#   SCAN_INTERVAL_SEC = "30"
-#   MAX_OPEN_POSITIONS = "2"
-#   MIN_USD_PER_ORDER = "20"
-#   FEE_RATE_SIDE = "0.001"  # 0.1% por lado si no conocemos tu tarifa exacta
-#
-# Nota: Este script está pensado para mercados ***USDC*** (par XXXUSDC).
-
 import os
 import time
-import json
 import math
-import signal
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Tuple, Optional
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
-import requests
 from binance.client import Client
-from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
+from binance.enums import *
+from binance.exceptions import BinanceAPIException
 
-# --------------------------- Config & Logging ---------------------------
+# =========================
+# Configuración
+# =========================
+API_KEY = os.getenv("BINANCE_API_KEY", "")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
-def _parse_float_env(name: str, default: float) -> float:
-    val = os.getenv(name, str(default))
-    # A prueba de "0,005" con coma
-    val = val.replace(",", ".")
-    try:
-        return float(val)
-    except Exception:
-        return default
+# Moneda base de referencia para PnL y puente de emergencia
+BASE_ASSET = os.getenv("BASE_ASSET", "USDC")
 
-WATCHLIST = os.getenv(
+# Activa enrutado cripto→cripto (1/true) o fuerza pasar por BASE_ASSET
+SMART_C2C = os.getenv("SMART_C2C", "1").lower() in ("1", "true", "yes")
+
+# Fee por defecto si la API no devuelve tasas (taker), 0.1% = 0.001
+DEFAULT_TAKER_FEE = float(os.getenv("DEFAULT_TAKER_FEE", "0.001"))
+
+# Lista de símbolos a vigilar (puedes ajustar)
+WATCHLIST = [s.strip().upper() for s in os.getenv(
     "WATCHLIST",
     "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,DOGEUSDC,TRXUSDC,XRPUSDC,ADAUSDC"
-).replace(" ", "").split(",")
+).split(",") if s.strip()]
 
-SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "30"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
-MIN_USD_PER_ORDER = _parse_float_env("MIN_USD_PER_ORDER", 20.0)
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "15"))
 
-# Riesgo / asignación
-ALLOC_SINGLE = 0.995   # si sólo 1 posición, usa ~99.5% (buffer fees/redondeos)
-ALLOC_DUAL   = 0.497   # si 2 posiciones, ~49.7% cada una
-
-# Entradas (indicadores)
-RSI_PERIOD = 14
-EMA_FAST   = 9
-EMA_SLOW   = 21
-ATR_PERIOD = 14
-ATR_PCT_MIN = 0.0015   # 0.15% mínimo de volatilidad
-
-# Salidas (beneficio y protección)
-TP_TRIGGER_PCT = 0.004   # activar trailing a partir de +0.40%
-TRAIL_PCT      = 0.003   # trailing 0.30% desde el pico
-HARD_SL_PCT    = 0.006   # stop-loss duro de -0.60%
-MIN_HOLD_SEC   = 240     # mínimo 4 min en posición antes de pensar en cerrar
-
-# Comisiones y umbrales de beneficio real
-FEE_RATE_SIDE  = _parse_float_env("FEE_RATE_SIDE", 0.001)  # 0.1% por lado (ajusta si tienes descuento)
-RT_FEE_RATE    = FEE_RATE_SIDE * 2
-MIN_ABS_PROFIT = 0.5      # no cerrar si ganancia < 0.5 USDC (salvo SL)
-MIN_PROFIT_XFEE = 1.5     # beneficio bruto >= 1.5x comisiones ida+vuelta
-
-# Enfriamiento por símbolo para no recomprar enseguida
-SYMBOL_COOLDOWN_SEC = 900  # 15 min
-
-# Timeframe para indicadores (más estable que 1m)
-KLINE_INTERVAL = Client.KLINE_INTERVAL_3MINUTE
-KLINE_LIMIT = 200  # suficiente para RSI/EMAs/ATR
-
-# Telegram (opcional)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
+# =========================
 # Logging
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-log = logging.getLogger("bot")
 
-# --------------------------- Binance Client ---------------------------
-
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-if not API_KEY or not API_SECRET:
-    log.error("❌ Falta BINANCE_API_KEY o BINANCE_API_SECRET en variables de entorno.")
-    raise SystemExit(1)
-
+# =========================
+# Cliente
+# =========================
 client = Client(API_KEY, API_SECRET)
 
-# --------------------------- Utils ---------------------------
 
-def now_ts() -> float:
-    return time.time()
+# =========================
+# Utilidades de mercado
+# =========================
+class MarketMeta:
+    def __init__(self):
+        self.symbols_info: Dict[str, dict] = {}
+        self.asset_pairs: Dict[Tuple[str, str], str] = {}  # (base,quote) -> SYMBOL
+        self.pair_by_assets: Dict[str, List[str]] = {}     # asset -> [symbols]
+        self.fee_cache: Dict[str, float] = {}              # symbol -> taker fee
 
-def notify(text: str):
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+    def load(self):
+        logging.info("✅ Exchange info cargada.")
+        ex = client.get_exchange_info()
+        for s in ex["symbols"]:
+            if s.get("status") != "TRADING":
+                continue
+            symbol = s["symbol"]
+            base = s["baseAsset"]
+            quote = s["quoteAsset"]
+            self.symbols_info[symbol] = s
+            self.asset_pairs[(base, quote)] = symbol
+            self.pair_by_assets.setdefault(base, []).append(symbol)
+            self.pair_by_assets.setdefault(quote, []).append(symbol)
+
+    def symbol_exists(self, base: str, quote: str) -> Optional[str]:
+        return self.asset_pairs.get((base, quote))
+
+    def get_filters(self, symbol: str) -> dict:
+        info = self.symbols_info[symbol]
+        f = {flt["filterType"]: flt for flt in info["filters"]}
+        return f
+
+    def step_round(self, qty: float, step: float) -> float:
+        return math.floor(qty / step) * step
+
+    def price_round(self, price: float, tick: float) -> float:
+        return math.floor(price / tick) * tick
+
+    def get_taker_fee(self, symbol: str) -> float:
+        if symbol in self.fee_cache:
+            return self.fee_cache[symbol]
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-                timeout=10
-            )
-        except Exception as e:
-            log.warning(f"[TG] Notificación fallida: {e}")
+            fees = client.get_trade_fee(symbol=symbol)
+            # Binance retorna lista con dicts como {"symbol": "...", "maker": "0.00100000", "taker":"0.00100000"}
+            if fees and isinstance(fees, list):
+                taker = float(fees[0].get("taker", DEFAULT_TAKER_FEE))
+            else:
+                taker = DEFAULT_TAKER_FEE
+        except Exception:
+            taker = DEFAULT_TAKER_FEE
+        self.fee_cache[symbol] = taker
+        return taker
 
-def fmt_usd(x: float) -> str:
-    return f"${x:.2f}"
 
-def safe_round(x: float, prec: int = 8) -> float:
-    return float(f"{x:.{prec}f}")
+market = MarketMeta()
 
-# --------------------------- Exchange Info / Filters ---------------------------
 
-_symbol_filters_cache: Dict[str, Dict[str, Any]] = {}
+# =========================
+# Balances y “dust”
+# =========================
+def get_balances_free() -> Dict[str, float]:
+    acc = client.get_account()
+    out = {}
+    for b in acc["balances"]:
+        free = float(b["free"])
+        if free > 0:
+            out[b["asset"]] = free
+    return out
 
-def refresh_exchange_info():
-    global _symbol_filters_cache
-    info = client.get_exchange_info()
-    cache = {}
-    for sym in info["symbols"]:
-        s = sym["symbol"]
-        fil = {f["filterType"]: f for f in sym["filters"]}
-        step = float(fil["LOT_SIZE"]["stepSize"])
-        min_qty = float(fil["LOT_SIZE"]["minQty"])
-        tick = float(fil["PRICE_FILTER"]["tickSize"])
-        # MIN_NOTIONAL puede venir como 'MIN_NOTIONAL' (minNotional) o 'NOTIONAL' (minNotional/notional)
-        min_notional = None
-        if "MIN_NOTIONAL" in fil:
-            min_notional = float(fil["MIN_NOTIONAL"].get("minNotional", fil["MIN_NOTIONAL"].get("notional", 0)))
-        elif "NOTIONAL" in fil:
-            min_notional = float(fil["NOTIONAL"].get("minNotional", fil["NOTIONAL"].get("notional", 0)))
-        cache[s] = {
-            "stepSize": step,
-            "minQty": min_qty,
-            "tickSize": tick,
-            "minNotional": min_notional or 10.0  # fallback sensato
-        }
-    _symbol_filters_cache = cache
-    log.info("✅ Exchange info cargada.")
-
-def get_filters(symbol: str) -> Dict[str, Any]:
-    if not _symbol_filters_cache:
-        refresh_exchange_info()
-    return _symbol_filters_cache[symbol]
-
-def round_step(qty: float, step: float) -> float:
-    if step <= 0:
-        return qty
-    return math.floor(qty / step) * step
-
-# --------------------------- Indicadores ---------------------------
-
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-def rsi(series: pd.Series, period: int) -> pd.Series:
-    delta = series.diff()
-    gain = (delta.clip(lower=0)).rolling(window=period).mean()
-    loss = (-delta.clip(upper=0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-12)
-    return 100 - (100 / (1 + rs))
-
-def atr(df: pd.DataFrame, period: int) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
-
-def fetch_klines_df(symbol: str) -> pd.DataFrame:
-    raw = client.get_klines(symbol=symbol, interval=KLINE_INTERVAL, limit=KLINE_LIMIT)
-    cols = ["open_time","open","high","low","close","volume","close_time","qav","num_trades","taker_base","taker_quote","ignore"]
-    df = pd.DataFrame(raw, columns=cols)
-    for c in ["open","high","low","close","volume","qav","taker_base","taker_quote"]:
-        df[c] = df[c].astype(float)
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    return df
-
-def build_indicators(symbol: str) -> Dict[str, Any]:
-    df = fetch_klines_df(symbol)
-    df["ema_f"] = ema(df["close"], EMA_FAST)
-    df["ema_s"] = ema(df["close"], EMA_SLOW)
-    df["rsi"]   = rsi(df["close"], RSI_PERIOD)
-    df["atr"]   = atr(df, ATR_PERIOD)
-    df["atr_pct"] = df["atr"] / df["close"]
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    return {
-        "price": float(last["close"]),
-        "ema_f": float(last["ema_f"]),
-        "ema_s": float(last["ema_s"]),
-        "rsi": float(last["rsi"]),
-        "rsi_prev": float(prev["rsi"]),
-        "atr_pct": float(last["atr_pct"])
-    }
-
-# --------------------------- Balances / Órdenes ---------------------------
-
-def get_free(asset: str) -> float:
-    b = client.get_asset_balance(asset=asset)
-    if not b:
-        return 0.0
-    return float(b.get("free", 0.0))
 
 def get_price(symbol: str) -> float:
     return float(client.get_symbol_ticker(symbol=symbol)["price"])
 
-def compute_buy_qty(symbol: str, allocation_usdc: float, price: float) -> float:
-    f = get_filters(symbol)
-    step = f["stepSize"]
-    min_notional = f["minNotional"]
-    qty_raw = (allocation_usdc / price) * (1 - FEE_RATE_SIDE)
-    qty = round_step(qty_raw, step)
-    # asegúrate de cumplir minNotional
-    if qty * price < min_notional:
-        return 0.0
-    return qty
 
-def compute_sell_qty(symbol: str, free_qty: float) -> float:
-    f = get_filters(symbol)
-    step = f["stepSize"]
-    sell_qty = max(free_qty - step, 0.0)  # deja 1 step de colchón
-    return round_step(sell_qty, step)
+def min_trade_ok(symbol: str, qty: float, side: str) -> bool:
+    """Verifica MIN_NOTIONAL y LOT_SIZE aprox con precio actual."""
+    try:
+        f = market.get_filters(symbol)
+        price = get_price(symbol)
+        notional = qty * price
+        min_notional = float(f.get("MIN_NOTIONAL", {}).get("minNotional", "0"))
+        step = float(f.get("LOT_SIZE", {}).get("stepSize", "0.00000001"))
+        qty_rounded = market.step_round(qty, step)
+        return qty_rounded > 0 and notional >= min_notional
+    except Exception:
+        return False
 
-def market_buy(symbol: str, qty: float) -> Dict[str, Any]:
-    return client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=str(qty))
 
-def market_sell(symbol: str, qty: float) -> Dict[str, Any]:
-    return client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=str(qty))
-
-def quote_from_symbol(symbol: str) -> str:
-    # asume XXXUSDC
-    return "USDC"
-
-def base_from_symbol(symbol: str) -> str:
-    return symbol.replace("USDC", "")
-
-# --------------------------- Estrategia / Estado ---------------------------
-
-class Position:
-    def __init__(self, symbol: str, qty: float, entry_price: float):
-        self.symbol = symbol
-        self.qty = qty
-        self.entry = entry_price
-        self.open_ts = now_ts()
-        self.peak = entry_price  # precio máximo desde entrada (para trailing)
-        self.trailing_active = False
-
-    def age_sec(self) -> float:
-        return now_ts() - self.open_ts
-
-    def update_peak(self, px: float):
-        if px > self.peak:
-            self.peak = px
-
-    def activate_trailing(self):
-        self.trailing_active = True
-
-positions: Dict[str, Position] = {}  # symbol -> Position
-last_exit_time: Dict[str, float] = {} # cooldown por símbolo
-
-def allowed_to_reenter(symbol: str) -> bool:
-    last = last_exit_time.get(symbol, 0.0)
-    return now_ts() - last >= SYMBOL_COOLDOWN_SEC
-
-def open_positions_count() -> int:
-    return len(positions)
-
-def free_usdc() -> float:
-    return get_free("USDC")
-
-def hedge_profit_requirements(entry_px: float, current_px: float, notional: float) -> bool:
-    gross = (current_px - entry_px) / entry_px
-    abs_profit = (current_px - entry_px) * (notional / current_px)
-    return (gross >= RT_FEE_RATE * MIN_PROFIT_XFEE) and (abs_profit >= MIN_ABS_PROFIT)
-
-# --------------------------- Señales ---------------------------
-
-def entry_signal(ind: Dict[str, Any]) -> bool:
-    # Reglas:
-    # 1) Cruce RSI de <50 a >50
-    # 2) EMA_f > EMA_s
-    # 3) ATR% suficiente
-    rsi_ok = ind["rsi_prev"] <= 50 and ind["rsi"] > 50
-    ema_ok = ind["ema_f"] > ind["ema_s"]
-    vol_ok = ind["atr_pct"] >= ATR_PCT_MIN
-    return rsi_ok and ema_ok and vol_ok
-
-# --------------------------- Loop principal ---------------------------
-
-_running = True
-def handle_sigterm(signum, frame):
-    global _running
-    _running = False
-    log.info("🛑 Señal recibida, apagando con gracia…")
-
-signal.signal(signal.SIGTERM, handle_sigterm)
-signal.signal(signal.SIGINT, handle_sigterm)
-
-def try_cleanup_dust():
-    # Intenta vender restos si cumplen minNotional; si no, los deja en paz.
-    for symbol, pos in list(positions.items()):
-        # si tenemos posición, no es "dust"
-        pass
-    # para assets sin posición:
-    for sym in WATCHLIST:
-        base = base_from_symbol(sym)
-        free_base = get_free(base)
-        if free_base <= 0:
+def clean_dust_to_base():
+    """Convierte saldos pequeños a BASE_ASSET cuando sea posible (mercado)."""
+    balances = get_balances_free()
+    if not balances:
+        return
+    for asset, qty in balances.items():
+        if asset in ("BNB", BASE_ASSET):  # BNB para fees, y base no tocar
             continue
-        qty_sell = compute_sell_qty(sym, free_base)
-        if qty_sell <= 0:
+        if qty <= 0:
             continue
-        px = get_price(sym)
-        min_notional = get_filters(sym)["minNotional"]
-        if qty_sell * px >= min_notional:
-            try:
-                res = market_sell(sym, qty_sell)
-                log.info(f"🧹 Limpieza DUST {sym}: vendidas {qty_sell}")
-            except Exception as e:
-                log.warning(f"🧹 Limpieza {sym} fallida: {e}")
-
-def main():
-    log.info("🤖 Bot iniciado. Escaneando…")
-    refresh_exchange_info()
-    cycle = 0
-
-    while _running:
-        t0 = time.time()
+        # Vender asset→BASE_ASSET si existe par
+        direct = market.symbol_exists(asset, BASE_ASSET)
+        if not direct:
+            continue
+        # Calcular cantidad válida
+        f = market.get_filters(direct)
+        step = float(f.get("LOT_SIZE", {}).get("stepSize", "0.00000001"))
+        qty_ok = market.step_round(qty, step)
+        if qty_ok <= 0:
+            continue
         try:
-            # --- Venta / gestión de posiciones ---
-            for sym, pos in list(positions.items()):
-                ind = build_indicators(sym)
-                px = ind["price"]
-                notional = pos.qty * px
-                pos.update_peak(px)
+            if not min_trade_ok(direct, qty_ok, side="SELL"):
+                continue
+            client.order_market_sell(symbol=direct, quantity=qty_ok)
+            logging.info(f"🧹 Limpieza DUST {direct}: vendidas {qty_ok}")
+        except BinanceAPIException as e:
+            logging.warning(f"[DUST] No se pudo vender {asset}->{BASE_ASSET}: {e.message}")
 
-                # Activar trailing sólo si el pico supera el umbral y además cubre comisiones+min abs
-                profit_needed = max(
-                    TP_TRIGGER_PCT,
-                    RT_FEE_RATE * MIN_PROFIT_XFEE
-                )
 
-                if ((pos.peak - pos.entry) / pos.entry) >= profit_needed and \
-                   hedge_profit_requirements(pos.entry, pos.peak, pos.qty * pos.peak) and \
-                   pos.age_sec() >= MIN_HOLD_SEC:
-                    pos.activate_trailing()
+# =========================
+# Enrutado inteligente cripto→cripto
+# =========================
+def find_best_route(src_asset: str, dst_asset: str) -> Optional[List[Tuple[str, str]]]:
+    """
+    Devuelve una ruta como lista de (symbol, side) donde side es 'BUY' o 'SELL'
+    Empezando desde tener src_asset y terminar poseyendo dst_asset.
 
-                # Condición de trailing: si activo y cae TRAIL_PCT desde el pico
-                if pos.trailing_active:
-                    drawdown = (pos.peak - px) / pos.peak
-                    # vender sólo si al precio actual aún se cumplen beneficios netos
-                    if drawdown >= TRAIL_PCT and hedge_profit_requirements(pos.entry, px, notional):
-                        qty_sell = compute_sell_qty(sym, pos.qty)
-                        if qty_sell > 0 and notional >= MIN_USD_PER_ORDER:
-                            try:
-                                market_sell(sym, qty_sell)
-                                log.info(f"✅ VENTA {sym} (TRAIL) qty={qty_sell:.8f} notional≈{fmt_usd(qty_sell*px)}")
-                                notify(f"✅ VENTA {sym} (trailing) {qty_sell:.8f} a ~{fmt_usd(px)}")
-                            except Exception as e:
-                                log.error(f"❌ Venta {sym} fallo: {e}")
-                                continue
-                            # actualizar cooldown y cerrar posición
-                            last_exit_time[sym] = now_ts()
-                            del positions[sym]
-                            continue
+    Preferencias:
+      1) Directo: (dst/src) como BUY, o (src/dst) como SELL según exista el par.
+      2) 1 salto por puentes: USDC o USDT (elige el que exista y con menor fee estimada).
+    """
+    src_asset = src_asset.upper()
+    dst_asset = dst_asset.upper()
+    if src_asset == dst_asset:
+        return []
 
-                # Stop-loss duro (protección última)
-                if ((px - pos.entry) / pos.entry) <= -HARD_SL_PCT and pos.age_sec() >= MIN_HOLD_SEC:
-                    qty_sell = compute_sell_qty(sym, pos.qty)
-                    if qty_sell > 0 and notional >= MIN_USD_PER_ORDER:
-                        try:
-                            market_sell(sym, qty_sell)
-                            log.info(f"🛑 SL {sym} qty={qty_sell:.8f} notional≈{fmt_usd(qty_sell*px)}")
-                            notify(f"🛑 STOP {sym} {qty_sell:.8f} a ~{fmt_usd(px)}")
-                        except Exception as e:
-                            log.error(f"❌ SL {sym} fallo: {e}")
-                            continue
-                        last_exit_time[sym] = now_ts()
-                        del positions[sym]
-                        continue
+    # 1) Directo: ¿existe par (dst/src) -> BUY?
+    direct_buy = market.symbol_exists(dst_asset, src_asset)
+    if direct_buy:
+        return [(direct_buy, "BUY")]
 
-            # --- Entradas (sólo si hay hueco) ---
-            if open_positions_count() < MAX_OPEN_POSITIONS:
-                free = free_usdc()
-                if open_positions_count() == 0:
-                    alloc = free * ALLOC_SINGLE
-                else:
-                    alloc = free * (ALLOC_DUAL / (1.0 if open_positions_count()==1 else 1.0))
+    # 1b) Directo: ¿existe par (src/dst) -> SELL?
+    direct_sell = market.symbol_exists(src_asset, dst_asset)
+    if direct_sell:
+        return [(direct_sell, "SELL")]
 
-                # Evita órdenes demasiado pequeñas
-                if alloc >= max(MIN_USD_PER_ORDER, 25.0):
-                    # Evalúa watchlist y elige el mejor candidato con señal válida
-                    candidates: List[Tuple[str, Dict[str, Any]]] = []
-                    for sym in WATCHLIST:
-                        if sym in positions:
-                            continue
-                        if not allowed_to_reenter(sym):
-                            continue
-                        try:
-                            ind = build_indicators(sym)
-                        except Exception as e:
-                            log.warning(f"[IND] {sym} error: {e}")
-                            continue
-                        if entry_signal(ind):
-                            candidates.append((sym, ind))
+    # 2) Puentes candidatos
+    bridges = ["USDC", "USDT"]
 
-                    # Ordena candidatos por “fuerza”: RSI más alto y distancia EMA_f-EMA_s
-                    if candidates:
-                        candidates.sort(
-                            key=lambda t: (t[1]["rsi"], t[1]["ema_f"] - t[1]["ema_s"], t[1]["atr_pct"]),
-                            reverse=True
-                        )
-                        # Abrir 1 símbolo por ciclo como máximo
-                        sym, ind = candidates[0]
-                        px = ind["price"]
-                        qty = compute_buy_qty(sym, alloc, px)
+    candidates = []
+    for bridge in bridges:
+        # Ruta A: src->bridge (SELL) + dst/bridge (BUY)   (si existen ambos)
+        leg1 = market.symbol_exists(src_asset, bridge)  # SELL src/bridge
+        leg2 = market.symbol_exists(dst_asset, bridge)  # BUY dst/bridge
+        if leg1 and leg2:
+            # coste aproximado: fee taker en leg1 + leg2
+            fee = market.get_taker_fee(leg1) + market.get_taker_fee(leg2)
+            candidates.append(([(leg1, "SELL"), (leg2, "BUY")], fee))
 
-                        if qty * px >= max(MIN_USD_PER_ORDER, get_filters(sym)["minNotional"]) and qty > 0:
-                            try:
-                                market_buy(sym, qty)
-                                positions[sym] = Position(sym, qty, px)
-                                log.info(f"✅ COMPRA {sym} qty={qty:.8f} notional≈{fmt_usd(qty*px)}")
-                                notify(f"✅ COMPRA {sym} {qty:.8f} a ~{fmt_usd(px)}")
-                            except Exception as e:
-                                log.error(f"❌ Compra {sym} fallo: {e}")
-                        else:
-                            log.info(f"[SKIP] {sym} qty insuficiente ({qty:.8f}) o minNotional no cumple.")
-                else:
-                    log.debug(f"[SKIP] USDC insuficiente para nueva entrada. Free={fmt_usd(free)}")
+        # Ruta B: bridge/src (BUY) + dst/src (¿SELL?) — no tiene sentido si partimos con src en cartera
 
-            # Limpieza de restos cada N ciclos
-            cycle += 1
-            if cycle % 30 == 0:
-                try_cleanup_dust()
+    if not candidates:
+        return None
 
+    # Elige la de menor fee estimada
+    candidates.sort(key=lambda x: x[1])
+    return candidates[0][0]
+
+
+def execute_route_from_asset(src_asset: str, dst_asset: str, portion: float = 1.0) -> bool:
+    """
+    Ejecuta la ruta para convertir src_asset -> dst_asset usando 'portion' del saldo disponible.
+    """
+    route = find_best_route(src_asset, dst_asset)
+    if route is None:
+        logging.warning(f"⚠️ No hay ruta disponible {src_asset} → {dst_asset}")
+        return False
+    if len(route) == 0:
+        logging.info("ℹ️ Ruta vacía (activos iguales).")
+        return True
+
+    balances = get_balances_free()
+    src_qty = balances.get(src_asset, 0.0) * float(portion)
+    if src_qty <= 0:
+        logging.warning(f"⚠️ Sin saldo en {src_asset} para ejecutar swap.")
+        return False
+
+    # Ejecutar cada paso en orden
+    # Nota: cuando la leg es SELL usamos qty en el base del símbolo;
+    # cuando es BUY calculamos qty objetivo estimando con el precio de mercado y respetando filtros.
+    for symbol, side in route:
+        f = market.get_filters(symbol)
+        base = market.symbols_info[symbol]["baseAsset"]
+        quote = market.symbols_info[symbol]["quoteAsset"]
+        step = float(f.get("LOT_SIZE", {}).get("stepSize", "0.00000001"))
+
+        try:
+            if side == "SELL":
+                # Debemos tener saldo en 'base' para vender
+                qty_avail = get_balances_free().get(base, 0.0)
+                qty = market.step_round(qty_avail, step)
+                if qty <= 0 or not min_trade_ok(symbol, qty, side="SELL"):
+                    logging.warning(f"⚠️ SELL no cumple mínimos {symbol} qty={qty}")
+                    return False
+                client.order_market_sell(symbol=symbol, quantity=qty)
+                logging.info(f"🔁 SELL {symbol} qty={qty}")
+
+            elif side == "BUY":
+                # Necesitamos saldo en 'quote' para comprar 'base'
+                price = get_price(symbol)
+                balances_now = get_balances_free()
+                quote_free = balances_now.get(quote, 0.0)
+                if quote_free <= 0:
+                    logging.warning(f"⚠️ Sin saldo en {quote} para comprar {base} ({symbol})")
+                    return False
+
+                # Cuánto base puedo comprar con todo el quote disponible
+                est_qty = (quote_free / price) * 0.999  # ligera reserva
+                qty = market.step_round(est_qty, step)
+                if qty <= 0 or not min_trade_ok(symbol, qty, side="BUY"):
+                    logging.warning(f"⚠️ BUY no cumple mínimos {symbol} qty={qty}")
+                    return False
+                client.order_market_buy(symbol=symbol, quantity=qty)
+                logging.info(f"🔁 BUY  {symbol} qty={qty}")
+            else:
+                logging.error(f"Side desconocido: {side}")
+                return False
+
+            time.sleep(0.4)  # breve respiro para evitar weight issues
+
+        except BinanceAPIException as e:
+            logging.error(f"[ROUTE] Falló orden {symbol} {side}: {e.message}")
+            return False
+
+    logging.info(f"✅ Swap completado: {src_asset} → {dst_asset} (ruta {route})")
+    return True
+
+
+# =========================
+# Estrategia (simple placeholder)
+# =========================
+def pick_target_asset() -> Optional[str]:
+    """
+    Lógica mínima: si no tienes posiciones (solo {BASE_ASSET,BNB}),
+    no hace nada. Si tienes una posición cripto distinta a BASE_ASSET
+    y SMART_C2C está activo y TARGET_ASSET env var está definida,
+    intenta rotar a TARGET_ASSET sin pasar por USDC si hay ruta.
+    """
+    env_target = os.getenv("TARGET_ASSET", "").upper().strip()
+    if not env_target:
+        return None
+    return env_target
+
+
+def current_position_assets() -> List[str]:
+    bals = get_balances_free()
+    # ignora BASE_ASSET y BNB (para fees)
+    return [a for a, q in bals.items() if q > 0 and a not in (BASE_ASSET, "BNB")]
+
+
+def loop():
+    logging.info("🤖 Bot iniciado. Escaneando…")
+    market.load()
+
+    # Limpia “dust” hacia BASE_ASSET una vez al iniciar (si no quieres, coméntalo)
+    clean_dust_to_base()
+
+    while True:
+        try:
+            # Puedes poner tu lógica de señales aquí.
+            # Para demostrar el cripto→cripto, usamos TARGET_ASSET si se define.
+            if SMART_C2C:
+                dst = pick_target_asset()
+                if dst:
+                    holds = current_position_assets()
+                    if holds and dst not in holds:
+                        # Elige la primera posición actual como origen
+                        src = holds[0]
+                        if src != dst:
+                            logging.info(f"♻️ Intento de rotación {src} → {dst} (C2C)")
+                            ok = execute_route_from_asset(src, dst, portion=1.0)
+                            if not ok:
+                                logging.warning("No se pudo completar la rotación C2C.")
+                            else:
+                                # Opcional: si quieres consolidar sobras (ej., restos de puente), puedes limpiar
+                                pass
+
+            time.sleep(SLEEP_SECONDS)
+
+        except KeyboardInterrupt:
+            logging.info("⏹️ Bot detenido por usuario.")
+            break
         except Exception as e:
-            log.error(f"⚠️ Error en ciclo: {e}")
+            logging.exception(f"Error en loop principal: {e}")
+            time.sleep(3)
 
-        # Control de ritmo y solapamientos
-        elapsed = time.time() - t0
-        if elapsed > SCAN_INTERVAL_SEC * 0.8:
-            log.warning("⏱️ Ciclo se alarga, ajusta SCAN_INTERVAL_SEC si ves 'skips'.")
-        sleep_s = max(0.0, SCAN_INTERVAL_SEC - elapsed)
-        time.sleep(sleep_s)
 
 if __name__ == "__main__":
-    main()
+    loop()
