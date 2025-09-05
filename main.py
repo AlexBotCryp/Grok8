@@ -1,464 +1,451 @@
+# main.py
 import os
 import time
-import json
 import math
 import logging
-import traceback
-from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN, getcontext
+from collections import defaultdict
+from datetime import datetime, timezone
 
+from apscheduler.schedulers.background import BackgroundScheduler
 from binance.client import Client
-from binance.exceptions import BinanceAPIException, BinanceRequestException
+from binance.enums import *
 
-# ---------------------- Config & Logs ----------------------
+# =========================
+# CONFIGURACIÓN POR ENV
+# =========================
+API_KEY = os.getenv("BINANCE_API_KEY", "")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+
+# Cotizamos TODO contra USDC (puedes cambiarlo p.ej. a USDT)
+QUOTE = os.getenv("QUOTE_ASSET", "USDC")
+
+# Lista de símbolos a escanear (separados por comas)
+WATCHLIST = os.getenv(
+    "WATCHLIST",
+    "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,DOGEUSDC,TRXUSDC,XRPUSDC,ADAUSDC,AVAXUSDC"
+).replace(" ", "").split(",")
+
+# Porcentaje trailing para venta (0.004 = 0.4%)
+TRAIL_PCT = Decimal(os.getenv("TRAIL_PCT", "0.004").replace(",", "."))
+
+# Beneficio/Stop opcional (si <=0, desactivado)
+TAKE_PROFIT_PCT = Decimal(os.getenv("TAKE_PROFIT_PCT", "0.006").replace(",", "."))  # 0.6%
+STOP_LOSS_PCT   = Decimal(os.getenv("STOP_LOSS_PCT",   "0.010").replace(",", "."))  # 1.0%
+
+# Mínimo notional deseado para operar (además del minNotional del exchange)
+# Útil para evitar compras minúsculas que pierden en comisiones:
+USER_MIN_NOTIONAL = Decimal(os.getenv("USER_MIN_NOTIONAL", "20"))  # 20 USDC
+
+# Intervalo de escaneo en segundos
+SCAN_SEC = int(os.getenv("SCAN_SEC", "15"))
+
+# Seguridad para qty (absorber fee/redondeos)
+SAFETY_QTY_PCT = Decimal(os.getenv("SAFETY_QTY_PCT", "0.001").replace(",", "."))  # 0.1%
+
+# Cooldown cuando el símbolo queda en "dust" o falla por minQty/minNotional
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "180"))
+
+# Evitar recomprar el mismo símbolo inmediatamente después de venderlo (en segundos)
+REBUY_COOLDOWN_SEC = int(os.getenv("REBUY_COOLDOWN_SEC", "120"))
+
+# Porcentaje máximo de la cartera USDC a usar en una compra (0-1)
+MAX_PORTFOLIO_USE = Decimal(os.getenv("MAX_PORTFOLIO_USE", "0.80").replace(",", "."))  # 80%
+
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
+log = logging.getLogger(__name__)
 
-API_KEY = os.getenv("BINANCE_API_KEY", "")
-API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+# Decimal precisión alta para evitar errores de redondeo
+getcontext().prec = 28
 
-INTERVAL = os.getenv("INTERVAL", "1m")
-LOOKBACK = int(os.getenv("LOOKBACK", "120"))
-LOOP_SEC = int(os.getenv("LOOP_SEC", "20"))
-
-BASE = "USDC"
-USE_CAPITAL_PCT = float(os.getenv("USE_CAPITAL_PCT", "1.0"))
-MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "20"))
-
-WATCHLIST = [s.strip().upper() for s in os.getenv(
-    "WATCHLIST",
-    "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,DOGEUSDC,TRXUSDC,XRPUSDC,ADAUSDC"
-).split(",") if s.strip()]
-
-FEE_PCT = float(os.getenv("FEE_PCT", "0.001"))                 # 0.1% taker
-EXTRA_PROFIT_PCT = float(os.getenv("EXTRA_PROFIT_PCT", "0.001"))  # 0.1% extra
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.01"))      # 1% SL (0=off)
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.0"))               # 0.5% trailing
-
-REBUY_COOLDOWN_MIN = int(os.getenv("REBUY_COOLDOWN_MIN", "5"))
-REENTRY_MIN_PCT = float(os.getenv("REENTRY_MIN_PCT", "0.005")) # 0.5%
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-STATE_FILE = "state.json"
+# =========================
+# Cliente Binance
+# =========================
+if not API_KEY or not API_SECRET:
+    log.warning("⚠️ Falta BINANCE_API_KEY o BINANCE_API_SECRET en variables de entorno.")
 
 client = Client(API_KEY, API_SECRET)
 
-# ---------------------- Utils ----------------------
-def now_utc():
-    return datetime.now(timezone.utc)
+# =========================
+# Cache de reglas
+# =========================
+_RULES_CACHE = {}
+_LAST_REJECT = {}         # symbol -> timestamp de último rechazo por dust/minQty/minNotional
+_LAST_SELL_TIME = {}      # symbol -> timestamp última venta (para evitar recomprar de inmediato)
+_POSITIONS = {}           # symbol -> dict con estado (entrada, peak, qty, etc.)
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {"last_exit": {}, "trailing": {}, "cooldown": {}}
-    try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {"last_exit": {}, "trailing": {}, "cooldown": {}}
+def now_ts() -> float:
+    return time.time()
 
-def save_state(state):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_FILE)
+def should_skip_for_a_while(symbol: str, wait_sec: int = COOLDOWN_SEC) -> bool:
+    t = _LAST_REJECT.get(symbol)
+    return bool(t and (now_ts() - t) < wait_sec)
 
-def notify(msg: str):
-    logging.info(msg)
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            import requests
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-            )
-        except Exception as e:
-            logging.warning(f"[TG] {e}")
+def mark_reject(symbol: str):
+    _LAST_REJECT[symbol] = now_ts()
 
-def round_step(value, step):
-    if step is None:
-        return value
-    precision = int(round(-math.log10(float(step))))
-    return float(f"{value:.{precision}f}")
+def mark_recent_sell(symbol: str):
+    _LAST_SELL_TIME[symbol] = now_ts()
 
-def get_symbol_filters(symbol_info):
-    lot_step = None
-    price_tick = None
-    min_notional = None
-    min_qty = None
-    for f in symbol_info.get("filters", []):
-        if f["filterType"] == "LOT_SIZE":
-            lot_step = float(f["stepSize"])
-            min_qty = float(f["minQty"])
-        elif f["filterType"] == "PRICE_FILTER":
-            price_tick = float(f["tickSize"])
-        elif f["filterType"] in ("NOTIONAL", "MIN_NOTIONAL"):
-            # Some markets use NOTIONAL, older MIN_NOTIONAL exists too
-            min_notional = float(f.get("minNotional") or f.get("notional"))
-    return lot_step, price_tick, min_notional, min_qty
+def sold_recently(symbol: str, window: int = REBUY_COOLDOWN_SEC) -> bool:
+    t = _LAST_SELL_TIME.get(symbol)
+    return bool(t and (now_ts() - t) < window)
 
-def fetch_klines(symbol, interval, limit):
-    # Small sleep to avoid weight spikes when scanning many symbols
-    time.sleep(0.05)
-    return client.get_klines(symbol=symbol, interval=interval, limit=limit)
+def get_symbol_rules(symbol: str):
+    if symbol in _RULES_CACHE:
+        return _RULES_CACHE[symbol]
 
-def closes_from_klines(kl):
-    return [float(x[4]) for x in kl]
+    info = client.get_symbol_info(symbol)
+    if not info:
+        raise RuntimeError(f"Symbol info no disponible para {symbol}")
 
-def ema(series, period):
-    if len(series) < period:
-        return []
-    k = 2 / (period + 1)
-    ema_vals = [sum(series[:period]) / period]
-    for price in series[period:]:
-        ema_vals.append(price * k + ema_vals[-1] * (1 - k))
-    # pad to same length
-    pad = [None] * (len(series) - len(ema_vals))
-    return pad + ema_vals
+    filters = {f["filterType"]: f for f in info["filters"]}
+    lot = filters["LOT_SIZE"]
+    price_filter = filters["PRICE_FILTER"]
+    notional_filter = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL")
 
-def rsi(series, period=14):
-    if len(series) < period + 1:
-        return []
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        ch = series[i] - series[i-1]
-        gains.append(max(ch, 0))
-        losses.append(abs(min(ch, 0)))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    rsis = []
-    for i in range(period + 1, len(series)):
-        ch = series[i] - series[i-1]
-        gain = max(ch, 0)
-        loss = abs(min(ch, 0))
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        rs = (avg_gain / avg_loss) if avg_loss != 0 else 999999
-        rsis.append(100 - (100 / (1 + rs)))
-    pad = [None] * (len(series) - len(rsis))
-    return pad + rsis
+    step = Decimal(lot["stepSize"])
+    min_qty = Decimal(lot["minQty"])
+    tick = Decimal(price_filter["tickSize"])
+    min_notional = Decimal(notional_filter.get("minNotional", "0")) if notional_filter else Decimal("0")
 
-def get_price(symbol):
-    return float(client.get_symbol_ticker(symbol=symbol)["price"])
+    base_precision = max(0, -step.as_tuple().exponent)
+    price_precision = max(0, -tick.as_tuple().exponent)
 
-def account_free(asset):
-    balances = client.get_asset_balance(asset=asset)
-    if not balances:
-        return 0.0
-    return float(balances["free"]) + float(balances["locked"]) * 0.0
-
-def get_symbol_info_cached(cache, symbol):
-    if symbol not in cache:
-        cache[symbol] = client.get_symbol_info(symbol)
-    return cache[symbol]
-
-def can_reenter(state, symbol, current_price):
-    # Cooldown check
-    cd = state.get("cooldown", {}).get(symbol)
-    if cd:
-        if now_utc().timestamp() < cd:
-            return False, f"en cooldown hasta {datetime.fromtimestamp(cd, tz=timezone.utc)}"
-    # Variación mínima desde la última salida
-    le = state.get("last_exit", {}).get(symbol)
-    if le:
-        last_px = le.get("price")
-        if last_px:
-            diff = abs(current_price - last_px) / last_px
-            if diff < REENTRY_MIN_PCT:
-                return False, f"variación {diff:.4f} < REENTRY_MIN_PCT {REENTRY_MIN_PCT:.4f}"
-    return True, ""
-
-def set_cooldown(state, symbol):
-    expire = now_utc() + timedelta(minutes=REBUY_COOLDOWN_MIN)
-    state.setdefault("cooldown", {})[symbol] = expire.timestamp()
-
-def record_exit(state, symbol, price):
-    state.setdefault("last_exit", {})[symbol] = {
-        "price": price,
-        "ts": now_utc().timestamp()
+    rules = {
+        "step": step,
+        "min_qty": min_qty,
+        "price_tick": tick,
+        "min_notional": min_notional,
+        "base_precision": base_precision,
+        "price_precision": price_precision,
     }
-    set_cooldown(state, symbol)
+    _RULES_CACHE[symbol] = rules
+    return rules
 
-def required_profit_pct():
-    # Beneficio mínimo que cubra comisiones ida+vuelta + margen extra
-    return 2 * FEE_PCT + EXTRA_PROFIT_PCT
+def round_down_qty(qty: Decimal, step: Decimal) -> Decimal:
+    if step == 0:
+        return qty
+    return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
 
-# ---------------------- Signals ----------------------
-def compute_signals(symbol):
-    k = fetch_klines(symbol, INTERVAL, LOOKBACK)
-    c = closes_from_klines(k)
-    if len(c) < 50:
-        return None
-    ema12 = ema(c, 12)
-    ema26 = ema(c, 26)
-    r14 = rsi(c, 14)
-    px = c[-1]
-    e12, e26, r = ema12[-1], ema26[-1], r14[-1]
-    if None in (e12, e26, r):
-        return None
+def round_down_price(px: Decimal, tick: Decimal) -> Decimal:
+    if tick == 0:
+        return px
+    return (px / tick).to_integral_value(rounding=ROUND_DOWN) * tick
 
-    # Señal de compra conservadora contra latigazos:
-    # - EMA12 > EMA26 (tendencia corta al alza)
-    # - RSI cruza al alza zona 35-55 (temprano pero con fuerza)
-    # - Confirmación: cierre actual > EMA12
-    buy = (e12 > e26) and (35 < r < 60) and (px > e12)
+def get_free(asset: str) -> Decimal:
+    bal = client.get_asset_balance(asset=asset)
+    if not bal:
+        return Decimal("0")
+    return Decimal(bal["free"])
 
-    # Señal de venta:
-    # - Si ya tenemos posición, se usa gestión de beneficio/SL/trailling más abajo.
-    # Aquí solo devolvemos indicadores.
-    return {
-        "price": px,
-        "ema12": e12,
-        "ema26": e26,
-        "rsi": r,
-        "buy": buy
-    }
+def get_locked(asset: str) -> Decimal:
+    bal = client.get_asset_balance(asset=asset)
+    if not bal:
+        return Decimal("0")
+    return Decimal(bal.get("locked", "0"))
 
-# ---------------------- Orders ----------------------
-def place_market_buy(symbol, usdc_amount, sym_info_cache):
-    si = get_symbol_info_cached(sym_info_cache, symbol)
-    lot_step, _, min_notional, min_qty = get_symbol_filters(si)
-    price = get_price(symbol)
-    qty = usdc_amount / price
+def last_price(symbol: str) -> Decimal:
+    t = client.get_symbol_ticker(symbol=symbol)
+    return Decimal(t["price"])
 
-    if min_notional and usdc_amount < min_notional:
-        raise ValueError(f"Notional {usdc_amount:.2f} < minNotional {min_notional}")
+def qty_sellable(symbol: str, price: Decimal, qty_free: Decimal) -> Decimal:
+    rules = get_symbol_rules(symbol)
+    qty = round_down_qty(qty_free, rules["step"])
+    if qty <= 0:
+        return Decimal("0")
 
-    if min_qty and qty < min_qty:
-        qty = min_qty
+    # Notional check
+    notional = qty * price
+    min_notional_req = max(rules["min_notional"], USER_MIN_NOTIONAL)
+    if notional < min_notional_req:
+        # intentar subir… pero solo vender lo que tenemos, así que si no llega => dust
+        if qty < rules["min_qty"]:
+            return Decimal("0")
+        return Decimal("0")
 
-    if lot_step:
-        qty = max(qty, min_qty or 0)
-        qty = round_step(qty, lot_step)
+    # Respeta minQty
+    if qty < rules["min_qty"]:
+        return Decimal("0")
 
-    order = client.order_market_buy(symbol=symbol, quantity=qty)
-    return order, price, qty
+    return qty
 
-def place_market_sell(symbol, qty, sym_info_cache):
-    si = get_symbol_info_cached(sym_info_cache, symbol)
-    lot_step, _, _, min_qty = get_symbol_filters(si)
-    if lot_step:
-        qty = round_step(qty, lot_step)
-    if min_qty and qty < min_qty:
-        raise ValueError(f"Qty {qty} < minQty {min_qty}")
-    order = client.order_market_sell(symbol=symbol, quantity=qty)
-    return order
+def qty_buyable(symbol: str, price: Decimal, quote_free: Decimal) -> Decimal:
+    """Calcular qty de compra cumpliendo notional mínimo y stepSize."""
+    rules = get_symbol_rules(symbol)
 
-# ---------------------- Portfolio Helpers ----------------------
-def consolidate_dust_to_usdc(symbol_info_cache):
-    """Vende cualquier coin (del watchlist) que tenga saldo residual > minNotional a USDC."""
+    # No usar más del % configurado del quote disponible
+    max_quote = quote_free * MAX_PORTFOLIO_USE
+    # Asegurar mínimo notional (regla exchange y regla usuario)
+    min_notional_req = max(rules["min_notional"], USER_MIN_NOTIONAL)
+
+    # Si no llegamos al mínimo notional, no compramos
+    if max_quote < min_notional_req:
+        return Decimal("0")
+
+    # qty bruta por el max_quote
+    qty = max_quote / price
+    # margen por seguridad
+    qty = qty * (Decimal(1) - SAFETY_QTY_PCT)
+    # redondeo a step
+    qty = round_down_qty(qty, rules["step"])
+
+    # Validar minQty y notional tras redondeo
+    if qty < rules["min_qty"]:
+        return Decimal("0")
+    if qty * price < min_notional_req:
+        return Decimal("0")
+    return qty
+
+def cancel_all(symbol: str):
     try:
-        acct = client.get_account()
-        balances = {b["asset"]: float(b["free"]) for b in acct["balances"]}
-        for sym in WATCHLIST:
-            asset = sym.replace(BASE, "")
-            if asset == BASE:
-                continue
-            free = balances.get(asset, 0.0)
-            if free <= 0:
-                continue
-            try:
-                si = get_symbol_info_cached(symbol_info_cache, sym)
-                _, _, min_notional, _ = get_symbol_filters(si)
-                px = get_price(sym)
-                notional = free * px
-                if min_notional and notional < min_notional:
-                    continue
-                notify(f"Consolidando residuo: vendiendo {free} {asset} -> {BASE}")
-                place_market_sell(sym, free, symbol_info_cache)
-                time.sleep(0.3)
-            except Exception as e:
-                logging.warning(f"[Consolidación] {sym}: {e}")
-                continue
+        client.cancel_open_orders(symbol=symbol)
     except Exception as e:
-        logging.warning(f"[Consolidación general] {e}")
+        # algunas cuentas no tienen permisos o no hay órdenes
+        pass
 
-def current_position(symbol_info_cache):
-    """Devuelve (symbol, asset_free_qty, price_now) si hay una única posición de watchlist (no USDC)."""
-    acct = client.get_account()
-    balances = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+def safe_market_sell(symbol: str):
+    base_asset = symbol.replace(QUOTE, "")
+    price = last_price(symbol)
+
+    acc_free = get_free(base_asset)
+    acc_locked = get_locked(base_asset)
+
+    # Si hay locked, cancelar órdenes para liberar
+    if acc_locked > 0:
+        cancel_all(symbol)
+        time.sleep(0.2)
+        acc_free = get_free(base_asset)
+
+    qty = qty_sellable(symbol, price, acc_free)
+    if qty <= 0:
+        mark_reject(symbol)
+        log.info(f"⚠️ {symbol}: saldo {acc_free} no vendible (minQty/minNotional/step). Marcado DUST. No reintento por {COOLDOWN_SEC}s.")
+        return None
+
+    # Buffer para absorber fee y evitar que Binance lo reduzca por debajo del step
+    qty = qty * (Decimal(1) - SAFETY_QTY_PCT)
+    qty = round_down_qty(qty, get_symbol_rules(symbol)["step"])
+    if qty <= 0:
+        mark_reject(symbol)
+        log.info(f"⚠️ {symbol}: qty se volvió 0 tras safety/rounding. No reintento por {COOLDOWN_SEC}s.")
+        return None
+
+    try:
+        order = client.order_market_sell(symbol=symbol, quantity=float(qty))
+        mark_recent_sell(symbol)
+        return order
+    except Exception as e:
+        mark_reject(symbol)
+        log.error(f"❌ Error al vender {symbol}: {e}")
+        return None
+
+def safe_market_buy(symbol: str):
+    price = last_price(symbol)
+    quote_free = get_free(QUOTE)
+
+    qty = qty_buyable(symbol, price, quote_free)
+    if qty <= 0:
+        log.info(f"⚠️ {symbol}: no compramos (quote={quote_free} insuficiente para minNotional/usuario).")
+        return None
+
+    # precio a tick
+    tick = get_symbol_rules(symbol)["price_tick"]
+    # aunque sea market, redondear puede ayudar para otras rutas si cambias a LIMIT
+    price_rd = round_down_price(price, tick)
+
+    try:
+        order = client.order_market_buy(symbol=symbol, quantity=float(qty))
+        return order
+    except Exception as e:
+        log.error(f"❌ Error al comprar {symbol}: {e}")
+        return None
+
+# =========================
+# Señales muy simples de ejemplo
+# =========================
+def compute_signal(symbol: str):
+    """
+    Ejemplo mínimo:
+    - Si no tenemos posición: compra cuando el precio sube 0.2% en los últimos ticks.
+    - Si tenemos posición: aplica trailing, TP y SL.
+    Esto es sólo un placeholder sencillo; integra aquí tu lógica real (RSI/EMA/volumen/Grok, etc.)
+    """
+    px_now = last_price(symbol)
+
+    pos = _POSITIONS.get(symbol)
+    if not pos:
+        # Sin posición => detectar micro momentum (placeholder)
+        # Truco mínimo: comparar precio actual con el de hace X segundos guardado en una memoria simple
+        hist = _TICK_MEM[symbol]
+        if len(hist) >= 2:
+            px_prev = hist[-2]
+            change = (px_now - px_prev) / px_prev if px_prev > 0 else Decimal(0)
+            if change >= Decimal("0.002"):  # +0.2%
+                return {"action": "BUY", "price": px_now}
+        return {"action": "HOLD", "price": px_now}
+
+    # Con posición => trailing / TP / SL
+    entry = pos["entry"]
+    peak = pos.get("peak", entry)
+    qty  = pos["qty"]
+
+    # Actualizar pico si sube
+    if px_now > peak:
+        peak = px_now
+        pos["peak"] = peak
+
+    pnl_pct = (px_now - entry) / entry
+
+    # Take Profit
+    if TAKE_PROFIT_PCT > 0 and pnl_pct >= TAKE_PROFIT_PCT:
+        return {"action": "SELL_TP", "price": px_now, "pnl": pnl_pct}
+
+    # Stop Loss
+    if STOP_LOSS_PCT > 0 and pnl_pct <= (STOP_LOSS_PCT * Decimal(-1)):
+        return {"action": "SELL_SL", "price": px_now, "pnl": pnl_pct}
+
+    # Trailing: si cae más de TRAIL_PCT desde el peak, vende
+    drawdown_from_peak = (peak - px_now) / peak if peak > 0 else Decimal(0)
+    if drawdown_from_peak >= TRAIL_PCT:
+        return {"action": "SELL_TRAIL", "price": px_now, "pnl": pnl_pct}
+
+    return {"action": "HOLD", "price": px_now}
+
+# Memoria muy simple de ticks recientes por símbolo
+_TICK_MEM = defaultdict(list)
+
+def update_tick_mem(symbol: str, price: Decimal, maxlen: int = 5):
+    arr = _TICK_MEM[symbol]
+    arr.append(price)
+    if len(arr) > maxlen:
+        arr.pop(0)
+
+# =========================
+# Gestión de posiciones
+# =========================
+def have_position(symbol: str) -> bool:
+    base = symbol.replace(QUOTE, "")
+    free = get_free(base)
+    return free > Decimal("0")
+
+def refresh_position_from_account(symbol: str):
+    """Sincroniza posición a partir del saldo real por si hubo operaciones externas."""
+    base = symbol.replace(QUOTE, "")
+    q = get_free(base)
+    if q > 0:
+        px = last_price(symbol)
+        _POSITIONS[symbol] = {
+            "entry": px,  # si no la sabemos, tomamos precio actual de referencia
+            "peak": px,
+            "qty": q
+        }
+    else:
+        _POSITIONS.pop(symbol, None)
+
+def on_buy_filled(symbol: str, order):
+    # Releer saldo para conocer qty exacta
+    base = symbol.replace(QUOTE, "")
+    q = get_free(base)
+    px = last_price(symbol)
+    _POSITIONS[symbol] = {
+        "entry": px,
+        "peak": px,
+        "qty": q
+    }
+    log.info(f"✅ COMPRA ejecutada {symbol}: qty={q} @~{px}")
+
+def on_sell_filled(symbol: str, order, reason: str):
+    # Tras vender, sincroniza y marca cooldown de recompra
+    refresh_position_from_account(symbol)
+    _POSITIONS.pop(symbol, None)
+    mark_recent_sell(symbol)
+    log.info(f"✅ VENTA ejecutada {symbol} ({reason}). Evitamos recomprar durante {REBUY_COOLDOWN_SEC}s.")
+
+# =========================
+# Loop principal
+# =========================
+def scan_symbol(symbol: str):
+    try:
+        px = last_price(symbol)
+    except Exception as e:
+        log.error(f"❌ No se pudo obtener precio {symbol}: {e}")
+        return
+
+    update_tick_mem(symbol, px)
+
+    # Sincroniza estado básico si no cuadra con el saldo real
+    if have_position(symbol) and symbol not in _POSITIONS:
+        refresh_position_from_account(symbol)
+    if (not have_position(symbol)) and (symbol in _POSITIONS):
+        _POSITIONS.pop(symbol, None)
+
+    sig = compute_signal(symbol)
+    action = sig["action"]
+    pnl = sig.get("pnl")
+
+    if action.startswith("SELL"):
+        # Evitar reintento si estamos en cooldown por rechazos previos
+        if should_skip_for_a_while(symbol):
+            return
+        if not have_position(symbol):
+            return
+
+        reasons = {
+            "SELL_TP": "TP",
+            "SELL_SL": "SL",
+            "SELL_TRAIL": "TRAIL"
+        }
+        reason = reasons.get(action, "SIG")
+
+        log.info(f"💰 Vendiendo {symbol} por {reason}. PnL={pnl and round(float(pnl)*100, 2)}%")
+        order = safe_market_sell(symbol)
+        if order:
+            on_sell_filled(symbol, order, reason)
+
+    elif action == "BUY":
+        # Evita recomprar el mismo símbolo inmediatamente
+        if sold_recently(symbol):
+            return
+        if have_position(symbol):
+            return
+
+        order = safe_market_buy(symbol)
+        if order:
+            on_buy_filled(symbol, order)
+
+    # HOLD => no hacer nada
+
+def scan_loop():
     for sym in WATCHLIST:
-        asset = sym.replace(BASE, "")
-        free = balances.get(asset, 0.0)
-        if free and free > 0:
-            px = get_price(sym)
-            return sym, asset, free, px
-    return None, None, 0.0, 0.0
-
-def usdc_balance():
-    return account_free(BASE)
-
-# ---------------------- Strategy Core ----------------------
-def select_candidate(state, sym_info_cache):
-    """Elige el mejor símbolo para comprar EXCLUYENDO el último vendido si incumple filtros."""
-    scored = []
-    for sym in WATCHLIST:
+        # Filtra símbolos no existentes en cuenta/futuros
         try:
-            sig = compute_signals(sym)
-            if not sig:
-                continue
-
-            px = sig["price"]
-            ok, why = can_reenter(state, sym, px)
-            # Permitimos comprar símbolos que NO estén en cooldown/variación bloqueada
-            if not ok:
-                # Lo excluimos del ranking si no está permitido reentrar
-                logging.debug(f"[{sym}] Excluido por filtro reentrada: {why}")
-                continue
-
-            # Ranking sencillo: RSI medio + distancia EMA12-EMA26
-            rank = 0.0
-            if sig["buy"]:
-                rank += 1.0
-            rank += max(0.0, sig["ema12"] - sig["ema26"]) / max(1e-9, sig["price"]) * 100
-            rank += max(0.0, 55 - abs(50 - sig["rsi"]))  # favorece RSI ~50 (inicio impulso)
-            scored.append((rank, sym, sig))
-        except BinanceAPIException as e:
-            logging.warning(f"[{sym}] API: {e}")
+            get_symbol_rules(sym)  # fuerza cache/valida símbolo
         except Exception as e:
-            logging.warning(f"[{sym}] {e}")
+            log.warning(f"⚠️ {sym}: no válido o sin info de exchange: {e}")
+            continue
 
-    if not scored:
-        return None, None
+        scan_symbol(sym)
 
-    scored.sort(reverse=True, key=lambda x: x[0])
-    best = scored[0]
-    return best[1], best[2]
+def main():
+    log.info("🤖 Bot iniciado. Escaneando…")
+    sched = BackgroundScheduler(timezone=str(time.tzname))
+    sched.add_job(scan_loop, 'interval', seconds=SCAN_SEC, max_instances=1)
+    sched.start()
 
-def manage_trailing(state, symbol, entry_px, current_px):
-    if TRAIL_PCT <= 0:
-        return False  # no trailing decision
-    t = state.setdefault("trailing", {}).get(symbol)
-    if not t:
-        # inicializa pico
-        state["trailing"][symbol] = {"peak": current_px, "armed": False}
-        return False
-    peak = t.get("peak", current_px)
-    armed = t.get("armed", False)
-    if current_px > peak:
-        peak = current_px
-        state["trailing"][symbol] = {"peak": peak, "armed": True}
-        return False
-    # Si baja TRAIL_PCT desde el máximo, dispara venta
-    if armed and (peak - current_px) / peak >= TRAIL_PCT:
-        return True
-    return False
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Saliendo…")
+    finally:
+        sched.shutdown(wait=False)
 
-def strategy_loop():
-    state = load_state()
-    sym_info_cache = {}
-
-    # Consolidar residuos al arrancar (no bloqueante)
-    consolidate_dust_to_usdc(sym_info_cache)
-
-    notify("🤖 Bot iniciado. Escaneando…")
-
-    while True:
-        try:
-            # ¿Tenemos posición abierta en alguna del watchlist?
-            sym_pos, asset, qty, px_now = current_position(sym_info_cache)
-            usdc = usdc_balance()
-
-            if sym_pos:
-                # Gestionar salida: target de beneficio neto, stop loss, trailing
-                # Guardar/leer precio de entrada aproximado vía última orden no es trivial con market,
-                # así que estimamos por balance inicial vs actual. Simplificamos: recalculamos usando
-                # el último 'last_exit' como referencia inversa si existiera. Para mayor precisión podrías
-                # persistir 'last_entry' en el estado con el precio de ejecución.
-                # Aquí optamos por consultar la media de las últimas velas como fallback del entry.
-                sig = compute_signals(sym_pos)
-                if not sig:
-                    time.sleep(LOOP_SEC)
-                    continue
-
-                current_px = sig["price"]
-
-                # Estimar entry: si tenemos trailing state con 'peak', usamos primera asignación como pista.
-                # Para un entry robusto, añadimos un campo 'last_entry' al estado cuando compremos.
-                entry_info = load_state()  # recarga ligera por si se editó en otra ruta
-                last_entry = entry_info.get("last_entry", {}).get(sym_pos, {}).get("price")
-                if not last_entry:
-                    # fallback simple: suponer que compramos cerca del EMA12 al cruzar
-                    last_entry = sig["ema12"]
-
-                pnl = (current_px - last_entry) / last_entry if last_entry else 0.0
-                need = required_profit_pct()
-
-                do_trail = manage_trailing(state, sym_pos, last_entry, current_px)
-                hit_tp = pnl >= need
-                hit_sl = (STOP_LOSS_PCT > 0) and (pnl <= -STOP_LOSS_PCT)
-
-                if hit_tp or hit_sl or do_trail:
-                    reason = "TP" if hit_tp else ("SL" if hit_sl else "TRAIL")
-                    notify(f"💰 Vendiendo {asset} ({sym_pos}) por {reason}. PnL={pnl*100:.2f}%")
-                    try:
-                        place_market_sell(sym_pos, qty, sym_info_cache)
-                        save_state(state)  # guardar trailing/estado por si acaso
-                        # Registrar salida y activar cooldown
-                        record_exit(state, sym_pos, current_px)
-                        save_state(state)
-                    except Exception as e:
-                        notify(f"❌ Error al vender {sym_pos}: {e}")
-                    time.sleep(LOOP_SEC)
-                    continue
-
-                # Si no toca vender, no hacer nada
-                time.sleep(LOOP_SEC)
-                continue
-
-            # Si NO hay posición abierta, buscamos compra (rotación inteligente)
-            candidate, sig = select_candidate(state, sym_info_cache)
-            usdc = usdc_balance()
-            if candidate and sig and usdc * USE_CAPITAL_PCT >= MIN_ORDER_USD:
-                # Otra capa de seguridad: vuelve a chequear filtros anti-recompra
-                ok, why = can_reenter(state, candidate, sig["price"])
-                if not ok:
-                    logging.info(f"Rechazado {candidate} por reentry: {why}")
-                    time.sleep(LOOP_SEC)
-                    continue
-
-                if not sig["buy"]:
-                    # No forzamos compra si la señal no es clara
-                    time.sleep(LOOP_SEC)
-                    continue
-
-                capital = usdc * USE_CAPITAL_PCT
-                capital = max(capital, 0.0)
-                if capital < MIN_ORDER_USD:
-                    time.sleep(LOOP_SEC)
-                    continue
-
-                try:
-                    order, exec_px, qty = place_market_buy(candidate, capital, sym_info_cache)
-                    notify(f"🛒 Comprado {candidate} qty={qty} ~{exec_px:.6f} con {capital:.2f} {BASE}")
-                    # Persistir precio de entrada para TP/SL
-                    st = load_state()
-                    st.setdefault("last_entry", {})[candidate] = {
-                        "price": exec_px,
-                        "ts": now_utc().timestamp()
-                    }
-                    # Resetear trailing para el símbolo
-                    st.setdefault("trailing", {})[candidate] = {"peak": exec_px, "armed": False}
-                    save_state(st)
-                except Exception as e:
-                    notify(f"❌ Error al comprar {candidate}: {e}")
-
-            time.sleep(LOOP_SEC)
-
-        except BinanceAPIException as e:
-            logging.warning(f"[BinanceAPI] {e}")
-            time.sleep(2)
-        except BinanceRequestException as e:
-            logging.warning(f"[BinanceRequest] {e}")
-            time.sleep(2)
-        except Exception as e:
-            logging.error(f"Loop error: {e}\n{traceback.format_exc()}")
-            time.sleep(3)
-
-# ---------------------- Entry ----------------------
 if __name__ == "__main__":
-    if not API_KEY or not API_SECRET:
-        raise SystemExit("Faltan BINANCE_API_KEY / BINANCE_API_SECRET")
-    strategy_loop()
+    main()
