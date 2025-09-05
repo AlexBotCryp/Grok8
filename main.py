@@ -158,6 +158,9 @@ SCALP_ENV = os.getenv("SCALP_MIN_PROFIT_PCT")
 SCALP_MIN_PROFIT_PCT = parse_float(SCALP_ENV, 2 * FEE_PCT + 0.0002)  # por defecto ≈ comisiones ida+vuelta + 0.02%
 ROTATE_FOR_ENTRIES = env("ROTATE_FOR_ENTRIES","true").lower()=="true"
 
+# Router (puentes si no hay par directo)
+ROUTER_BRIDGES = [s.strip().upper() for s in env("QUOTE_ASSETS","USDC,USDT,BTC").split(",") if s.strip()]
+
 # Grok (opcional)
 GROK_ENABLE = env("GROK_ENABLE","false").lower()=="true"
 GROK_BASE_URL = env("GROK_BASE_URL","https://api.x.ai/v1")
@@ -361,6 +364,15 @@ def place_buy(sym, quote_qty):
     _invalidate_balance_cache()
     return order, qty, price
 
+def place_buy_with_quote(symbol, quote_qty):
+    """Compra BASE usando cantidad de QUOTE directamente (market buy con quoteOrderQty)."""
+    info = get_symbol_info(symbol)
+    if Decimal(str(quote_qty)) < info["min_notional"]:
+        raise RuntimeError(f"quote_qty {quote_qty} < min_notional for {symbol}")
+    order = client.order_market_buy(symbol=symbol, quoteOrderQty=round(float(quote_qty), 8))
+    _invalidate_balance_cache()
+    return order
+
 def place_sell(sym, qty):
     info = get_symbol_info(sym)
     qty = round_step(qty, info["step"])
@@ -370,19 +382,11 @@ def place_sell(sym, qty):
 
 # ------------------ Helpers de PnL flotante / Rotación ------------------
 def unrealized_profit_pct(entry_price: float, current_price: float) -> float:
-    """
-    Rentabilidad NETa tras comisiones ida+vuelta:
-    (venta_neta - compra_neta) / compra_neta
-    """
     buy_net = entry_price * (1 + FEE_PCT)
     sell_net = current_price * (1 - FEE_PCT)
     return (sell_net - buy_net) / buy_net
 
 def sell_best_profitable_position(st) -> bool:
-    """
-    Vende la posición con mayor ganancia neta >= SCALP_MIN_PROFIT_PCT.
-    Devuelve True si vendió algo.
-    """
     best_sym = None
     best_up = 0.0
     for sym, pos in st.get("positions", {}).items():
@@ -452,6 +456,101 @@ def cooldown_reentry_after_close_allowed(st, sym):
     if not dt: return True
     return (datetime.now(timezone.utc) - dt) >= timedelta(minutes=COOLDOWN_MIN)
 
+# ------------------ Router de pares (ANY->ANY) ------------------
+EX_INFO_CACHE = {"pairs": set(), "base_of": {}, "quote_of": {}}
+
+def refresh_pairs_cache():
+    ex = client.get_exchange_info()
+    pairs = set()
+    base_of = {}
+    quote_of = {}
+    for s in ex["symbols"]:
+        if s.get("status") != "TRADING": 
+            continue
+        base = s.get("baseAsset"); quote = s.get("quoteAsset")
+        sym = s.get("symbol")
+        pairs.add(sym)
+        base_of.setdefault(base, set()).add((base, quote, sym))
+        quote_of.setdefault(quote, set()).add((base, quote, sym))
+    EX_INFO_CACHE["pairs"] = pairs
+    EX_INFO_CACHE["base_of"] = base_of
+    EX_INFO_CACHE["quote_of"] = quote_of
+
+def has_pair(base, quote):
+    sym = f"{base}{quote}"
+    return sym in EX_INFO_CACHE["pairs"]
+
+def symbol_name(base, quote):
+    return f"{base}{quote}"
+
+def estimate_usdc_price(asset):
+    if asset == "USDC": return 1.0
+    sym = f"{asset}USDC"
+    try:
+        px = get_last_price(sym, fallback_rest=True)
+        return float(px)
+    except Exception:
+        return 0.0
+
+def buy_base_using_quote(base_asset, quote_asset, quote_amount):
+    """
+    Intenta comprar 'base_asset' gastando 'quote_asset' (cantidad en unidades del quote).
+    Preferimos par directo BASE/QUOTE (market buy con quoteOrderQty).
+    Si no existe, intentamos vía puentes.
+    """
+    # 1) Directo BASE/QUOTE
+    sym = symbol_name(base_asset, quote_asset)
+    if has_pair(base_asset, quote_asset):
+        try:
+            place_buy_with_quote(sym, quote_amount * 0.995)  # pequeño margen para fees/lot
+            tg_send(f"🔄 BUY {base_asset} usando {quote_amount:.8f} {quote_asset} en {sym}")
+            return True
+        except Exception as e:
+            tg_send(f"⚠️ Fallo compra directa {sym}: {repr(e)}")
+
+    # 2) Vía puentes: quote -> bridge -> base
+    #    Primero convertimos quote -> bridge (comprando BRIDGE con QUOTE), luego BRIDGE -> base.
+    bals = get_all_balances()
+    have_quote = float(bals.get(quote_asset, 0.0))
+    quote_amount = min(quote_amount, have_quote)
+
+    for bridge in ROUTER_BRIDGES:
+        if bridge == quote_asset:  # ya estás en puente
+            # direct bridge -> base
+            sym2 = symbol_name(base_asset, bridge)
+            if has_pair(base_asset, bridge):
+                try:
+                    place_buy_with_quote(sym2, quote_amount * 0.995)
+                    tg_send(f"🔀 BUY {base_asset} usando {quote_amount:.8f} {bridge} (puente) en {sym2}")
+                    return True
+                except Exception as e:
+                    tg_send(f"⚠️ Fallo {sym2} (bridge->base): {repr(e)}")
+            continue
+
+        # quote -> bridge (comprar BRIDGE gastando QUOTE)
+        sym1 = symbol_name(bridge, quote_asset)
+        if not has_pair(bridge, quote_asset):
+            continue
+        try:
+            place_buy_with_quote(sym1, quote_amount * 0.995)
+            # ahora tenemos bridge (al menos parte)
+            tg_send(f"🔁 SWAP {quote_asset}->{bridge} via {sym1}")
+            # segundo salto: bridge -> base
+            sym2 = symbol_name(base_asset, bridge)
+            if has_pair(base_asset, bridge):
+                # usar TODO el bridge disponible (menos margen)
+                bals = get_all_balances()
+                bridge_amt = float(bals.get(bridge, 0.0))
+                if bridge_amt <= 0:
+                    continue
+                place_buy_with_quote(sym2, bridge_amt * 0.995)
+                tg_send(f"🔀 BUY {base_asset} usando {bridge_amt:.8f} {bridge} en {sym2}")
+                return True
+        except Exception as e:
+            tg_send(f"⚠️ Fallo ruta {sym1}→{base_asset}:{repr(e)}")
+            continue
+    return False
+
 # ------------------ Estrategia ------------------
 def evaluate_and_trade():
     if reached_daily_loss():
@@ -476,8 +575,7 @@ def evaluate_and_trade():
             o,h,l,c,v = data
             closes = np.array(c, float); vols = np.array(v, float); price = float(closes[-1])
 
-            # Indicadores
-            # RSI
+            # Indicadores (RSI rápido in-situ para ahorrar cómputo)
             delta = np.diff(closes)
             up = np.where(delta>0,delta,0.0); down = np.where(delta<0,-delta,0.0)
             roll_up = ema(up, RSI_LEN); roll_down = ema(down, RSI_LEN)
@@ -592,35 +690,80 @@ def evaluate_and_trade():
                 if DEBUG: print(f"[SKIP] {sym} límite buys loop ({buys_this_loop}/{MAX_BUYS_PER_LOOP})", flush=True)
                 continue
 
+            # tamaño deseado en USDC aprox (si no hay USDC, estimamos con el asset pagador)
             usdc = get_free_usdc()
-            if DEBUG: print(f"[BAL] USDC libre ≈ {usdc:.2f}", flush=True)
-            if usdc < MIN_ORDER_USD:
-                if DEBUG: print(f"[SKIP] {sym} USDC insuficiente ({usdc:.2f} < {MIN_ORDER_USD})", flush=True)
-                # Intento de rotación (una vez por ciclo), vende la mejor en verde para liberar USDC
-                if ROTATE_FOR_ENTRIES and not rotated_this_loop:
-                    did = sell_best_profitable_position(st)
-                    rotated_this_loop = did
+            desired_usdc = 0.995 * max(MIN_ORDER_USD, usdc * ALLOCATION_PCT)
+            base_asset = sym.replace("USDC","")
+
+            if DEBUG: print(f"[BAL] USDC libre ≈ {usdc:.2f} | desired_usdc ≈ {desired_usdc:.2f}", flush=True)
+
+            if usdc >= MIN_ORDER_USD:
+                # Compra clásica con USDC
+                info = get_symbol_info(sym)
+                if Decimal(str(desired_usdc)) < info["min_notional"]:
+                    desired_usdc = float(info["min_notional"]) + 1.0
+                order, qty, raw_entry = place_buy(sym, desired_usdc)
+                st["positions"][sym] = {"entry": raw_entry*(1+FEE_PCT), "qty": qty, "best": raw_entry, "opened_at": now_ts()}
+                st.setdefault("last_open",{})[sym] = now_ts()
+                save_state(st)
+                tg_send(f"🟢 BUY {sym} {qty} @ {raw_entry:.8f} | Notional ≈ {qty*raw_entry:.2f} USDC")
+                buys_this_loop += 1
+                open_positions += 1
                 continue
 
-            desired = max(MIN_ORDER_USD, usdc * ALLOCATION_PCT * 0.995)
-            if total_equity > 0:
-                max_more_for_symbol = MAX_SYMBOL_EXPOSURE_PCT * total_equity - sym_exp
-                if max_more_for_symbol <= 0:
-                    if DEBUG: print(f"[SKIP] {sym} cap por símbolo alcanzado", flush=True)
+            # === NUEVO: compra base usando otra cripto como "quote" (ANY->BASE) ===
+            # elegimos un asset pagador con saldo (excluyendo USDC y el propio base_asset)
+            bals = get_all_balances()
+            payers = [(a, q) for a, q in bals.items() if a not in ("USDC","BUSD","USD") and a != base_asset and q > 0]
+
+            # intenta pagar con el asset que mejor cubra el desired_usdc (según precio a USDC)
+            payers_scored = []
+            for a, q in payers:
+                px = estimate_usdc_price(a)
+                if px <= 0: continue
+                payers_scored.append((a, q, px, q*px))  # (asset, qty, px_usdc, notional_usdc)
+            payers_scored.sort(key=lambda x: x[3], reverse=True)  # mayor capacidad primero
+
+            bought = False
+            for a, q, px, notion in payers_scored:
+                # gastaremos hasta cubrir desired_usdc, o la mitad del saldo si es demasiado
+                need_quote = min(q*0.98, desired_usdc / max(px, 1e-9))
+                if need_quote <= 0:
                     continue
-                desired = min(desired, max_more_for_symbol)
 
-            info = get_symbol_info(sym)
-            if Decimal(str(desired)) < info["min_notional"]:
-                desired = float(info["min_notional"]) + 1.0
+                ok = buy_base_using_quote(base_asset, a, need_quote)
+                if ok:
+                    # tras comprar base con "a", necesitamos registrar la posición en sym (BASEUSDC)
+                    # obtenemos precio actual de sym para fijar entry (con comisión)
+                    raw_entry = get_last_price(sym)
+                    # estimar qty base disponible: consultamos balance de base
+                    new_bal = get_all_balances()
+                    base_qty = float(new_bal.get(base_asset, 0.0))
+                    # cantidad "nueva" aproximada: tomamos un 98% del incremento (simplificado)
+                    # para no hacernos un lío, si ya teníamos algo del base_asset, igualará; no pasa nada.
+                    if base_qty <= 0:
+                        continue
+                    # Redondeo a step del par BASEUSDC
+                    info = get_symbol_info(sym)
+                    base_qty_rd = round_step(base_qty, info["step"])
+                    if base_qty_rd <= 0:
+                        continue
+                    st["positions"][sym] = {"entry": raw_entry*(1+FEE_PCT), "qty": base_qty_rd, "best": raw_entry, "opened_at": now_ts()}
+                    st.setdefault("last_open",{})[sym] = now_ts()
+                    save_state(st)
+                    tg_send(f"🟢 BUY {sym} usando {a} (sin USDC) | qty≈{base_qty_rd}")
+                    buys_this_loop += 1
+                    open_positions += 1
+                    bought = True
+                    break
 
-            order, qty, raw_entry = place_buy(sym, desired)
-            st["positions"][sym] = {"entry": raw_entry*(1+FEE_PCT), "qty": qty, "best": raw_entry, "opened_at": now_ts()}
-            st.setdefault("last_open",{})[sym] = now_ts()
-            save_state(st)
-            tg_send(f"🟢 BUY {sym} {qty} @ {raw_entry:.8f} | Notional ≈ {qty*raw_entry:.2f} USDC")
-            buys_this_loop += 1
-            open_positions += 1
+            if bought:
+                continue
+
+            # Si no pudo comprar con otras cripto, intenta rotar (vender la mejor en verde) para liberar USDC
+            if ROTATE_FOR_ENTRIES and not rotated_this_loop:
+                did = sell_best_profitable_position(st)
+                rotated_this_loop = did
 
         except BinanceAPIException as be:
             if be.code == -1003:
@@ -641,6 +784,9 @@ def heartbeat():
 # ------------------ Main ------------------
 def main():
     print(f"[BOOT] {now_ts()} — starting...", flush=True)
+
+    # Construye cache de pares para routing ANY->ANY
+    refresh_pairs_cache()
 
     # Universo auto (opcional)
     if AUTO_UNIVERSE:
