@@ -8,12 +8,17 @@ from collections import defaultdict
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
 from binance.client import Client
+import requests
 
 # =========================
 # CONFIG (ENV)
 # =========================
 API_KEY = os.getenv("BINANCE_API_KEY", "")
 API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+
+# Telegram
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Cotizamos contra USDC (cámbialo a USDT si quieres)
 QUOTE = os.getenv("QUOTE_ASSET", "USDC")
@@ -52,6 +57,23 @@ if not API_KEY or not API_SECRET:
     log.warning("⚠️ Falta BINANCE_API_KEY o BINANCE_API_SECRET.")
 
 client = Client(API_KEY, API_SECRET)
+
+# =========================
+# Telegram helpers
+# =========================
+def tg_enabled() -> bool:
+    return bool(TG_TOKEN and TG_CHAT)
+
+def tg_send(text: str):
+    if not tg_enabled():
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        payload = {"chat_id": TG_CHAT, "text": text}
+        # timeout corto para no bloquear el ciclo
+        requests.post(url, json=payload, timeout=4)
+    except Exception as e:
+        log.warning(f"⚠️ Telegram no envió: {e}")
 
 # =========================
 # Estado y caches
@@ -185,20 +207,22 @@ def safe_market_sell(symbol: str):
     locked = get_locked(base)
     if locked > 0:
         cancel_all(symbol)
-        time.sleep(0.25)
+        time.sleep(0.2)
         free = get_free(base)
 
     qty = qty_sellable(symbol, price, free)
     if qty <= 0:
         mark_reject(symbol)
-        log.info(f"⚠️ {symbol}: saldo {free} no vendible (minQty/minNotional/step). Marcado DUST. Cooldown {COOLDOWN_SEC}s.")
+        msg = f"⚠️ {symbol}: saldo {free} no vendible (minQty/minNotional/step). DUST. Cooldown {COOLDOWN_SEC}s."
+        log.info(msg); tg_send(msg)
         return None
 
     qty = qty * (Decimal(1) - SAFETY_QTY_PCT)
     qty = round_down_qty(qty, get_symbol_rules(symbol)["step"])
     if qty <= 0:
         mark_reject(symbol)
-        log.info(f"⚠️ {symbol}: qty 0 tras safety/rounding. Cooldown {COOLDOWN_SEC}s.")
+        msg = f"⚠️ {symbol}: qty 0 tras safety/rounding. Cooldown {COOLDOWN_SEC}s."
+        log.info(msg); tg_send(msg)
         return None
 
     try:
@@ -207,7 +231,8 @@ def safe_market_sell(symbol: str):
         return order
     except Exception as e:
         mark_reject(symbol)
-        log.error(f"❌ Error al vender {symbol}: {e}")
+        msg = f"❌ Error al vender {symbol}: {e}"
+        log.error(msg); tg_send(msg)
         return None
 
 def safe_market_buy(symbol: str):
@@ -223,18 +248,18 @@ def safe_market_buy(symbol: str):
         order = client.order_market_buy(symbol=symbol, quantity=float(qty))
         return order
     except Exception as e:
-        log.error(f"❌ Error al comprar {symbol}: {e}")
+        msg = f"❌ Error al comprar {symbol}: {e}"
+        log.error(msg); tg_send(msg)
         return None
 
 # =========================
-# Señal placeholder (cámbiala por la tuya)
+# Señal placeholder (sustituye por tu lógica)
 # =========================
 def compute_signal(symbol: str):
     """
-    Placeholder MUY simple:
+    Placeholder:
     - Sin posición: compra si sube ~0.2% vs tick anterior.
     - Con posición: TP, SL y trailing.
-    Sustituye por tu RSI/EMA/volumen/Grok cuando quieras.
     """
     px_now = last_price(symbol)
     hist = _TICK_MEM[symbol]
@@ -296,13 +321,15 @@ def on_buy_filled(symbol: str, order):
     q = get_free(base)
     px = last_price(symbol)
     _POSITIONS[symbol] = {"entry": px, "peak": px, "qty": q}
-    log.info(f"✅ COMPRA {symbol}: qty={q} @~{px}")
+    msg = f"✅ COMPRA {symbol}: qty={q} @~{px}"
+    log.info(msg); tg_send(msg)
 
 def on_sell_filled(symbol: str, order, reason: str):
     refresh_position_from_account(symbol)
     _POSITIONS.pop(symbol, None)
     mark_recent_sell(symbol)
-    log.info(f"✅ VENTA {symbol} ({reason}). Rebuy cooldown {REBUY_COOLDOWN_SEC}s.")
+    msg = f"✅ VENTA {symbol} ({reason}). Rebuy cooldown {REBUY_COOLDOWN_SEC}s."
+    log.info(msg); tg_send(msg)
 
 # =========================
 # Escaneo por símbolo
@@ -311,7 +338,8 @@ def scan_symbol(symbol: str):
     try:
         px = last_price(symbol)
     except Exception as e:
-        log.error(f"❌ Precio {symbol}: {e}")
+        msg = f"❌ Precio {symbol}: {e}"
+        log.error(msg); tg_send(msg)
         return
 
     update_tick_mem(symbol, px)
@@ -351,13 +379,22 @@ def scan_symbol(symbol: str):
     # HOLD => nada
 
 def scan_loop():
-    for sym in WATCHLIST:
+    start = time.time()
+    for i, sym in enumerate(WATCHLIST):
+        # Si el ciclo se está alargando, corta para no pisar el siguiente
+        if time.time() - start > SCAN_SEC - 1:
+            log.warning("⏱️ Ciclo se alarga, corto para evitar 'skipped'.")
+            break
+
         try:
             get_symbol_rules(sym)  # valida símbolo y cachea
         except Exception as e:
             log.warning(f"⚠️ {sym}: símbolo no válido o sin info: {e}")
             continue
+
         scan_symbol(sym)
+        # micro-sleep para repartir carga y no bloquear si hay latencia
+        time.sleep(0.05)
 
 # =========================
 # Main
@@ -371,8 +408,11 @@ def main():
         log.warning(f"⚠️ BOT_TZ='{BOT_TZ_STR}' no válida. Uso UTC.")
 
     log.info("🤖 Bot iniciado. Escaneando…")
-    sched = BackgroundScheduler(timezone=tz)
-    sched.add_job(scan_loop, 'interval', seconds=SCAN_SEC, max_instances=1)
+
+    # Scheduler con coalesce para no encolar ciclos atrasados
+    sched = BackgroundScheduler(timezone=tz, job_defaults={"coalesce": True, "misfire_grace_time": SCAN_SEC})
+    # max_instances=1 para evitar solapar ciclos; coalesce=True evitará colas.
+    sched.add_job(scan_loop, 'interval', seconds=SCAN_SEC, max_instances=1, id="scan")
     sched.start()
 
     try:
