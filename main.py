@@ -3,7 +3,7 @@ import os
 import time
 import logging
 from decimal import Decimal, ROUND_DOWN, getcontext
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
@@ -20,26 +20,40 @@ API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Cotizamos contra USDC (cámbialo a USDT si quieres)
+# Cotizamos contra USDC (puedes usar USDT si quieres)
 QUOTE = os.getenv("QUOTE_ASSET", "USDC")
 
-# Lista de símbolos a escanear (coma-separado)
+# Máximo 2 posiciones simultáneas, usa el 100% de la cartera
+MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "2"))
+MAX_PORTFOLIO_USE  = Decimal(os.getenv("MAX_PORTFOLIO_USE", "1.00").replace(",", "."))  # 100%
+USER_MIN_NOTIONAL  = Decimal(os.getenv("USER_MIN_NOTIONAL", "20").replace(",", "."))     # compra/venta mínima deseada
+
+# Lista de símbolos a escanear
 WATCHLIST = os.getenv(
     "WATCHLIST",
     "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,DOGEUSDC,TRXUSDC,XRPUSDC,ADAUSDC,AVAXUSDC"
 ).replace(" ", "").split(",")
 
 # Señales/gestión
-TRAIL_PCT         = Decimal(os.getenv("TRAIL_PCT",         "0.004").replace(",", "."))  # 0.4%
-TAKE_PROFIT_PCT   = Decimal(os.getenv("TAKE_PROFIT_PCT",   "0.006").replace(",", "."))  # 0.6%  (<=0 desactiva)
-STOP_LOSS_PCT     = Decimal(os.getenv("STOP_LOSS_PCT",     "0.010").replace(",", "."))  # 1.0%  (<=0 desactiva)
-USER_MIN_NOTIONAL = Decimal(os.getenv("USER_MIN_NOTIONAL", "20").replace(",", "."))     # mínimo deseado además del exchange
-SCAN_SEC          = int(os.getenv("SCAN_SEC", "25"))                                   # subimos a 25s para holgura
-SAFETY_QTY_PCT    = Decimal(os.getenv("SAFETY_QTY_PCT", "0.001").replace(",", "."))     # 0.1% buffer qty
-COOLDOWN_SEC      = int(os.getenv("COOLDOWN_SEC", "180"))                                # enfriar si queda en dust
-REBUY_COOLDOWN_SEC= int(os.getenv("REBUY_COOLDOWN_SEC", "120"))
-MAX_PORTFOLIO_USE = Decimal(os.getenv("MAX_PORTFOLIO_USE", "0.80").replace(",", "."))   # usa hasta 80% del quote
-BOT_TZ_STR        = os.getenv("BOT_TZ", "Europe/Madrid")
+TRAIL_PCT       = Decimal(os.getenv("TRAIL_PCT",       "0.006").replace(",", "."))  # trailing 0.6%
+TAKE_PROFIT_PCT = Decimal(os.getenv("TAKE_PROFIT_PCT", "0.012").replace(",", "."))  # TP 1.2%
+STOP_LOSS_PCT   = Decimal(os.getenv("STOP_LOSS_PCT",   "0.008").replace(",", "."))  # SL 0.8%
+
+# Frecuencia y seguridad
+SCAN_SEC        = int(os.getenv("SCAN_SEC", "25"))
+SAFETY_QTY_PCT  = Decimal(os.getenv("SAFETY_QTY_PCT", "0.001").replace(",", "."))   # 0.1% para absorber fees/redondeo
+COOLDOWN_SEC    = int(os.getenv("COOLDOWN_SEC", "180"))                              # si queda en dust
+REBUY_COOLDOWN_SEC = int(os.getenv("REBUY_COOLDOWN_SEC", "180"))                    # no recomprar enseguida mismo símbolo
+GLOBAL_BUY_GAP_SEC = int(os.getenv("GLOBAL_BUY_GAP_SEC", "30"))                     # separa compras entre sí
+MIN_HOLD_SEC       = int(os.getenv("MIN_HOLD_SEC", "600"))                           # mantener posición mínimo (evita churn)
+
+# Indicadores
+EMA_FAST_N = int(os.getenv("EMA_FAST_N", "12"))
+EMA_SLOW_N = int(os.getenv("EMA_SLOW_N", "26"))
+RSI_N      = int(os.getenv("RSI_N", "14"))
+
+# Zona horaria
+BOT_TZ_STR = os.getenv("BOT_TZ", "Europe/Madrid")
 
 # =========================
 # LOGGING
@@ -56,7 +70,7 @@ if not API_KEY or not API_SECRET:
 client = Client(API_KEY, API_SECRET)
 
 # =========================
-# Telegram helpers
+# Telegram
 # =========================
 def tg_enabled() -> bool:
     return bool(TG_TOKEN and TG_CHAT)
@@ -76,15 +90,31 @@ def tg_send(text: str):
 # Estado y caches
 # =========================
 _RULES_CACHE = {}
-_LAST_REJECT = {}      # symbol -> ts último rechazo (dust/minQty/minNotional)
-_LAST_SELL   = {}      # symbol -> ts última venta
-_POSITIONS   = {}      # symbol -> {entry, peak, qty}
-_TICK_MEM    = defaultdict(list)  # memoria de precios recientes
+_LAST_REJECT = {}        # symbol -> ts último rechazo (dust/minQty/minNotional)
+_LAST_SELL   = {}        # symbol -> ts última venta (para evitar recomprar)
+_LAST_GLOBAL_BUY = 0.0   # separa compras entre sí
 
-# caches por ciclo
-_price_cache = {}      # symbol -> Decimal(price)
-_bal_free = {}         # asset -> Decimal(free)
-_bal_locked = {}       # asset -> Decimal(locked)
+# Posiciones en cartera (solo contaremos base free >0 como posición)
+_POSITIONS = {}          # symbol -> {entry, peak, qty, ts_entry}
+
+# Indicadores por símbolo
+_IND = {
+    # symbol: {
+    #   "ema_f": Decimal,
+    #   "ema_s": Decimal,
+    #   "rsi": Decimal or None,
+    #   "avg_gain": Decimal,
+    #   "avg_loss": Decimal,
+    #   "last_px": Decimal,
+    #   "warmup": int (ticks acumulados)
+    # }
+}
+_TICK_MEM = defaultdict(lambda: deque(maxlen=3))  # memoria ligera de últimos precios
+
+# caches por ciclo (para reducir llamadas API)
+_price_cache = {}        # symbol -> Decimal(price)
+_bal_free = {}           # asset -> Decimal(free)
+_bal_locked = {}         # asset -> Decimal(locked)
 
 def now_ts() -> float:
     return time.time()
@@ -104,7 +134,7 @@ def sold_recently(symbol: str, window: int = REBUY_COOLDOWN_SEC) -> bool:
     return bool(t and (now_ts() - t) < window)
 
 # =========================
-# Reglas de símbolo y utilidades
+# Reglas símbolo y utilidades
 # =========================
 def get_symbol_rules(symbol: str):
     if symbol in _RULES_CACHE:
@@ -126,15 +156,9 @@ def round_down_qty(qty: Decimal, step: Decimal) -> Decimal:
     if step == 0: return qty
     return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
 
-def round_down_price(px: Decimal, tick: Decimal) -> Decimal:
-    if tick == 0: return px
-    return (px / tick).to_integral_value(rounding=ROUND_DOWN) * tick
-
 def last_price(symbol: str) -> Decimal:
-    # Usa cache del ciclo (alimentada por get_all_tickers)
     p = _price_cache.get(symbol)
     if p is None:
-        # fallback (no debería pasar)
         t = client.get_symbol_ticker(symbol=symbol)
         p = Decimal(t["price"])
         _price_cache[symbol] = p
@@ -147,7 +171,68 @@ def get_locked(asset: str) -> Decimal:
     return _bal_locked.get(asset, Decimal("0"))
 
 # =========================
-# Validaciones de cantidad
+# Indicadores (EMA + RSI incremental)
+# =========================
+def update_indicators(symbol: str, px: Decimal):
+    d = _IND.get(symbol)
+    if d is None:
+        _IND[symbol] = {
+            "ema_f": px,
+            "ema_s": px,
+            "rsi": None,
+            "avg_gain": Decimal("0"),
+            "avg_loss": Decimal("0"),
+            "last_px": px,
+            "warmup": 1
+        }
+        return
+
+    # EMA
+    alpha_f = Decimal(2) / Decimal(EMA_FAST_N + 1)
+    alpha_s = Decimal(2) / Decimal(EMA_SLOW_N + 1)
+    d["ema_f"] = (px - d["ema_f"]) * alpha_f + d["ema_f"]
+    d["ema_s"] = (px - d["ema_s"]) * alpha_s + d["ema_s"]
+
+    # RSI Wilder incremental
+    change = px - d["last_px"]
+    gain = change if change > 0 else Decimal("0")
+    loss = -change if change < 0 else Decimal("0")
+    if d["warmup"] < RSI_N:
+        # Acumula medias iniciales
+        d["avg_gain"] = (d["avg_gain"] * (d["warmup"] - 1) + gain) / max(1, d["warmup"])
+        d["avg_loss"] = (d["avg_loss"] * (d["warmup"] - 1) + loss) / max(1, d["warmup"])
+        d["rsi"] = None
+        d["warmup"] += 1
+    else:
+        d["avg_gain"] = (d["avg_gain"] * (RSI_N - 1) + gain) / RSI_N
+        d["avg_loss"] = (d["avg_loss"] * (RSI_N - 1) + loss) / RSI_N
+        if d["avg_loss"] == 0:
+            d["rsi"] = Decimal("100")
+        else:
+            rs = d["avg_gain"] / d["avg_loss"]
+            d["rsi"] = Decimal("100") - (Decimal("100") / (Decimal("1") + rs))
+
+    d["last_px"] = px
+
+def indicator_score(symbol: str):
+    d = _IND.get(symbol)
+    if not d or d["rsi"] is None:
+        return None
+    ema_ok = d["ema_f"] > d["ema_s"]
+    rsi = d["rsi"]
+    # Evita sobrecompra fuerte
+    if rsi >= 70:
+        return None
+    # Score mezcla momentum + tendencia
+    ema_ratio = (d["ema_f"] / d["ema_s"]) if d["ema_s"] > 0 else Decimal("1")
+    score = (rsi - Decimal("50")) + (ema_ratio - Decimal("1")) * Decimal("150")
+    # Penaliza si EMA no cruza aún
+    if not ema_ok:
+        score -= Decimal("10")
+    return float(score)
+
+# =========================
+# Cantidades comprables/vendibles
 # =========================
 def qty_sellable(symbol: str, price: Decimal, qty_free: Decimal) -> Decimal:
     rules = get_symbol_rules(symbol)
@@ -163,12 +248,10 @@ def qty_sellable(symbol: str, price: Decimal, qty_free: Decimal) -> Decimal:
 
 def qty_buyable(symbol: str, price: Decimal, quote_free: Decimal) -> Decimal:
     rules = get_symbol_rules(symbol)
-    max_quote = quote_free * MAX_PORTFOLIO_USE
     min_notional_req = max(rules["min_notional"], USER_MIN_NOTIONAL)
-    if max_quote < min_notional_req:
+    if quote_free < min_notional_req:
         return Decimal("0")
-    qty = max_quote / price
-    qty = qty * (Decimal(1) - SAFETY_QTY_PCT)
+    qty = (quote_free / price) * (Decimal(1) - SAFETY_QTY_PCT)
     qty = round_down_qty(qty, rules["step"])
     if qty < rules["min_qty"]:
         return Decimal("0")
@@ -185,29 +268,32 @@ def cancel_all(symbol: str):
 # =========================
 # Órdenes seguras
 # =========================
-def safe_market_sell(symbol: str):
+def safe_market_sell(symbol: str, reason: str):
     base = symbol.replace(QUOTE, "")
     price = last_price(symbol)
     free = get_free(base); locked = get_locked(base)
     if locked > 0:
         cancel_all(symbol); time.sleep(0.2)
-    # actualizar saldos del ciclo tras cancelar no lo hacemos para no añadir latencia:
-    # asumimos que locked es bajo; si da error, entrará a cooldown
+
     qty = qty_sellable(symbol, price, free)
     if qty <= 0:
         mark_reject(symbol)
-        msg = f"⚠️ {symbol}: saldo {free} no vendible (minQty/minNotional/step). DUST. Cooldown {COOLDOWN_SEC}s."
+        msg = f"⚠️ {symbol}: saldo {free} no vendible (dust/minQty/minNotional). Cooldown {COOLDOWN_SEC}s."
         log.info(msg); tg_send(msg)
         return None
+
     qty = round_down_qty(qty * (Decimal(1) - SAFETY_QTY_PCT), get_symbol_rules(symbol)["step"])
     if qty <= 0:
         mark_reject(symbol)
         msg = f"⚠️ {symbol}: qty 0 tras safety/rounding. Cooldown {COOLDOWN_SEC}s."
         log.info(msg); tg_send(msg)
         return None
+
     try:
         order = client.order_market_sell(symbol=symbol, quantity=float(qty))
         mark_recent_sell(symbol)
+        msg = f"✅ VENTA {symbol} ({reason}) qty={qty} notional≈{(qty*price):.2f}"
+        log.info(msg); tg_send(msg)
         return order
     except Exception as e:
         mark_reject(symbol)
@@ -215,15 +301,16 @@ def safe_market_sell(symbol: str):
         log.error(msg); tg_send(msg)
         return None
 
-def safe_market_buy(symbol: str):
+def safe_market_buy(symbol: str, allocation_quote: Decimal):
     price = last_price(symbol)
-    quote_free = get_free(QUOTE)
-    qty = qty_buyable(symbol, price, quote_free)
+    qty = qty_buyable(symbol, price, allocation_quote)
     if qty <= 0:
-        log.info(f"⚠️ {symbol}: no se compra (quote={quote_free} insuficiente).")
+        log.info(f"⚠️ {symbol}: no compra (quote={allocation_quote} insuficiente).")
         return None
     try:
         order = client.order_market_buy(symbol=symbol, quantity=float(qty))
+        msg = f"✅ COMPRA {symbol} qty={qty} notional≈{(qty*price):.2f}"
+        log.info(msg); tg_send(msg)
         return order
     except Exception as e:
         msg = f"❌ Error al comprar {symbol}: {e}"
@@ -231,82 +318,149 @@ def safe_market_buy(symbol: str):
         return None
 
 # =========================
-# Señal placeholder (cámbiala cuando quieras)
-# =========================
-def compute_signal(symbol: str):
-    """
-    Placeholder muy simple:
-    - Sin posición: compra si sube ~0.2% vs tick anterior.
-    - Con posición: TP, SL y trailing.
-    """
-    px_now = last_price(symbol)
-    hist = _TICK_MEM[symbol]
-    if len(hist) >= 1:
-        px_prev = hist[-1]
-        if symbol not in _POSITIONS:
-            change = (px_now - px_prev) / px_prev if px_prev > 0 else Decimal(0)
-            if change >= Decimal("0.002"):
-                return {"action": "BUY", "price": px_now}
-    pos = _POSITIONS.get(symbol)
-    if not pos:
-        return {"action": "HOLD", "price": px_now}
-    entry = pos["entry"]; peak = pos.get("peak", entry)
-    if px_now > peak:
-        peak = px_now; pos["peak"] = peak
-    pnl_pct = (px_now - entry) / entry
-    if TAKE_PROFIT_PCT > 0 and pnl_pct >= TAKE_PROFIT_PCT:
-        return {"action": "SELL_TP", "price": px_now, "pnl": pnl_pct}
-    if STOP_LOSS_PCT > 0 and pnl_pct <= (STOP_LOSS_PCT * Decimal(-1)):
-        return {"action": "SELL_SL", "price": px_now, "pnl": pnl_pct}
-    dd = (peak - px_now) / peak if peak > 0 else Decimal(0)
-    if dd >= TRAIL_PCT:
-        return {"action": "SELL_TRAIL", "price": px_now, "pnl": pnl_pct}
-    return {"action": "HOLD", "price": px_now}
-
-def update_tick_mem(symbol: str, price: Decimal, maxlen: int = 5):
-    arr = _TICK_MEM[symbol]; arr.append(price)
-    if len(arr) > maxlen: arr.pop(0)
-
-# =========================
 # Posiciones
 # =========================
 def have_position(symbol: str) -> bool:
-    base = symbol.replace(QUOTE, ""); return get_free(base) > Decimal("0")
+    base = symbol.replace(QUOTE, "")
+    return get_free(base) > Decimal("0")
 
 def refresh_position_from_account(symbol: str):
-    base = symbol.replace(QUOTE, ""); q = get_free(base)
+    base = symbol.replace(QUOTE, "")
+    q = get_free(base)
+    px = last_price(symbol)
     if q > 0:
-        px = last_price(symbol)
-        _POSITIONS[symbol] = {"entry": px, "peak": px, "qty": q}
+        if symbol not in _POSITIONS:
+            _POSITIONS[symbol] = {"entry": px, "peak": px, "qty": q, "ts_entry": now_ts()}
+        else:
+            _POSITIONS[symbol]["qty"] = q
+            # mantener entry original; actualizar peak si corresponde
+            if px > _POSITIONS[symbol]["peak"]:
+                _POSITIONS[symbol]["peak"] = px
     else:
         _POSITIONS.pop(symbol, None)
 
-def on_buy_filled(symbol: str, order):
-    base = symbol.replace(QUOTE, ""); q = get_free(base); px = last_price(symbol)
-    _POSITIONS[symbol] = {"entry": px, "peak": px, "qty": q}
-    msg = f"✅ COMPRA {symbol}: qty={q} @~{px}"
-    log.info(msg); tg_send(msg)
-
-def on_sell_filled(symbol: str, order, reason: str):
-    refresh_position_from_account(symbol)
-    _POSITIONS.pop(symbol, None)
-    mark_recent_sell(symbol)
-    msg = f"✅ VENTA {symbol} ({reason}). Rebuy cooldown {REBUY_COOLDOWN_SEC}s."
-    log.info(msg); tg_send(msg)
+def position_pnl(symbol: str):
+    pos = _POSITIONS.get(symbol)
+    if not pos:
+        return None
+    entry = pos["entry"]
+    px = last_price(symbol)
+    if entry <= 0:
+        return None
+    return (px - entry) / entry
 
 # =========================
-# Ciclo: precache de precios y balances
+# Lógica de señales y gestión de cartera (máx. 2 posiciones, 100% uso)
+# =========================
+def evaluate_and_trade():
+    global _LAST_GLOBAL_BUY
+
+    # 1) Actualiza posiciones desde saldos reales
+    for sym in WATCHLIST:
+        refresh_position_from_account(sym)
+
+    open_symbols = list(_POSITIONS.keys())
+    num_open = len(open_symbols)
+
+    # 2) Reglas de salida para posiciones abiertas
+    for sym in open_symbols:
+        if should_skip(sym):
+            continue
+        pos = _POSITIONS[sym]
+        px = last_price(sym)
+        pos["peak"] = max(pos["peak"], px)
+        pnl = position_pnl(sym)
+        hold_time = now_ts() - pos["ts_entry"]
+
+        # Ventas por SL/TP siempre activas; trailing solo si ya hemos tenido subida
+        if pnl is not None:
+            if TAKE_PROFIT_PCT > 0 and pnl >= TAKE_PROFIT_PCT:
+                safe_market_sell(sym, "TP")
+                continue
+            if STOP_LOSS_PCT > 0 and pnl <= (STOP_LOSS_PCT * Decimal(-1)):
+                safe_market_sell(sym, "SL")
+                continue
+
+            # Trailing: si cae desde el pico más que TRAIL_PCT
+            if pos["peak"] > 0:
+                dd = (pos["peak"] - px) / pos["peak"]
+                if dd >= TRAIL_PCT and hold_time >= MIN_HOLD_SEC/2:
+                    safe_market_sell(sym, "TRAIL")
+                    continue
+
+    # Recalcula tras ventas
+    for sym in WATCHLIST:
+        refresh_position_from_account(sym)
+    open_symbols = list(_POSITIONS.keys())
+    num_open = len(open_symbols)
+
+    # 3) Selección de compras (máx. 2 posiciones en total)
+    quote_free = get_free(QUOTE)
+    if num_open >= MAX_POSITIONS or quote_free <= Decimal("0"):
+        return
+
+    # Enfriamiento global entre compras para no spamear
+    if now_ts() - _LAST_GLOBAL_BUY < GLOBAL_BUY_GAP_SEC:
+        return
+
+    # Construye ranking de candidatos por score
+    scored = []
+    for sym in WATCHLIST:
+        if have_position(sym) or sold_recently(sym):
+            continue
+        sc = indicator_score(sym)
+        if sc is None:
+            continue
+        # filtro mínimo para considerar compra
+        if sc < 2.5:   # umbral prudente
+            continue
+        scored.append((sc, sym))
+
+    if not scored:
+        return
+
+    scored.sort(reverse=True)  # mayor score primero
+    # Decide cuántos comprar para llegar a MAX_POSITIONS
+    slots = MAX_POSITIONS - num_open
+    to_buy_syms = [s for _, s in scored[:slots]]
+
+    # Asignación: usa el 100% de la cartera disponible repartido entre los seleccionados
+    # (si 1 símbolo -> 100%; si 2 símbolos -> 50% y 50%)
+    n = len(to_buy_syms)
+    if n == 0:
+        return
+
+    allocation_each = (quote_free * MAX_PORTFOLIO_USE) / Decimal(n)
+
+    bought_any = False
+    for sym in to_buy_syms:
+        order = safe_market_buy(sym, allocation_each)
+        if order:
+            # inicializa/actualiza posición
+            refresh_position_from_account(sym)
+            # si position nueva, fija entry como precio actual y peak=entry
+            if sym in _POSITIONS:
+                _POSITIONS[sym]["entry"] = last_price(sym)
+                _POSITIONS[sym]["peak"]  = _POSITIONS[sym]["entry"]
+                _POSITIONS[sym]["ts_entry"] = now_ts()
+            bought_any = True
+
+    if bought_any:
+        _LAST_GLOBAL_BUY = now_ts()
+
+# =========================
+# Ciclo: precache de precios, balances, actualizar indicadores
 # =========================
 def precache_prices_and_balances():
     global _price_cache, _bal_free, _bal_locked
-    # Precios en 1 llamada
+    # Precios
     try:
         tickers = client.get_all_tickers()
         _price_cache = {t['symbol']: Decimal(t['price']) for t in tickers}
     except Exception as e:
         log.error(f"❌ Error al cargar precios: {e}")
         _price_cache = {}
-    # Balances en 1 llamada
+    # Balances
     try:
         acc = client.get_account()
         free = {}; locked = {}
@@ -319,61 +473,35 @@ def precache_prices_and_balances():
         log.error(f"❌ Error al cargar balances: {e}")
         _bal_free, _bal_locked = {}, {}
 
-# =========================
-# Escaneo por símbolo
-# =========================
-def scan_symbol(symbol: str):
-    try:
-        # valida reglas (cacheadas)
-        get_symbol_rules(symbol)
-    except Exception as e:
-        log.warning(f"⚠️ {symbol}: símbolo no válido o sin info: {e}")
-        return
-
-    px = last_price(symbol)
-    if px is None:
-        log.warning(f"⚠️ {symbol}: sin precio en cache.")
-        return
-
-    update_tick_mem(symbol, px)
-    # Sincroniza estado con saldo real
-    if have_position(symbol) and symbol not in _POSITIONS:
-        refresh_position_from_account(symbol)
-    if (not have_position(symbol)) and (symbol in _POSITIONS):
-        _POSITIONS.pop(symbol, None)
-
-    sig = compute_signal(symbol)
-    action = sig["action"]; pnl = sig.get("pnl")
-
-    if action.startswith("SELL"):
-        if should_skip(symbol): return
-        if not have_position(symbol): return
-        reasons = {"SELL_TP": "TP", "SELL_SL": "SL", "SELL_TRAIL": "TRAIL"}
-        reason = reasons.get(action, "SIG")
-        log.info(f"💰 Vendiendo {symbol} por {reason}. PnL={pnl and round(float(pnl)*100, 2)}%")
-        order = safe_market_sell(symbol)
-        if order: on_sell_filled(symbol, order, reason)
-
-    elif action == "BUY":
-        if sold_recently(symbol): return
-        if have_position(symbol): return
-        order = safe_market_buy(symbol)
-        if order: on_buy_filled(symbol, order)
-
-    # HOLD => nada
-
 def scan_loop():
     start = time.time()
-    # 1) precargar precios y balances una sola vez
+
+    # 1) cache precios + balances en 2 llamadas
     precache_prices_and_balances()
 
+    # 2) actualizar indicadores con precio actual
     for sym in WATCHLIST:
-        # cortar si nos vamos a comer el siguiente ciclo
+        # corta si se alarga demasiado el ciclo
         if time.time() - start > SCAN_SEC - 1:
             log.warning("⏱️ Ciclo se alarga, corto para evitar 'skipped'.")
             break
-        scan_symbol(sym)
-        time.sleep(0.02)  # pequeño respiro
+        try:
+            # valida reglas solo 1a vez (cache)
+            get_symbol_rules(sym)
+        except Exception as e:
+            log.warning(f"⚠️ {sym}: sin info de exchange: {e}")
+            continue
+
+        px = _price_cache.get(sym)
+        if px is None:
+            continue
+
+        _TICK_MEM[sym].append(px)
+        update_indicators(sym, px)
+        time.sleep(0.01)
+
+    # 3) aplicar lógica de trading (salidas + entradas)
+    evaluate_and_trade()
 
 # =========================
 # Main
@@ -387,18 +515,17 @@ def main():
         log.warning(f"⚠️ BOT_TZ='{BOT_TZ_STR}' no válida. Uso UTC.")
 
     log.info("🤖 Bot iniciado. Escaneando…")
-    tg_send("🚀 Bot cripto iniciado y listo.")
+    tg_send("🚀 Bot cripto iniciado y listo. Modo: máx 2 posiciones, 100% cartera.")
 
-    # Scheduler con coalesce y job único
+    # Scheduler compacto y sin solapamiento
     sched = BackgroundScheduler(
         timezone=tz,
         job_defaults={"coalesce": True, "misfire_grace_time": SCAN_SEC}
     )
     sched.add_job(scan_loop, 'interval', seconds=SCAN_SEC, max_instances=1, id="scan", replace_existing=True)
-    # (opcional) heartbeat cada 15 min
-    sched.add_job(lambda: tg_send("💓 Heartbeat: bot en marcha."), 'interval', minutes=15, id="heartbeat",
-                  coalesce=True, max_instances=1, replace_existing=True)
-
+    # Heartbeat opcional
+    sched.add_job(lambda: tg_send("💓 Heartbeat: bot en marcha."), 'interval', minutes=15,
+                  id="heartbeat", coalesce=True, max_instances=1, replace_existing=True)
     sched.start()
 
     try:
