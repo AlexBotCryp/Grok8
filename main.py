@@ -12,7 +12,6 @@ except Exception:
     pass
 
 import numpy as np
-from dateutil import tz
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from binance.streams import ThreadedWebsocketManager
@@ -40,8 +39,8 @@ def now_ts():
 def load_state():
     if not os.path.exists(STATE_PATH):
         return {
-            "positions": {},            # sym -> {entry, qty, best, opened_at, last_sell_at}
-            "pnl_history": {}, 
+            "positions": {},            # sym -> {entry, qty, best, opened_at}
+            "pnl_history": {},
             "tokens_used": 0,
             "last_open": {},            # sym -> iso datetime
             "last_close": {},           # sym -> iso datetime
@@ -55,10 +54,8 @@ def save_state(st):
     os.replace(tmp, STATE_PATH)
 
 def iso_to_dt(s):
-    try:
-        return datetime.fromisoformat(s.replace("Z","+00:00"))
-    except Exception:
-        return None
+    try: return datetime.fromisoformat(s.replace("Z","+00:00"))
+    except Exception: return None
 
 # ------------------ Mini HTTP (Render health) ------------------
 def start_http_server():
@@ -141,11 +138,11 @@ TRAIL_PCT       = parse_float(env("TRAIL_PCT","0.004"), 0.004)        # 0.4%
 MIN_ORDER_USD   = parse_float(env("MIN_ORDER_USD","5"), 5)            # tickets pequeños si el par lo acepta
 ALLOCATION_PCT  = parse_float(env("ALLOCATION_PCT","0.15"), 0.15)     # % por trade (diversifica)
 MAX_OPEN_POSITIONS = int(env("MAX_OPEN_POSITIONS","6"))
-MAX_SYMBOL_EXPOSURE_PCT = parse_float(env("MAX_SYMBOL_EXPOSURE_PCT","0.35"), 0.35)  # tope por símbolo sobre equity total
+MAX_SYMBOL_EXPOSURE_PCT = parse_float(env("MAX_SYMBOL_EXPOSURE_PCT","0.35"), 0.35)  # tope por símbolo / equity
 MAX_BUYS_PER_LOOP = int(env("MAX_BUYS_PER_LOOP","3"))
 
-COOLDOWN_MIN = int(env("COOLDOWN_MIN","10"))           # min tras cerrar para volver a abrir el MISMO símbolo
-OPEN_COOLDOWN_MIN = int(env("OPEN_COOLDOWN_MIN","3"))  # min tras abrir para no reabrir en seguida
+COOLDOWN_MIN = int(env("COOLDOWN_MIN","10"))           # min tras cerrar para reentrar mismo símbolo
+OPEN_COOLDOWN_MIN = int(env("OPEN_COOLDOWN_MIN","3"))  # min tras abrir para no reabrir enseguida
 
 DAILY_MAX_LOSS_USD = parse_float(env("DAILY_MAX_LOSS_USD","25"), 25)
 FEE_PCT = parse_float(env("FEE_PCT","0.001"), 0.001)
@@ -155,6 +152,11 @@ DEBUG = env("DEBUG","true").lower()=="true"
 SEED_KLINES_ON_START = env("SEED_KLINES_ON_START","true").lower()=="true"
 FORCE_BUY_SYMBOL = env("FORCE_BUY_SYMBOL","").strip().upper()
 FORCE_BUY_USD = parse_float(env("FORCE_BUY_USD","0"), 0.0)
+
+# Scalping/rotación
+SCALP_ENV = os.getenv("SCALP_MIN_PROFIT_PCT")
+SCALP_MIN_PROFIT_PCT = parse_float(SCALP_ENV, 2 * FEE_PCT + 0.0002)  # por defecto ≈ comisiones ida+vuelta + 0.02%
+ROTATE_FOR_ENTRIES = env("ROTATE_FOR_ENTRIES","true").lower()=="true"
 
 # Grok (opcional)
 GROK_ENABLE = env("GROK_ENABLE","false").lower()=="true"
@@ -281,12 +283,10 @@ def build_auto_universe():
                 usdc_syms.append(sym)
             except Exception:
                 continue
-        # ordenar por volumen 24h (ticker)
-        tickers = client.get_ticker()  # lista
+        tickers = client.get_ticker()
         vol_map = {t["symbol"]: float(t.get("quoteVolume",0.0)) for t in tickers}
         usdc_syms.sort(key=lambda x: vol_map.get(x,0.0), reverse=True)
-        if UNIVERSE_MAX>0:
-            usdc_syms = usdc_syms[:UNIVERSE_MAX]
+        if UNIVERSE_MAX>0: usdc_syms = usdc_syms[:UNIVERSE_MAX]
         if usdc_syms:
             SYMBOLS = usdc_syms
             print(f"[UNIVERSE] AUTO: {len(SYMBOLS)} símbolos USDC top volumen", flush=True)
@@ -318,10 +318,8 @@ def get_free_usdc():
     return get_all_balances().get("USDC", 0.0)
 
 def portfolio_value_usdc():
-    """USDC + sum(coin_qty * last_price in USDC) para todos los símbolos en MARKET."""
     bals = get_all_balances()
     total = float(bals.get("USDC", 0.0))
-    # mapea asset->qty (sin USDC)
     for asset, qty in bals.items():
         if asset in ("USDC","BUSD","USD"): continue
         if qty <= 0: continue
@@ -329,15 +327,12 @@ def portfolio_value_usdc():
         try:
             px = get_last_price(sym, fallback_rest=False)
         except Exception:
-            try:
-                px = float(client.get_symbol_ticker(symbol=sym)["price"])
-            except Exception:
-                px = 0.0
+            try: px = float(client.get_symbol_ticker(symbol=sym)["price"])
+            except Exception: px = 0.0
         total += qty * px
     return total
 
 def symbol_exposure_usdc(symbol):
-    """Notional actual invertido en 'symbol' según posición abierta (state)."""
     st = load_state()
     pos = st.get("positions", {}).get(symbol)
     if not pos: return 0.0
@@ -373,6 +368,52 @@ def place_sell(sym, qty):
     _invalidate_balance_cache()
     return order
 
+# ------------------ Helpers de PnL flotante / Rotación ------------------
+def unrealized_profit_pct(entry_price: float, current_price: float) -> float:
+    """
+    Rentabilidad NETa tras comisiones ida+vuelta:
+    (venta_neta - compra_neta) / compra_neta
+    """
+    buy_net = entry_price * (1 + FEE_PCT)
+    sell_net = current_price * (1 - FEE_PCT)
+    return (sell_net - buy_net) / buy_net
+
+def sell_best_profitable_position(st) -> bool:
+    """
+    Vende la posición con mayor ganancia neta >= SCALP_MIN_PROFIT_PCT.
+    Devuelve True si vendió algo.
+    """
+    best_sym = None
+    best_up = 0.0
+    for sym, pos in st.get("positions", {}).items():
+        try:
+            price = get_last_price(sym)
+            up = unrealized_profit_pct(pos["entry"], price)
+            if up > best_up:
+                best_up = up
+                best_sym = sym
+        except Exception:
+            continue
+
+    if best_sym is None:
+        return False
+
+    scalp_min = SCALP_MIN_PROFIT_PCT
+    if best_up >= scalp_min:
+        sym = best_sym
+        pos = st["positions"][sym]
+        qty = pos["qty"]
+        price = get_last_price(sym)
+        place_sell(sym, qty)
+        pnl = (price * (1 - FEE_PCT) - pos["entry"] * (1 + FEE_PCT)) * qty
+        add_realized_pnl(pnl)
+        st["positions"].pop(sym, None)
+        st.setdefault("last_close", {})[sym] = now_ts()
+        save_state(st)
+        tg_send(f"💡 SELL SCALP {sym} @ {price:.8f} | +{best_up*100:.2f}% neto | PnL ≈ {pnl:.2f} USDC")
+        return True
+    return False
+
 # ------------------ Seed de velas (REST, una vez) ------------------
 def seed_klines_once(symbols, interval, limit=200):
     try:
@@ -398,7 +439,6 @@ def seed_klines_once(symbols, interval, limit=200):
 
 # ------------------ Cooldowns ------------------
 def cooldown_open_allowed(st, sym):
-    # cooldown tras abrir
     ts = st.get("last_open", {}).get(sym)
     if not ts: return True
     dt = iso_to_dt(ts)
@@ -406,7 +446,6 @@ def cooldown_open_allowed(st, sym):
     return (datetime.now(timezone.utc) - dt) >= timedelta(minutes=OPEN_COOLDOWN_MIN)
 
 def cooldown_reentry_after_close_allowed(st, sym):
-    # cooldown tras cerrar
     ts = st.get("last_close", {}).get(sym)
     if not ts: return True
     dt = iso_to_dt(ts)
@@ -421,12 +460,9 @@ def evaluate_and_trade():
 
     st = load_state()
     buys_this_loop = 0
+    rotated_this_loop = False
 
-    # Control de nº de posiciones global
     open_positions = len(st.get("positions", {}))
-    if open_positions >= MAX_OPEN_POSITIONS:
-        if DEBUG: print(f"[RISK] Máx posiciones abiertas alcanzado ({open_positions}/{MAX_OPEN_POSITIONS})", flush=True)
-
     total_equity = portfolio_value_usdc()
     if DEBUG: print(f"[EQ] Equity total ≈ {total_equity:.2f} USDC | open={open_positions}", flush=True)
 
@@ -441,13 +477,18 @@ def evaluate_and_trade():
             closes = np.array(c, float); vols = np.array(v, float); price = float(closes[-1])
 
             # Indicadores
-            r = rsi(closes, RSI_LEN)
+            # RSI
+            delta = np.diff(closes)
+            up = np.where(delta>0,delta,0.0); down = np.where(delta<0,-delta,0.0)
+            roll_up = ema(up, RSI_LEN); roll_down = ema(down, RSI_LEN)
+            rs = np.divide(roll_up, roll_down, out=np.zeros_like(roll_up), where=roll_down!=0)
+            rsi_val = float(100 - (100/(1+rs[-1])))
+
             ema_f = ema(closes, EMA_FAST)
             ema_s = ema(closes, EMA_SLOW)
             vol_base = vols[-50:-1].mean() if len(vols)>50 else (vols.mean() if len(vols) else 0.0)
             vol_ok = vols[-1] > VOL_SPIKE * max(vol_base, 1e-9)
             trend_up = ema_f[-1] > ema_s[-1]
-            rsi_val = r[-1]
             atrp = atr_pct(h, l, c, 14)
 
             ema_cross_up = (ema_f[-2] <= ema_s[-2]) and (ema_f[-1] > ema_s[-1])
@@ -474,32 +515,47 @@ def evaluate_and_trade():
                 if price > best:
                     pos["best"] = price; best = price
 
+                # 1) TP por SCALPING (ganancia neta ≥ umbral)
+                up = unrealized_profit_pct(entry, price)
+                if up >= SCALP_MIN_PROFIT_PCT:
+                    place_sell(sym, qty)
+                    pnl = (price * (1 - FEE_PCT) - entry * (1 + FEE_PCT)) * qty
+                    add_realized_pnl(pnl)
+                    st["positions"].pop(sym, None)
+                    st.setdefault("last_close", {})[sym] = now_ts()
+                    save_state(st)
+                    tg_send(f"💡 SELL SCALP {sym} @ {price:.8f} | +{up*100:.2f}% neto | PnL ≈ {pnl:.2f} USDC")
+                    continue
+
+                # 2) TP clásico
                 if price >= tp_price:
                     place_sell(sym, qty)
                     pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
                     add_realized_pnl(pnl)
                     st["positions"].pop(sym, None)
-                    st.setdefault("last_close",{})[sym] = now_ts()
+                    st.setdefault("last_close", {})[sym] = now_ts()
                     save_state(st)
                     tg_send(f"✅ SELL TP {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
+                # 3) Trailing si va en verde
                 if best > entry and price <= best * (1 - TRAIL_PCT):
                     place_sell(sym, qty)
                     pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
                     add_realized_pnl(pnl)
                     st["positions"].pop(sym, None)
-                    st.setdefault("last_close",{})[sym] = now_ts()
+                    st.setdefault("last_close", {})[sym] = now_ts()
                     save_state(st)
                     tg_send(f"⚠️ SELL TRAIL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
 
+                # 4) Stop Loss
                 if price <= sl_price:
                     place_sell(sym, qty)
                     pnl = (price*(1-FEE_PCT) - entry*(1+FEE_PCT)) * qty
                     add_realized_pnl(pnl)
                     st["positions"].pop(sym, None)
-                    st.setdefault("last_close",{})[sym] = now_ts()
+                    st.setdefault("last_close", {})[sym] = now_ts()
                     save_state(st)
                     tg_send(f"❌ SELL SL {sym} @ {price:.8f} | PnL ≈ {pnl:.2f} USDC")
                     continue
@@ -516,12 +572,10 @@ def evaluate_and_trade():
                 if DEBUG: print(f"[SKIP] {sym} ATR% insuficiente ({atrp:.4f} < {MIN_EXPECTED_GAIN_PCT})", flush=True)
                 continue
 
-            # Cap de número de posiciones abiertas
             if open_positions >= MAX_OPEN_POSITIONS:
                 if DEBUG: print(f"[SKIP] {sym} límite global de posiciones ({open_positions}/{MAX_OPEN_POSITIONS})", flush=True)
                 continue
 
-            # Cooldowns por símbolo
             if not cooldown_open_allowed(st, sym):
                 if DEBUG: print(f"[SKIP] {sym} cooldown tras abrir", flush=True)
                 continue
@@ -529,25 +583,25 @@ def evaluate_and_trade():
                 if DEBUG: print(f"[SKIP] {sym} cooldown tras cerrar", flush=True)
                 continue
 
-            # Cap de exposición por símbolo
             sym_exp = symbol_exposure_usdc(sym)
             if total_equity > 0 and (sym_exp / total_equity) >= MAX_SYMBOL_EXPOSURE_PCT:
                 if DEBUG: print(f"[SKIP] {sym} exposición {sym_exp/total_equity:.2%} >= cap {MAX_SYMBOL_EXPOSURE_PCT:.0%}", flush=True)
                 continue
 
-            # Límite de compras por ciclo
             if buys_this_loop >= MAX_BUYS_PER_LOOP:
                 if DEBUG: print(f"[SKIP] {sym} límite buys loop ({buys_this_loop}/{MAX_BUYS_PER_LOOP})", flush=True)
                 continue
 
-            # Balance y tamaño
             usdc = get_free_usdc()
             if DEBUG: print(f"[BAL] USDC libre ≈ {usdc:.2f}", flush=True)
             if usdc < MIN_ORDER_USD:
                 if DEBUG: print(f"[SKIP] {sym} USDC insuficiente ({usdc:.2f} < {MIN_ORDER_USD})", flush=True)
+                # Intento de rotación (una vez por ciclo), vende la mejor en verde para liberar USDC
+                if ROTATE_FOR_ENTRIES and not rotated_this_loop:
+                    did = sell_best_profitable_position(st)
+                    rotated_this_loop = did
                 continue
 
-            # Calcula notional respetando cap por símbolo
             desired = max(MIN_ORDER_USD, usdc * ALLOCATION_PCT * 0.995)
             if total_equity > 0:
                 max_more_for_symbol = MAX_SYMBOL_EXPOSURE_PCT * total_equity - sym_exp
