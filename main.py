@@ -1,453 +1,464 @@
-#!/usr/bin/env python3
-import os, time, csv, signal, traceback
-from collections import deque
-from datetime import datetime, timezone
-from decimal import Decimal
+import os
+import time
+import json
+import math
+import logging
+import traceback
+from datetime import datetime, timedelta, timezone
 
 from binance.client import Client
-from binance.enums import *
-from binance.helpers import round_step_size
-from dotenv import load_dotenv
-import requests
+from binance.exceptions import BinanceAPIException, BinanceRequestException
 
-# =============== Utilidades ENV/tiempo/format =================
+# ---------------------- Config & Logs ----------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-def env_float(name: str, default: float) -> float:
-    """Admite coma o punto decimal en ENV."""
-    val = os.getenv(name)
-    if val is None or str(val).strip() == "":
-        return float(default)
-    return float(str(val).replace(",", ".").strip())
+API_KEY = os.getenv("BINANCE_API_KEY", "")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
-def env_int(name: str, default: int) -> int:
-    val = os.getenv(name)
-    return int(val) if val not in (None, "") else int(default)
+INTERVAL = os.getenv("INTERVAL", "1m")
+LOOKBACK = int(os.getenv("LOOKBACK", "120"))
+LOOP_SEC = int(os.getenv("LOOP_SEC", "20"))
 
-def env_bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None or str(val).strip() == "":
-        return default
-    return str(val).strip().lower() in ("1","true","yes","y")
+BASE = "USDC"
+USE_CAPITAL_PCT = float(os.getenv("USE_CAPITAL_PCT", "1.0"))
+MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "20"))
 
-def now_ts() -> float:
-    return time.time()
+WATCHLIST = [s.strip().upper() for s in os.getenv(
+    "WATCHLIST",
+    "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,DOGEUSDC,TRXUSDC,XRPUSDC,ADAUSDC"
+).split(",") if s.strip()]
 
-def fmt_pct(x: float) -> str:
-    return f"{x*100:.3f}%"
+FEE_PCT = float(os.getenv("FEE_PCT", "0.001"))                 # 0.1% taker
+EXTRA_PROFIT_PCT = float(os.getenv("EXTRA_PROFIT_PCT", "0.001"))  # 0.1% extra
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.01"))      # 1% SL (0=off)
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.0"))               # 0.5% trailing
 
-# =================== Notificador + Logger =====================
+REBUY_COOLDOWN_MIN = int(os.getenv("REBUY_COOLDOWN_MIN", "5"))
+REENTRY_MIN_PCT = float(os.getenv("REENTRY_MIN_PCT", "0.005")) # 0.5%
 
-class Notifier:
-    def __init__(self, token: str, chat_id: str):
-        self.token = token
-        self.chat_id = chat_id
-        self.base = f"https://api.telegram.org/bot{self.token}/sendMessage" if token and chat_id else None
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    def send(self, msg: str):
-        if not self.base:  # Telegram no configurado
-            return
+STATE_FILE = "state.json"
+
+client = Client(API_KEY, API_SECRET)
+
+# ---------------------- Utils ----------------------
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"last_exit": {}, "trailing": {}, "cooldown": {}}
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_exit": {}, "trailing": {}, "cooldown": {}}
+
+def save_state(state):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_FILE)
+
+def notify(msg: str):
+    logging.info(msg)
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            requests.post(self.base, data={"chat_id": self.chat_id, "text": msg}, timeout=5)
-        except Exception:
-            pass
-
-def make_logger(notifier: Notifier):
-    def log(msg: str):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] {msg}"
-        print(line, flush=True)       # siempre a consola (Render)
-        notifier.send(line)           # y a Telegram si está
-    return log
-
-# ===================== Bot Micro-Oportunidades =================
-
-class MicroScalpBot:
-    def __init__(self):
-        load_dotenv()
-
-        # ---------- Configuración ----------
-        self.API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
-        self.API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
-        self.TESTNET = env_bool("BINANCE_TESTNET", False)
-
-        self.QUOTE = os.getenv("QUOTE_ASSET", "USDC").strip().upper()
-        wl = os.getenv("WATCHLIST", "")
-        self.WATCHLIST = [s.strip().upper() for s in wl.split(",") if s.strip()] or \
-            ["BTCUSDC","ETHUSDC","SOLUSDC","BNBUSDC","DOGEUSDC","TRXUSDC","XRPUSDC","ADAUSDC"]
-
-        self.SCAN_INTERVAL = env_int("SCAN_INTERVAL_SEC", 5)
-        self.MAX_POS = env_int("MAX_POSITIONS", 4)
-
-        self.ALLOC_MODE = os.getenv("ALLOC_MODE", "ALL").strip().upper()  # ALL o FIXED
-        self.FIXED_TRADE_USD = env_float("FIXED_TRADE_USD", 50.0)
-        self.MIN_TRADE_USD = env_float("MIN_TRADE_USD", 20.0)
-
-        # Objetivos y Riesgo (siempre DECIMAL con punto)
-        self.TARGET_NET_PCT = env_float("TARGET_NET_PCT", 0.004)   # 0.4% neto
-        self.TRAIL_PCT = env_float("TRAIL_PCT", 0.004)             # 0.4% trailing
-        self.STOP_LOSS_PCT = env_float("STOP_LOSS_PCT", 0.006)     # 0.6% SL
-        self.TIMEOUT_SELL_SEC = env_int("TIMEOUT_SELL_SEC", 900)   # 15 min
-
-        # Filtros de entrada
-        self.MOMENTUM_PCT = env_float("MOMENTUM_PCT", 0.001)       # +0.1%
-        self.MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", 0.0006)  # 0.06%
-
-        # Varios
-        self.BALANCE_REFRESH_SEC = env_int("BALANCE_REFRESH_SEC", 30)
-        self.LOG_CSV = os.getenv("LOG_TRADES_CSV", "trades.csv")
-        self.DRY_RUN = env_bool("DRY_RUN", False)
-
-        # Logger / Telegram
-        self.TELE_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        self.TELE_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        self.notify = Notifier(self.TELE_TOKEN, self.TELE_CHAT)
-        self.log = make_logger(self.notify)
-
-        # Resumen arranque
-        self.log("🚀 Iniciando Bot Micro-Oportunidades (scalping)")
-        self.log(f"TESTNET={self.TESTNET}  DRY_RUN={self.DRY_RUN}")
-        self.log(f"QUOTE={self.QUOTE}  WATCHLIST={','.join(self.WATCHLIST)}")
-        self.log(f"TARGET_NET={fmt_pct(self.TARGET_NET_PCT)}  TRAIL={fmt_pct(self.TRAIL_PCT)}  SL={fmt_pct(self.STOP_LOSS_PCT)}")
-        if not (self.TELE_TOKEN and self.TELE_CHAT):
-            self.log("ℹ️ Telegram no configurado (TELEGRAM_BOT_TOKEN/CHAT_ID). Enviaré logs solo a consola.")
-        if not self.API_KEY or not self.API_SECRET:
-            self.log("⚠️ BINANCE_API_KEY/SECRET vacíos: leeré precios pero NO podré operar.")
-
-        # Cliente Binance
-        try:
-            self.client = Client(self.API_KEY, self.API_SECRET, testnet=self.TESTNET)
-            self.log("✅ Cliente Binance creado.")
+            import requests
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+            )
         except Exception as e:
-            self.log(f"❌ Error creando cliente Binance: {e}")
-            raise
+            logging.warning(f"[TG] {e}")
 
-        # Exchange info / filtros
-        self.filters = {}
-        self.base_asset = {}
-        self.quote_asset = {}
-        self._load_exchange_info()
+def round_step(value, step):
+    if step is None:
+        return value
+    precision = int(round(-math.log10(float(step))))
+    return float(f"{value:.{precision}f}")
 
-        # Fees
-        self.taker_fee = {}
-        self._load_fees()
+def get_symbol_filters(symbol_info):
+    lot_step = None
+    price_tick = None
+    min_notional = None
+    min_qty = None
+    for f in symbol_info.get("filters", []):
+        if f["filterType"] == "LOT_SIZE":
+            lot_step = float(f["stepSize"])
+            min_qty = float(f["minQty"])
+        elif f["filterType"] == "PRICE_FILTER":
+            price_tick = float(f["tickSize"])
+        elif f["filterType"] in ("NOTIONAL", "MIN_NOTIONAL"):
+            # Some markets use NOTIONAL, older MIN_NOTIONAL exists too
+            min_notional = float(f.get("minNotional") or f.get("notional"))
+    return lot_step, price_tick, min_notional, min_qty
 
-        # Balances
-        self.last_balance_ts = 0
-        self.free_balances = {}
-        self._refresh_balances(force=True)
+def fetch_klines(symbol, interval, limit):
+    # Small sleep to avoid weight spikes when scanning many symbols
+    time.sleep(0.05)
+    return client.get_klines(symbol=symbol, interval=interval, limit=limit)
 
-        # Estado
-        self.positions = {}  # symbol -> {qty, entry, peak, ts, spent_usd}
-        self.price_hist = {s: deque(maxlen=12) for s in self.WATCHLIST}
-        self._running = True
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+def closes_from_klines(kl):
+    return [float(x[4]) for x in kl]
 
-        # CSV header
-        if not os.path.exists(self.LOG_CSV):
-            with open(self.LOG_CSV, "w", newline="") as f:
-                csv.writer(f).writerow(["ts","action","symbol","qty","price","pnl_pct","note"])
+def ema(series, period):
+    if len(series) < period:
+        return []
+    k = 2 / (period + 1)
+    ema_vals = [sum(series[:period]) / period]
+    for price in series[period:]:
+        ema_vals.append(price * k + ema_vals[-1] * (1 - k))
+    # pad to same length
+    pad = [None] * (len(series) - len(ema_vals))
+    return pad + ema_vals
 
-        self.log("🤖 Bot iniciado. Comenzando escaneo…")
-        # Ping de bienvenida más detallado
-        self.notify.send(f"✅ Bot listo\nQUOTE={self.QUOTE}\nWATCHLIST={','.join(self.WATCHLIST)}\n"
-                         f"SCAN={self.SCAN_INTERVAL}s  MAX_POS={self.MAX_POS}\n"
-                         f"TARGET_NET={fmt_pct(self.TARGET_NET_PCT)}  TRAIL={fmt_pct(self.TRAIL_PCT)}  SL={fmt_pct(self.STOP_LOSS_PCT)}")
+def rsi(series, period=14):
+    if len(series) < period + 1:
+        return []
+    gains, losses = [], []
+    for i in range(1, period + 1):
+        ch = series[i] - series[i-1]
+        gains.append(max(ch, 0))
+        losses.append(abs(min(ch, 0)))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    rsis = []
+    for i in range(period + 1, len(series)):
+        ch = series[i] - series[i-1]
+        gain = max(ch, 0)
+        loss = abs(min(ch, 0))
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        rs = (avg_gain / avg_loss) if avg_loss != 0 else 999999
+        rsis.append(100 - (100 / (1 + rs)))
+    pad = [None] * (len(series) - len(rsis))
+    return pad + rsis
 
-    # ------------------ Inicialización helpers -----------------
+def get_price(symbol):
+    return float(client.get_symbol_ticker(symbol=symbol)["price"])
 
-    def _handle_signal(self, *args):
-        self._running = False
-        self.log("🛑 Señal de parada recibida. Cerrando…")
+def account_free(asset):
+    balances = client.get_asset_balance(asset=asset)
+    if not balances:
+        return 0.0
+    return float(balances["free"]) + float(balances["locked"]) * 0.0
 
-    def _load_exchange_info(self):
-        self.log("⏳ Cargando exchange info…")
-        info = self.client.get_exchange_info()
-        for s in info["symbols"]:
-            if s["status"] != "TRADING":
+def get_symbol_info_cached(cache, symbol):
+    if symbol not in cache:
+        cache[symbol] = client.get_symbol_info(symbol)
+    return cache[symbol]
+
+def can_reenter(state, symbol, current_price):
+    # Cooldown check
+    cd = state.get("cooldown", {}).get(symbol)
+    if cd:
+        if now_utc().timestamp() < cd:
+            return False, f"en cooldown hasta {datetime.fromtimestamp(cd, tz=timezone.utc)}"
+    # Variación mínima desde la última salida
+    le = state.get("last_exit", {}).get(symbol)
+    if le:
+        last_px = le.get("price")
+        if last_px:
+            diff = abs(current_price - last_px) / last_px
+            if diff < REENTRY_MIN_PCT:
+                return False, f"variación {diff:.4f} < REENTRY_MIN_PCT {REENTRY_MIN_PCT:.4f}"
+    return True, ""
+
+def set_cooldown(state, symbol):
+    expire = now_utc() + timedelta(minutes=REBUY_COOLDOWN_MIN)
+    state.setdefault("cooldown", {})[symbol] = expire.timestamp()
+
+def record_exit(state, symbol, price):
+    state.setdefault("last_exit", {})[symbol] = {
+        "price": price,
+        "ts": now_utc().timestamp()
+    }
+    set_cooldown(state, symbol)
+
+def required_profit_pct():
+    # Beneficio mínimo que cubra comisiones ida+vuelta + margen extra
+    return 2 * FEE_PCT + EXTRA_PROFIT_PCT
+
+# ---------------------- Signals ----------------------
+def compute_signals(symbol):
+    k = fetch_klines(symbol, INTERVAL, LOOKBACK)
+    c = closes_from_klines(k)
+    if len(c) < 50:
+        return None
+    ema12 = ema(c, 12)
+    ema26 = ema(c, 26)
+    r14 = rsi(c, 14)
+    px = c[-1]
+    e12, e26, r = ema12[-1], ema26[-1], r14[-1]
+    if None in (e12, e26, r):
+        return None
+
+    # Señal de compra conservadora contra latigazos:
+    # - EMA12 > EMA26 (tendencia corta al alza)
+    # - RSI cruza al alza zona 35-55 (temprano pero con fuerza)
+    # - Confirmación: cierre actual > EMA12
+    buy = (e12 > e26) and (35 < r < 60) and (px > e12)
+
+    # Señal de venta:
+    # - Si ya tenemos posición, se usa gestión de beneficio/SL/trailling más abajo.
+    # Aquí solo devolvemos indicadores.
+    return {
+        "price": px,
+        "ema12": e12,
+        "ema26": e26,
+        "rsi": r,
+        "buy": buy
+    }
+
+# ---------------------- Orders ----------------------
+def place_market_buy(symbol, usdc_amount, sym_info_cache):
+    si = get_symbol_info_cached(sym_info_cache, symbol)
+    lot_step, _, min_notional, min_qty = get_symbol_filters(si)
+    price = get_price(symbol)
+    qty = usdc_amount / price
+
+    if min_notional and usdc_amount < min_notional:
+        raise ValueError(f"Notional {usdc_amount:.2f} < minNotional {min_notional}")
+
+    if min_qty and qty < min_qty:
+        qty = min_qty
+
+    if lot_step:
+        qty = max(qty, min_qty or 0)
+        qty = round_step(qty, lot_step)
+
+    order = client.order_market_buy(symbol=symbol, quantity=qty)
+    return order, price, qty
+
+def place_market_sell(symbol, qty, sym_info_cache):
+    si = get_symbol_info_cached(sym_info_cache, symbol)
+    lot_step, _, _, min_qty = get_symbol_filters(si)
+    if lot_step:
+        qty = round_step(qty, lot_step)
+    if min_qty and qty < min_qty:
+        raise ValueError(f"Qty {qty} < minQty {min_qty}")
+    order = client.order_market_sell(symbol=symbol, quantity=qty)
+    return order
+
+# ---------------------- Portfolio Helpers ----------------------
+def consolidate_dust_to_usdc(symbol_info_cache):
+    """Vende cualquier coin (del watchlist) que tenga saldo residual > minNotional a USDC."""
+    try:
+        acct = client.get_account()
+        balances = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+        for sym in WATCHLIST:
+            asset = sym.replace(BASE, "")
+            if asset == BASE:
                 continue
-            symbol = s["symbol"]
-            base = s["baseAsset"]; quote = s["quoteAsset"]
-            self.base_asset[symbol] = base
-            self.quote_asset[symbol] = quote
-            f = {"stepSize": None, "minQty": None, "minNotional": None, "tickSize": None}
-            for flt in s["filters"]:
-                t = flt["filterType"]
-                if t == "LOT_SIZE":
-                    f["stepSize"] = float(flt["stepSize"]); f["minQty"] = float(flt["minQty"])
-                elif t in ("MIN_NOTIONAL","NOTIONAL"):
-                    f["minNotional"] = float(flt.get("minNotional") or 0)
-                elif t == "PRICE_FILTER":
-                    f["tickSize"] = float(flt["tickSize"])
-            self.filters[symbol] = f
-
-        before = list(self.WATCHLIST)
-        self.WATCHLIST = [s for s in self.WATCHLIST if s in self.filters and self.quote_asset.get(s) == self.QUOTE]
-        if not self.WATCHLIST:
-            self.log(f"⚠️ WATCHLIST {before} no tiene pares con QUOTE={self.QUOTE}. Ajusto a defecto.")
-            self.WATCHLIST = [s for s in ["BTCUSDC","ETHUSDC","SOLUSDC","BNBUSDC","DOGEUSDC","TRXUSDC","XRPUSDC","ADAUSDC"]
-                              if self.quote_asset.get(s) == self.QUOTE]
-        self.log(f"✅ Watchlist final: {','.join(self.WATCHLIST)}")
-
-    def _load_fees(self):
-        """Robusto a respuestas como lista o dict; si falla, usa 0.1% por defecto."""
-        try:
-            resp = self.client.get_trade_fee()
-            items = []
-            if isinstance(resp, dict) and "tradeFee" in resp:
-                items = resp["tradeFee"]
-            elif isinstance(resp, list):
-                items = resp
-            else:
-                items = []
-
-            count = 0
-            for item in items:
-                sym = item.get("symbol")
-                taker = item.get("taker")
-                if sym is None or taker is None:
-                    continue
-                self.taker_fee[sym] = float(taker)
-                count += 1
-
-            if count > 0:
-                self.log(f"✅ Fees cargadas para {count} símbolos.")
-            else:
-                self.log("⚠️ No llegaron fees por símbolo; uso 0.1% por defecto.")
-        except Exception as e:
-            self.log(f"⚠️ No pude cargar fees, uso 0.1% por defecto. Detalle: {e}")
-
-    def _fee(self, symbol: str) -> float:
-        return self.taker_fee.get(symbol, 0.001)  # 0.1% default
-
-    def _refresh_balances(self, force: bool=False):
-        if not force and (now_ts() - self.last_balance_ts) < self.BALANCE_REFRESH_SEC:
-            return
-        try:
-            acc = self.client.get_account()
-            self.free_balances = {b["asset"]: float(b["free"]) for b in acc["balances"]}
-            self.last_balance_ts = now_ts()
-        except Exception as e:
-            self.log(f"⚠️ Error leyendo balances: {e}")
-
-    def _free(self, asset: str) -> float:
-        return float(self.free_balances.get(asset, 0.0))
-
-    # =================== Precios agregados =====================
-
-    def _all_prices(self) -> dict:
-        tickers = self.client.get_symbol_ticker()  # peso bajo, todos a la vez
-        return {t["symbol"]: float(t["price"]) for t in tickers}
-
-    def _all_book_tickers(self) -> dict:
-        books = self.client.get_orderbook_ticker()  # peso bajo, todos a la vez
-        return {b["symbol"]: (float(b["bidPrice"]), float(b["askPrice"])) for b in books}
-
-    # =================== Redondeos / filtros ===================
-
-    def _round_qty(self, symbol: str, qty: float) -> float:
-        step = (self.filters.get(symbol) or {}).get("stepSize") or 0.0
-        if step > 0:
-            # redondeo hacia abajo a múltiplo de step
-            return float(Decimal(str(qty)) // Decimal(str(step)) * Decimal(str(step)))
-        return float(f"{qty:.8f}")
-
-    def _min_notional_ok(self, symbol: str, price: float, qty: float) -> bool:
-        mn = (self.filters.get(symbol) or {}).get("minNotional") or 0.0
-        return (price * qty) >= max(mn, self.MIN_TRADE_USD)
-
-    # ======================= Órdenes ===========================
-
-    def _buy_market(self, symbol: str, quote_usd: float):
-        if self.DRY_RUN:
-            self.log(f"(DRY_RUN) BUY {symbol} ≈{quote_usd:.2f} {self.QUOTE}")
-            return {"fills":[{"price":"0","qty":"0"}], "executedQty":"0"}
-        qo = max(quote_usd, self.MIN_TRADE_USD)
-        return self.client.create_order(
-            symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET,
-            quoteOrderQty=str(qo)
-        )
-
-    def _sell_market(self, symbol: str, qty: float):
-        if self.DRY_RUN:
-            self.log(f"(DRY_RUN) SELL {symbol} qty≈{qty}")
-            return {"fills":[{"price":"0","qty": str(qty)}], "executedQty": str(qty)}
-        return self.client.create_order(
-            symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET,
-            quantity=str(qty)
-        )
-
-    # ===================== Estrategia ==========================
-
-    def _calc_net_change(self, symbol: str, entry: float, current_bid: float) -> float:
-        """Retorno neto considerando fee compra+venta."""
-        fee = self._fee(symbol)
-        net_mult = (current_bid * (1 - fee)) / (entry * (1 + fee))
-        return net_mult - 1.0
-
-    def _try_enter(self, symbol: str, bid: float, ask: float):
-        # Plazas libres
-        if len(self.positions) >= self.MAX_POS:
-            return
-
-        hist = self.price_hist[symbol]
-        last_mid = hist[-1] if len(hist) else None
-        if last_mid is None:
-            return
-
-        # Spread y momentum
-        spread_pct = (ask - bid) / ask if ask > 0 else 1.0
-        if spread_pct > self.MAX_SPREAD_PCT:
-            return
-        momentum_pct = (ask / last_mid) - 1.0
-        if momentum_pct < self.MOMENTUM_PCT:
-            return
-
-        # Capital
-        self._refresh_balances()
-        quote_free = self._free(self.QUOTE)
-        quote_to_spend = quote_free if self.ALLOC_MODE == "ALL" else min(quote_free, self.FIXED_TRADE_USD)
-        if quote_to_spend < self.MIN_TRADE_USD:
-            return
-
-        try:
-            order = self._buy_market(symbol, quote_to_spend)
-            avg_price = ask  # aproximar (DRY_RUN / fills omitidos)
-            self._refresh_balances(force=True)
-            base = self.base_asset[symbol]
-            base_free = self._free(base)
-            if base_free <= 0:
-                return
-
-            self.positions[symbol] = {
-                "qty": base_free,
-                "entry": avg_price,
-                "peak": avg_price,
-                "ts": now_ts(),
-                "spent_usd": quote_to_spend
-            }
-            self._record_trade("BUY", symbol, base_free, avg_price, note=f"spent≈{quote_to_spend:.2f} {self.QUOTE}")
-            self.log(f"🟢 BUY {symbol} qty≈{base_free:.6f} entry≈{avg_price:.8g} spread {fmt_pct(spread_pct)} mom {fmt_pct(momentum_pct)}")
-
-        except Exception as e:
-            self.log(f"⚠️ Error BUY {symbol}: {e}\n{traceback.format_exc()}")
-
-    def _try_exit(self, symbol: str, bid: float, ask: float):
-        if symbol not in self.positions:
-            return
-        pos = self.positions[symbol]
-        qty = pos["qty"]; entry = pos["entry"]; peak = pos["peak"]; ts = pos["ts"]
-
-        mid = (bid + ask) / 2.0
-        if mid > peak:
-            pos["peak"] = mid
-            peak = mid
-
-        net_change = self._calc_net_change(symbol, entry, bid)
-        drawdown_from_peak = (peak - bid) / peak if peak > 0 else 0.0
-        age = now_ts() - ts
-
-        should_sell = False
-        reason = ""
-
-        # 1) Take Profit neto
-        if net_change >= self.TARGET_NET_PCT:
-            should_sell = True; reason = f"TP net {fmt_pct(self.TARGET_NET_PCT)} ({fmt_pct(net_change)})"
-        # 2) Trailing (solo si vamos en ganancia bruta)
-        elif drawdown_from_peak >= self.TRAIL_PCT and bid > entry:
-            should_sell = True; reason = f"Trailing {fmt_pct(self.TRAIL_PCT)}"
-        # 3) Stop-loss duro
-        elif ((bid / entry) - 1.0) <= -self.STOP_LOSS_PCT:
-            should_sell = True; reason = f"Stop-loss {fmt_pct(self.STOP_LOSS_PCT)}"
-        # 4) Timeout
-        elif age >= self.TIMEOUT_SELL_SEC:
-            if net_change > 0:
-                should_sell = True; reason = f"Timeout {self.TIMEOUT_SELL_SEC}s con net +"
-            elif net_change <= -min(self.STOP_LOSS_PCT/2, 0.003):
-                should_sell = True; reason = f"Timeout SL suave"
-
-        if not should_sell:
-            return
-
-        qty_to_sell = self._round_qty(symbol, qty)
-        if qty_to_sell <= 0 or not self._min_notional_ok(symbol, bid, qty_to_sell):
-            return
-
-        try:
-            order = self._sell_market(symbol, qty_to_sell)
-            exit_price = bid
-            pnl_net = self._calc_net_change(symbol, entry, exit_price)
-            self._record_trade("SELL", symbol, qty_to_sell, exit_price, pnl_net, note=reason)
-            self.log(f"🔴 SELL {symbol} qty≈{qty_to_sell:.6f} exit≈{exit_price:.8g} PnL net {fmt_pct(pnl_net)} — {reason}")
-            del self.positions[symbol]
-        except Exception as e:
-            self.log(f"⚠️ Error SELL {symbol}: {e}\n{traceback.format_exc()}")
-
-    def _record_trade(self, action, symbol, qty, price, pnl_pct=None, note=""):
-        with open(self.LOG_CSV, "a", newline="") as f:
-            csv.writer(f).writerow([
-                datetime.now(timezone.utc).isoformat(),
-                action, symbol,
-                f"{qty:.8f}", f"{price:.8g}",
-                "" if pnl_pct is None else f"{pnl_pct:.6f}",
-                note
-            ])
-
-    # ===================== Bucle principal =====================
-
-    def run(self):
-        loop_count = 0
-        while self._running:
-            t0 = now_ts()
+            free = balances.get(asset, 0.0)
+            if free <= 0:
+                continue
             try:
-                prices = self._all_prices()
-                books = self._all_book_tickers()
-
-                # histórico mids
-                for sym in self.WATCHLIST:
-                    if sym in books:
-                        b,a = books[sym]; self.price_hist[sym].append((b+a)/2.0)
-                    elif sym in prices:
-                        p = prices[sym]; self.price_hist[sym].append(p)
-
-                # salidas primero
-                for sym in list(self.positions.keys()):
-                    if sym in books:
-                        b,a = books[sym]; self._try_exit(sym, b, a)
-                    elif sym in prices:
-                        p = prices[sym]; self._try_exit(sym, p, p)
-
-                # entradas
-                for sym in self.WATCHLIST:
-                    if sym in self.positions:
-                        continue
-                    if len(self.positions) >= self.MAX_POS:
-                        break
-                    if sym in books:
-                        b,a = books[sym]
-                    else:
-                        p = prices.get(sym)
-                        if not p: 
-                            continue
-                        b = a = p
-                    self._try_enter(sym, b, a)
-
-                loop_count += 1
-                # latido 1/min
-                if loop_count % max(1, int(60 / max(1, self.SCAN_INTERVAL))) == 0:
-                    self._refresh_balances()
-                    self.log(f"⏱️ Ciclos={loop_count}  Posiciones={len(self.positions)}  {self.QUOTE} libre≈{self._free(self.QUOTE):.4f}")
-
+                si = get_symbol_info_cached(symbol_info_cache, sym)
+                _, _, min_notional, _ = get_symbol_filters(si)
+                px = get_price(sym)
+                notional = free * px
+                if min_notional and notional < min_notional:
+                    continue
+                notify(f"Consolidando residuo: vendiendo {free} {asset} -> {BASE}")
+                place_market_sell(sym, free, symbol_info_cache)
+                time.sleep(0.3)
             except Exception as e:
-                self.log(f"⚠️ Loop error: {e}\n{traceback.format_exc()}")
+                logging.warning(f"[Consolidación] {sym}: {e}")
+                continue
+    except Exception as e:
+        logging.warning(f"[Consolidación general] {e}")
 
-            elapsed = now_ts() - t0
-            time.sleep(max(0, self.SCAN_INTERVAL - elapsed))
+def current_position(symbol_info_cache):
+    """Devuelve (symbol, asset_free_qty, price_now) si hay una única posición de watchlist (no USDC)."""
+    acct = client.get_account()
+    balances = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+    for sym in WATCHLIST:
+        asset = sym.replace(BASE, "")
+        free = balances.get(asset, 0.0)
+        if free and free > 0:
+            px = get_price(sym)
+            return sym, asset, free, px
+    return None, None, 0.0, 0.0
 
-        self.log("✅ Bot finalizado limpiamente.")
+def usdc_balance():
+    return account_free(BASE)
 
-# ========================== MAIN ==============================
+# ---------------------- Strategy Core ----------------------
+def select_candidate(state, sym_info_cache):
+    """Elige el mejor símbolo para comprar EXCLUYENDO el último vendido si incumple filtros."""
+    scored = []
+    for sym in WATCHLIST:
+        try:
+            sig = compute_signals(sym)
+            if not sig:
+                continue
 
+            px = sig["price"]
+            ok, why = can_reenter(state, sym, px)
+            # Permitimos comprar símbolos que NO estén en cooldown/variación bloqueada
+            if not ok:
+                # Lo excluimos del ranking si no está permitido reentrar
+                logging.debug(f"[{sym}] Excluido por filtro reentrada: {why}")
+                continue
+
+            # Ranking sencillo: RSI medio + distancia EMA12-EMA26
+            rank = 0.0
+            if sig["buy"]:
+                rank += 1.0
+            rank += max(0.0, sig["ema12"] - sig["ema26"]) / max(1e-9, sig["price"]) * 100
+            rank += max(0.0, 55 - abs(50 - sig["rsi"]))  # favorece RSI ~50 (inicio impulso)
+            scored.append((rank, sym, sig))
+        except BinanceAPIException as e:
+            logging.warning(f"[{sym}] API: {e}")
+        except Exception as e:
+            logging.warning(f"[{sym}] {e}")
+
+    if not scored:
+        return None, None
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    best = scored[0]
+    return best[1], best[2]
+
+def manage_trailing(state, symbol, entry_px, current_px):
+    if TRAIL_PCT <= 0:
+        return False  # no trailing decision
+    t = state.setdefault("trailing", {}).get(symbol)
+    if not t:
+        # inicializa pico
+        state["trailing"][symbol] = {"peak": current_px, "armed": False}
+        return False
+    peak = t.get("peak", current_px)
+    armed = t.get("armed", False)
+    if current_px > peak:
+        peak = current_px
+        state["trailing"][symbol] = {"peak": peak, "armed": True}
+        return False
+    # Si baja TRAIL_PCT desde el máximo, dispara venta
+    if armed and (peak - current_px) / peak >= TRAIL_PCT:
+        return True
+    return False
+
+def strategy_loop():
+    state = load_state()
+    sym_info_cache = {}
+
+    # Consolidar residuos al arrancar (no bloqueante)
+    consolidate_dust_to_usdc(sym_info_cache)
+
+    notify("🤖 Bot iniciado. Escaneando…")
+
+    while True:
+        try:
+            # ¿Tenemos posición abierta en alguna del watchlist?
+            sym_pos, asset, qty, px_now = current_position(sym_info_cache)
+            usdc = usdc_balance()
+
+            if sym_pos:
+                # Gestionar salida: target de beneficio neto, stop loss, trailing
+                # Guardar/leer precio de entrada aproximado vía última orden no es trivial con market,
+                # así que estimamos por balance inicial vs actual. Simplificamos: recalculamos usando
+                # el último 'last_exit' como referencia inversa si existiera. Para mayor precisión podrías
+                # persistir 'last_entry' en el estado con el precio de ejecución.
+                # Aquí optamos por consultar la media de las últimas velas como fallback del entry.
+                sig = compute_signals(sym_pos)
+                if not sig:
+                    time.sleep(LOOP_SEC)
+                    continue
+
+                current_px = sig["price"]
+
+                # Estimar entry: si tenemos trailing state con 'peak', usamos primera asignación como pista.
+                # Para un entry robusto, añadimos un campo 'last_entry' al estado cuando compremos.
+                entry_info = load_state()  # recarga ligera por si se editó en otra ruta
+                last_entry = entry_info.get("last_entry", {}).get(sym_pos, {}).get("price")
+                if not last_entry:
+                    # fallback simple: suponer que compramos cerca del EMA12 al cruzar
+                    last_entry = sig["ema12"]
+
+                pnl = (current_px - last_entry) / last_entry if last_entry else 0.0
+                need = required_profit_pct()
+
+                do_trail = manage_trailing(state, sym_pos, last_entry, current_px)
+                hit_tp = pnl >= need
+                hit_sl = (STOP_LOSS_PCT > 0) and (pnl <= -STOP_LOSS_PCT)
+
+                if hit_tp or hit_sl or do_trail:
+                    reason = "TP" if hit_tp else ("SL" if hit_sl else "TRAIL")
+                    notify(f"💰 Vendiendo {asset} ({sym_pos}) por {reason}. PnL={pnl*100:.2f}%")
+                    try:
+                        place_market_sell(sym_pos, qty, sym_info_cache)
+                        save_state(state)  # guardar trailing/estado por si acaso
+                        # Registrar salida y activar cooldown
+                        record_exit(state, sym_pos, current_px)
+                        save_state(state)
+                    except Exception as e:
+                        notify(f"❌ Error al vender {sym_pos}: {e}")
+                    time.sleep(LOOP_SEC)
+                    continue
+
+                # Si no toca vender, no hacer nada
+                time.sleep(LOOP_SEC)
+                continue
+
+            # Si NO hay posición abierta, buscamos compra (rotación inteligente)
+            candidate, sig = select_candidate(state, sym_info_cache)
+            usdc = usdc_balance()
+            if candidate and sig and usdc * USE_CAPITAL_PCT >= MIN_ORDER_USD:
+                # Otra capa de seguridad: vuelve a chequear filtros anti-recompra
+                ok, why = can_reenter(state, candidate, sig["price"])
+                if not ok:
+                    logging.info(f"Rechazado {candidate} por reentry: {why}")
+                    time.sleep(LOOP_SEC)
+                    continue
+
+                if not sig["buy"]:
+                    # No forzamos compra si la señal no es clara
+                    time.sleep(LOOP_SEC)
+                    continue
+
+                capital = usdc * USE_CAPITAL_PCT
+                capital = max(capital, 0.0)
+                if capital < MIN_ORDER_USD:
+                    time.sleep(LOOP_SEC)
+                    continue
+
+                try:
+                    order, exec_px, qty = place_market_buy(candidate, capital, sym_info_cache)
+                    notify(f"🛒 Comprado {candidate} qty={qty} ~{exec_px:.6f} con {capital:.2f} {BASE}")
+                    # Persistir precio de entrada para TP/SL
+                    st = load_state()
+                    st.setdefault("last_entry", {})[candidate] = {
+                        "price": exec_px,
+                        "ts": now_utc().timestamp()
+                    }
+                    # Resetear trailing para el símbolo
+                    st.setdefault("trailing", {})[candidate] = {"peak": exec_px, "armed": False}
+                    save_state(st)
+                except Exception as e:
+                    notify(f"❌ Error al comprar {candidate}: {e}")
+
+            time.sleep(LOOP_SEC)
+
+        except BinanceAPIException as e:
+            logging.warning(f"[BinanceAPI] {e}")
+            time.sleep(2)
+        except BinanceRequestException as e:
+            logging.warning(f"[BinanceRequest] {e}")
+            time.sleep(2)
+        except Exception as e:
+            logging.error(f"Loop error: {e}\n{traceback.format_exc()}")
+            time.sleep(3)
+
+# ---------------------- Entry ----------------------
 if __name__ == "__main__":
-    bot = MicroScalpBot()
-    bot.run()
+    if not API_KEY or not API_SECRET:
+        raise SystemExit("Faltan BINANCE_API_KEY / BINANCE_API_SECRET")
+    strategy_loop()
