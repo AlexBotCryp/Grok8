@@ -1,4 +1,4 @@
 python-binance==1.0.19
-pandas==2.2.2
-numpy==1.26.4
+APScheduler==3.10.4
 requests==2.32.3
+urllib3==2.2.2
