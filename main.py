@@ -13,8 +13,8 @@ from binance.exceptions import BinanceAPIException
 # ========= Config por entorno =========
 API_KEY        = os.getenv("BINANCE_API_KEY", "")
 API_SECRET     = os.getenv("BINANCE_API_SECRET", "")
-LIVE_MODE      = os.getenv("LIVE_MODE", "1") == "1"  # si 0 => dry-run
-BASE_ASSET     = os.getenv("FORCE_BASE", "USDC").upper()
+LIVE_MODE      = os.getenv("LIVE_MODE", "1") == "1"          # 0 => dry-run
+BASE_ASSET     = os.getenv("FORCE_BASE", "USDC").upper()     # USDC base
 
 AUTO_CONSOLIDATE   = os.getenv("AUTO_CONSOLIDATE", "1") == "1"
 DUST_MODE          = os.getenv("DUST_MODE", "IGNORE").upper()   # IGNORE o SELL
@@ -25,14 +25,22 @@ TP_PCT             = Decimal(os.getenv("TP_PCT", "0.006"))      # 0.6%
 SL_PCT             = Decimal(os.getenv("SL_PCT", "0.007"))      # 0.7%
 ALLOC_PCT          = Decimal(os.getenv("ALLOC_PCT", "1.0"))     # 100% del USDC libre
 STATE_PATH         = os.getenv("STATE_PATH", "state.json")
-WATCHLIST          = os.getenv("WATCHLIST", "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,DOGEUSDC,TRXUSDC,XRPUSDC,ADAUSDC,LTCUSDC")
 
-# --- Dinamizadores para que "se mueva" ---
-TRAIL_ARM_PCT      = Decimal(os.getenv("TRAIL_ARM_PCT", "0.003"))     # +0.30% arma trailing
+# Watchlist SOLO USDC (forzamos en tiempo de ejecución que terminen en USDC)
+WATCHLIST = os.getenv(
+    "WATCHLIST",
+    "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,DOGEUSDC,TRXUSDC,XRPUSDC,ADAUSDC,LTCUSDC"
+)
+
+# Dinamizadores para que "se mueva"
+TRAIL_ARM_PCT      = Decimal(os.getenv("TRAIL_ARM_PCT", "0.003"))      # +0.30% arma trailing
 TRAIL_GIVEBACK_PCT = Decimal(os.getenv("TRAIL_GIVEBACK_PCT", "0.0015"))# -0.15% desde el máximo => vender
-STALE_MIN          = int(os.getenv("STALE_MIN", "40"))                 # minutos max “plano”
-FLAT_PNL_PCT       = Decimal(os.getenv("FLAT_PNL_PCT", "0.0015"))      # ±0.15% se considera plano
-BE_EXIT_PCT        = Decimal(os.getenv("BE_EXIT_PCT", "0.0025"))       # +0.25% salida light (fees)
+STALE_MIN          = int(os.getenv("STALE_MIN", "40"))                  # minutos max “plano”
+FLAT_PNL_PCT       = Decimal(os.getenv("FLAT_PNL_PCT", "0.0015"))       # ±0.15% se considera plano
+BE_EXIT_PCT        = Decimal(os.getenv("BE_EXIT_PCT", "0.0025"))        # +0.25% salida ligera (fees)
+
+# Venta segura (evita insufficient balance por comisiones/decimales)
+SAFETY_SELL_PCT    = Decimal(os.getenv("SAFETY_SELL_PCT", "0.999"))     # vende 99.9%
 
 # Telegram
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -47,7 +55,6 @@ def err (msg): print(f"{LOG_PREFIX('ERROR')} {msg}")
 
 # ========= Telegram =========
 def tg_notify(text: str, parse_mode: str = "HTML", disable_web_page_preview: bool = True):
-    """Envía un mensaje a Telegram con reintentos básicos."""
     if TG_OFF or not TG_TOKEN or not TG_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -96,11 +103,11 @@ def save_state(st: dict):
 state = load_state()
 state.setdefault("base_asset", BASE_ASSET)
 state.setdefault("open_symbol", None)
-state.setdefault("open_qty", 0.0)
+state.setdefault("open_qty", 0.0)      # qty neta
 state.setdefault("avg_price", 0.0)
 state.setdefault("last_trade_ts", 0)
 state.setdefault("opened_ts", 0)       # epoch segs
-state.setdefault("high_water", 0.0)    # mejor PnL alcanzado desde que se abrió
+state.setdefault("high_water", 0.0)    # mejor PnL desde apertura
 
 # ========= Exchange info / filtros =========
 SYMBOL_INFO: Dict[str, dict] = {}
@@ -153,10 +160,7 @@ def last_price(symbol: str) -> Decimal:
 
 def get_klines(symbol: str, interval="1m", limit=60) -> List[dict]:
     raws = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-    kls = []
-    for k in raws:
-        kls.append({"c": Decimal(str(k[4]))})
-    return kls
+    return [{"c": Decimal(str(k[4]))} for k in raws]
 
 def ema(values: List[Decimal], period: int) -> Decimal:
     if not values: return Decimal("0")
@@ -231,7 +235,7 @@ def force_base_position_usdc():
             sell_all_to_usdc(a, q)
     usdc = free_balance(BASE_ASSET)
     info(f"💰 {BASE_ASSET} libre: {usdc:.2f}")
-    # Fija estado a sin posición
+    # Estado a sin posición
     state["open_symbol"] = None
     state["open_qty"] = 0.0
     state["avg_price"] = 0.0
@@ -241,7 +245,7 @@ def force_base_position_usdc():
     info("✅ Posición base forzada: USDC. Sin posición abierta.")
     tg_notify("✅ Bot iniciado y consolidado a <b>USDC</b>. Sin posición abierta.")
 
-# ========= Señal simple (EMA vs precio) =========
+# ========= Señal simple (precio vs EMA20) =========
 def score_symbol(symbol: str) -> Tuple[Decimal, dict]:
     try:
         kl = get_klines(symbol, limit=40)
@@ -256,31 +260,55 @@ def score_symbol(symbol: str) -> Tuple[Decimal, dict]:
         warn(f"{symbol} fallo señal: {e}")
         return Decimal("0"), {"reason":"error señal"}
 
-# ========= Órdenes =========
+# ========= Órdenes (compra guarda qty neta, venta usa saldo real + safety) =========
 def place_market_buy(symbol: str, usdc_to_spend: Decimal):
     px = last_price(symbol)
     if px <= 0:
         info(f"⛔ {symbol} sin precio válido.")
         tg_notify(f"⛔ {symbol} sin precio válido para comprar.")
         return None, None, None
+
     ex_min = min_notional(symbol)
     min_needed = ex_min if ex_min > 0 else MIN_NOTIONAL_USDC
     if usdc_to_spend < min_needed:
         info(f"⛔ Notional insuficiente ({usdc_to_spend:.2f} < {min_needed:.2f}) para {symbol}.")
         tg_notify(f"⛔ Notional insuficiente para {symbol}: <code>{usdc_to_spend:.2f} &lt; {min_needed:.2f}</code>")
         return None, None, None
-    qty = round_by_step(usdc_to_spend / px, lot_step(symbol))
-    if qty <= 0:
+
+    step = lot_step(symbol)
+    req_qty = usdc_to_spend / px
+    req_qty = round_by_step(req_qty, step) if step > 0 else req_qty
+    if req_qty <= 0:
         info(f"⛔ Qty redondeada es 0 para {symbol}.")
         tg_notify(f"⛔ Qty redondeada 0 para {symbol}.")
         return None, None, None
+
     if LIVE_MODE:
         try:
             o = client.create_order(symbol=symbol, side=SIDE_BUY,
-                                    type=ORDER_TYPE_MARKET, quantity=float(qty))
-            info(f"✅ COMPRA {symbol} qty={qty} notional≈{(qty*px):.2f}")
-            tg_notify(f"🟢 <b>COMPRA</b> {symbol}\nQty: <code>{qty}</code>\nPrecio≈<code>{px:.6f}</code>\nNotional≈<code>{(qty*px):.2f} USDC</code>")
-            return o, qty, px
+                                    type=ORDER_TYPE_MARKET, quantity=float(req_qty))
+            # Cantidad neta tras comisión (si la comisión fue en el mismo activo)
+            base_asset = symbol.replace(BASE_ASSET, "")
+            filled_qty = Decimal("0")
+            commission_in_base = Decimal("0")
+            if "fills" in o:
+                for f in o["fills"]:
+                    filled_qty += Decimal(str(f.get("qty", "0")))
+                    if f.get("commissionAsset") == base_asset:
+                        commission_in_base += Decimal(str(f.get("commission", "0")))
+            net_qty = filled_qty - commission_in_base
+            if net_qty <= 0:
+                # Fallback: leer del balance real
+                net_qty = free_balance(base_asset)
+
+            info(f"✅ COMPRA {symbol} qty_neta={net_qty} notional≈{(net_qty*px):.2f}")
+            tg_notify(
+                f"🟢 <b>COMPRA</b> {symbol}\n"
+                f"Qty neta: <code>{net_qty}</code>\n"
+                f"Precio≈<code>{px:.6f}</code>\n"
+                f"Notional≈<code>{(net_qty*px):.2f} USDC</code>"
+            )
+            return o, net_qty, px
         except BinanceAPIException as be:
             err(f"Orden BUY falló {symbol}: {be.message}")
             tg_notify(f"⛔ BUY falló {symbol}: <code>{be.message}</code>")
@@ -290,27 +318,40 @@ def place_market_buy(symbol: str, usdc_to_spend: Decimal):
             tg_notify(f"⛔ BUY falló {symbol}: <code>{e}</code>")
             return None, None, None
     else:
-        info(f"[DRY] BUY {symbol} qty={qty} notional≈{(qty*px):.2f}")
-        tg_notify(f"🟢 [DRY] COMPRA {symbol} qty=<code>{qty}</code> px≈<code>{px:.6f}</code>")
-        return {"dry": True}, qty, px
+        info(f"[DRY] BUY {symbol} qty={req_qty} notional≈{(req_qty*px):.2f}")
+        tg_notify(f"🟢 [DRY] COMPRA {symbol} qty=<code>{req_qty}</code> px≈<code>{px:.6f}</code>")
+        return {"dry": True}, req_qty, px
 
-def place_market_sell(symbol: str, qty: Decimal):
-    q = round_by_step(qty, lot_step(symbol))
+def place_market_sell(symbol: str, qty_hint: Decimal):
+    base_asset = symbol.replace(BASE_ASSET, "")
+    free_asset = free_balance(base_asset)
+
+    qty_raw = min(qty_hint, free_asset) * SAFETY_SELL_PCT
+    step = lot_step(symbol)
+    q = round_by_step(qty_raw, step) if step > 0 else qty_raw
+
     if q <= 0:
-        info(f"⛔ Qty de venta redondeada es 0 para {symbol}.")
-        tg_notify(f"⛔ Qty de venta redondeada 0 para {symbol}.")
+        info(f"⛔ Qty venta 0 para {symbol} (free={free_asset}, hint={qty_hint}).")
+        tg_notify(f"⛔ Venta 0 para {symbol} (free={free_asset}, hint={qty_hint}).")
         return None
+
     if LIVE_MODE:
         try:
             o = client.create_order(symbol=symbol, side=SIDE_SELL,
                                     type=ORDER_TYPE_MARKET, quantity=float(q))
             px = last_price(symbol)
             info(f"✅ VENTA {symbol} qty={q} notional≈{(q*px):.2f}")
-            tg_notify(f"🔴 <b>VENTA</b> {symbol}\nQty: <code>{q}</code>\nPrecio≈<code>{px:.6f}</code>\nNotional≈<code>{(q*px):.2f} USDC</code>")
+            tg_notify(
+                f"🔴 <b>VENTA</b> {symbol}\n"
+                f"Qty: <code>{q}</code>\n"
+                f"Precio≈<code>{px:.6f}</code>\n"
+                f"Notional≈<code>{(q*px):.2f} USDC</code>"
+            )
             return o
         except BinanceAPIException as be:
             err(f"Orden SELL falló {symbol}: {be.message}")
-            tg_notify(f"⛔ SELL falló {symbol}: <code>{be.message}</code>")
+            tg_notify(f"⛔ SELL falló {symbol}: <code>{be.message}</code>\n"
+                      f"(free={free_asset} hint={qty_hint} q_try={q})")
             return None
         except Exception as e:
             err(f"Orden SELL falló {symbol}: {e}")
@@ -335,7 +376,7 @@ def manage_position():
         avg = Decimal(str(state.get("avg_price", 0)))
         qty = Decimal(str(state.get("open_qty", 0)))
         if avg <= 0 or qty <= 0:
-            info("⚠️ Estado inconsistente, cierro posición en memoria.")
+            info("⚠️ Estado inconsistente, cierro mem-pos.")
             state["open_symbol"] = None
             state["open_qty"] = 0.0
             state["avg_price"] = 0.0
@@ -348,7 +389,7 @@ def manage_position():
         opened_ts = int(state.get("opened_ts", 0))
         minutes_open = int((time.time() - opened_ts) / 60) if opened_ts else 0
 
-        # actualizar high-water (mejor PnL desde la apertura)
+        # Actualizar high-water (mejor PnL desde apertura)
         hw = Decimal(str(state.get("high_water", 0.0)))
         if pnl > hw:
             hw = pnl
@@ -358,6 +399,9 @@ def manage_position():
         # 1) TP directo
         if pnl >= TP_PCT:
             info(f"🎯 TP {sym} +{float(pnl)*100:.2f}% (avg={avg}, px={px})")
+            base_asset = sym.replace(BASE_ASSET, "")
+            free_asset = free_balance(base_asset)
+            info(f"🧮 Pre-SELL {sym}: hint_qty={qty} | free_asset={free_asset}")
             if place_market_sell(sym, qty):
                 state["open_symbol"] = None
                 state["open_qty"] = 0.0
@@ -369,25 +413,30 @@ def manage_position():
                 tg_notify(f"🎯 <b>TP</b> {sym} +{float(pnl)*100:.2f}%")
             return
 
-        # 2) Trailing: arma a +TRAIL_ARM_PCT y cierra si cede GIVEBACK desde el máximo
-        if hw >= TRAIL_ARM_PCT:
-            if (hw - pnl) >= TRAIL_GIVEBACK_PCT:
-                info(f"🏳️ Trailing {sym}: hw={float(hw)*100:.2f}% → pnl={float(pnl)*100:.2f}% "
-                     f"| giveback={float(hw-pnl)*100:.2f}%")
-                if place_market_sell(sym, qty):
-                    state["open_symbol"] = None
-                    state["open_qty"] = 0.0
-                    state["avg_price"] = 0.0
-                    state["opened_ts"] = 0
-                    state["high_water"] = 0.0
-                    state["last_trade_ts"] = int(time.time())
-                    save_state(state)
-                    tg_notify(f"🏳️ <b>Trailing</b> {sym} hw={float(hw)*100:.2f}% → pnl={float(pnl)*100:.2f}%")
-                return
+        # 2) Trailing armado y giveback
+        if hw >= TRAIL_ARM_PCT and (hw - pnl) >= TRAIL_GIVEBACK_PCT:
+            info(f"🏳️ Trailing {sym}: hw={float(hw)*100:.2f}% → pnl={float(pnl)*100:.2f}% "
+                 f"| giveback={float(hw-pnl)*100:.2f}%")
+            base_asset = sym.replace(BASE_ASSET, "")
+            free_asset = free_balance(base_asset)
+            info(f"🧮 Pre-SELL {sym}: hint_qty={qty} | free_asset={free_asset}")
+            if place_market_sell(sym, qty):
+                state["open_symbol"] = None
+                state["open_qty"] = 0.0
+                state["avg_price"] = 0.0
+                state["opened_ts"] = 0
+                state["high_water"] = 0.0
+                state["last_trade_ts"] = int(time.time())
+                save_state(state)
+                tg_notify(f"🏳️ <b>Trailing</b> {sym} hw={float(hw)*100:.2f}% → pnl={float(pnl)*100:.2f}%")
+            return
 
         # 3) SL clásico
         if (-pnl) >= SL_PCT:
             info(f"🛑 SL {sym} -{float(pnl)*100:.2f}% (avg={avg}, px={px})")
+            base_asset = sym.replace(BASE_ASSET, "")
+            free_asset = free_balance(base_asset)
+            info(f"🧮 Pre-SELL {sym}: hint_qty={qty} | free_asset={free_asset}")
             if place_market_sell(sym, qty):
                 state["open_symbol"] = None
                 state["open_qty"] = 0.0
@@ -399,9 +448,12 @@ def manage_position():
                 tg_notify(f"🛑 <b>SL</b> {sym} -{float(pnl)*100:.2f}%")
             return
 
-        # 4) Break-even con comisiones si no arma trailing y no toca TP
-        if pnl >= BE_EXIT_PCT and hw < TRAIL_ARM_PCT:
+        # 4) Break-even/fees si no arma trailing
+        if pnl >= BE_EXIT_PCT and Decimal(str(state.get("high_water", 0.0))) < TRAIL_ARM_PCT:
             info(f"🔄 BE/fees exit {sym}: pnl=+{float(pnl)*100:.2f}% (sin armar trailing)")
+            base_asset = sym.replace(BASE_ASSET, "")
+            free_asset = free_balance(base_asset)
+            info(f"🧮 Pre-SELL {sym}: hint_qty={qty} | free_asset={free_asset}")
             if place_market_sell(sym, qty):
                 state["open_symbol"] = None
                 state["open_qty"] = 0.0
@@ -416,6 +468,9 @@ def manage_position():
         # 5) Salida por estancamiento
         if minutes_open >= STALE_MIN and abs(pnl) < FLAT_PNL_PCT:
             info(f"⏱️ Estancamiento {sym}: {minutes_open} min con pnl={float(pnl)*100:.2f}% → rotación")
+            base_asset = sym.replace(BASE_ASSET, "")
+            free_asset = free_balance(base_asset)
+            info(f"🧮 Pre-SELL {sym}: hint_qty={qty} | free_asset={free_asset}")
             if place_market_sell(sym, qty):
                 state["open_symbol"] = None
                 state["open_qty"] = 0.0
@@ -434,7 +489,7 @@ def manage_position():
         warn(f"manage_position error: {e}")
         tg_notify(f"⚠️ manage_position error: <code>{e}</code>")
 
-# ========= Bucle de escaneo =========
+# ========= Apertura de posición (solo símbolos USDC válidos) =========
 def position_can_open_now() -> bool:
     if COOLDOWN_SEC <= 0: return True
     last = int(state.get("last_trade_ts", 0))
@@ -448,12 +503,12 @@ def position_can_open_now() -> bool:
 def scan_loop():
     info("🤖 Escaneando…")
 
-    # 1) Si hay posición abierta -> gestionar y salir
+    # Si hay posición abierta → gestionar
     if position_open():
         manage_position()
         return
 
-    # 2) Sin posición: verificar USDC
+    # Sin posición: verificar USDC
     free_usdc = free_balance(BASE_ASSET)
     info(f"💰 {BASE_ASSET} libre: {free_usdc:.2f}")
     if free_usdc < MIN_NOTIONAL_USDC:
@@ -463,15 +518,15 @@ def scan_loop():
     if not position_can_open_now():
         return
 
-    # 3) Watchlist válida
+    # Watchlist SOLO USDC y existente en exchange
     syms_conf = [s.strip().upper() for s in WATCHLIST.split(",") if s.strip()]
     symbols = [s for s in syms_conf if s.endswith(BASE_ASSET) and symbol_exists(s)]
     if not symbols:
-        info("⛔ WATCHLIST vacía o inválida.")
-        tg_notify("⛔ WATCHLIST vacía o inválida.")
+        info("⛔ WATCHLIST vacía o inválida (USDC).")
+        tg_notify("⛔ WATCHLIST vacía o inválida (USDC).")
         return
 
-    # 4) Puntuar y elegir mejor candidato
+    # Puntuar y elegir mejor
     best_sym = None
     best_score = Decimal("-999")
     for s in symbols:
@@ -480,16 +535,17 @@ def scan_loop():
         if sc > best_score:
             best_score = sc
             best_sym = s
+
     if best_sym is None or best_score <= 0:
         info("🟡 Sin señal clara (score<=0). No compro.")
         return
 
-    # 5) Comprar
+    # Comprar con todo el USDC (según ALLOC_PCT)
     to_spend = free_usdc * ALLOC_PCT
-    order, qty, px = place_market_buy(best_sym, to_spend)
-    if order and qty and px:
+    order, net_qty, px = place_market_buy(best_sym, to_spend)
+    if order and net_qty and px:
         state["open_symbol"] = best_sym
-        state["open_qty"] = float(qty)
+        state["open_qty"] = float(net_qty)   # qty neta
         state["avg_price"] = float(px)
         state["opened_ts"] = int(time.time())
         state["high_water"] = 0.0
@@ -503,12 +559,12 @@ def main():
     info("🤖 Bot iniciado.")
     refresh_exchange_info()
     info("✅ Exchange info cargada.")
-    info(f"🧹 Dust: {'ignorado' if DUST_MODE=='IGNORE' else 'intento vender (SELL)'} (DUST_MODE={DUST_MODE}).")
+    info(f"🧹 Dust: {'ignorado' if DUST_MODE=='IGNORE' else 'SELL'} (DUST_MODE={DUST_MODE}).")
 
+    # Consolidar todo a USDC si está activo
     if AUTO_CONSOLIDATE:
         force_base_position_usdc()
     else:
-        # Log amigable si no consolida en el arranque
         usdc = free_balance(BASE_ASSET)
         info(f"ℹ️ Arranque sin consolidación. {BASE_ASSET} libre: {usdc:.2f}")
 
@@ -519,10 +575,13 @@ def main():
         info(f"ℹ️ Sin posición abierta. Base: {BASE_ASSET}")
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(scan_loop, "interval",
-                      seconds=SCAN_INTERVAL_SEC,
-                      max_instances=1, coalesce=True, misfire_grace_time=10)
+    scheduler.add_job(
+        scan_loop, "interval",
+        seconds=SCAN_INTERVAL_SEC,
+        max_instances=1, coalesce=True, misfire_grace_time=10
+    )
     scheduler.start()
+
     try:
         while True:
             time.sleep(1)
