@@ -1,5 +1,5 @@
 # main.py
-import os, json, time
+import os, json, time, math
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -10,106 +10,100 @@ from binance.client import Client
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 from binance.exceptions import BinanceAPIException
 
-# ========= Config por entorno =========
+# ============ CONFIG ENTORNO ============
 API_KEY        = os.getenv("BINANCE_API_KEY", "")
 API_SECRET     = os.getenv("BINANCE_API_SECRET", "")
-LIVE_MODE      = os.getenv("LIVE_MODE", "1") == "1"          # 0 => dry-run
-BASE_ASSET     = os.getenv("FORCE_BASE", "USDC").upper()     # USDC base
+LIVE_MODE      = os.getenv("LIVE_MODE", "1") == "1"
 
-AUTO_CONSOLIDATE   = os.getenv("AUTO_CONSOLIDATE", "1") == "1"
-DUST_MODE          = os.getenv("DUST_MODE", "IGNORE").upper()   # IGNORE o SELL
+BASE_ASSET     = os.getenv("FORCE_BASE", "USDC").upper()
+AUTO_CONSOLIDATE   = os.getenv("AUTO_CONSOLIDATE", "1") == "1"   # consolida restos a USDC
+DUST_MODE          = os.getenv("DUST_MODE", "IGNORE").upper()    # IGNORE o SELL
 MIN_NOTIONAL_USDC  = Decimal(os.getenv("MIN_NOTIONAL_USDC", "20"))
+
 SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", "15"))
-COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", "0"))
-TP_PCT             = Decimal(os.getenv("TP_PCT", "0.006"))      # 0.6%
-SL_PCT             = Decimal(os.getenv("SL_PCT", "0.007"))      # 0.7%
-ALLOC_PCT          = Decimal(os.getenv("ALLOC_PCT", "1.0"))     # 100% del USDC libre
 STATE_PATH         = os.getenv("STATE_PATH", "state.json")
 
-# Watchlist SOLO USDC (forzamos en tiempo de ejecución que terminen en USDC)
+# ======= ESTRATEGIA (anti-churn y con ATR) =======
+# Comisiones (taker) para cubrir ida/vuelta:
+FEE_TAKER_PCT   = Decimal(os.getenv("FEE_TAKER_PCT", "0.001"))   # 0.10% por lado típico
+MIN_PROFIT_USDC = Decimal(os.getenv("MIN_PROFIT_USDC", "2.0"))   # beneficio mínimo NETO por trade
+
+# Sizing / capital
+ALLOC_PCT       = Decimal(os.getenv("ALLOC_PCT", "1.0"))         # 100% del USDC libre
+
+# Volatilidad y señales
+ATR_PERIOD      = int(os.getenv("ATR_PERIOD", "14"))
+MIN_ATR_PCT     = Decimal(os.getenv("MIN_ATR_PCT", "0.0015"))    # 0.15% mínimo de volatilidad para operar
+TP_ATR_MULT     = Decimal(os.getenv("TP_ATR_MULT", "1.2"))       # TP = avg + 1.2 * ATR
+SL_ATR_MULT     = Decimal(os.getenv("SL_ATR_MULT", "1.0"))       # SL = avg - 1.0 * ATR
+TRAIL_ARM_MULT  = Decimal(os.getenv("TRAIL_ARM_MULT", "0.8"))    # arma trailing cuando pnl >= 0.8*ATR/avg (%)
+TRAIL_GIVEBACK  = Decimal(os.getenv("TRAIL_GIVEBACK", "0.5"))    # cede 0.5*ATR/avg desde el pico => venta
+
+# Control de tiempos
+MIN_HOLD_MIN        = int(os.getenv("MIN_HOLD_MIN", "20"))       # tiempo mínimo en posición
+SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "60"))# no re-entrar antes de X minutos en el mismo símbolo
+MAX_HOLD_MIN        = int(os.getenv("MAX_HOLD_MIN", "240"))      # límite “blando” de 4h
+
+# Watchlist SOLO USDC (liquidez alta)
 WATCHLIST = os.getenv(
     "WATCHLIST",
     "BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,DOGEUSDC,TRXUSDC,XRPUSDC,ADAUSDC,LTCUSDC"
 )
-
-# Dinamizadores para que "se mueva"
-TRAIL_ARM_PCT      = Decimal(os.getenv("TRAIL_ARM_PCT", "0.003"))      # +0.30% arma trailing
-TRAIL_GIVEBACK_PCT = Decimal(os.getenv("TRAIL_GIVEBACK_PCT", "0.0015"))# -0.15% desde el máximo => vender
-STALE_MIN          = int(os.getenv("STALE_MIN", "40"))                  # minutos max “plano”
-FLAT_PNL_PCT       = Decimal(os.getenv("FLAT_PNL_PCT", "0.0015"))       # ±0.15% se considera plano
-BE_EXIT_PCT        = Decimal(os.getenv("BE_EXIT_PCT", "0.0025"))        # +0.25% salida ligera (fees)
-
-# Venta segura (evita insufficient balance por comisiones/decimales)
-SAFETY_SELL_PCT    = Decimal(os.getenv("SAFETY_SELL_PCT", "0.999"))     # vende 99.9%
 
 # Telegram
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TG_OFF     = os.getenv("TELEGRAM_DISABLE", "0") == "1"
 
-# ========= Logger =========
+# ============ LOG ============
 LOG_PREFIX = lambda lvl: f"{datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} - {lvl} -"
 def info(msg): print(f"{LOG_PREFIX('INFO')} {msg}")
 def warn(msg): print(f"{LOG_PREFIX('WARNING')} {msg}")
 def err (msg): print(f"{LOG_PREFIX('ERROR')} {msg}")
 
-# ========= Telegram =========
 def tg_notify(text: str, parse_mode: str = "HTML", disable_web_page_preview: bool = True):
     if TG_OFF or not TG_TOKEN or not TG_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text[:3900],
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": disable_web_page_preview,
-    }
+    payload = {"chat_id": TG_CHAT_ID, "text": text[:3900], "parse_mode": parse_mode,
+               "disable_web_page_preview": disable_web_page_preview}
     for _ in range(3):
         try:
             r = requests.post(url, json=payload, timeout=10)
-            if r.status_code == 200:
-                return True
+            if r.status_code == 200: return True
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", "2"))
-                time.sleep(min(max(wait, 2), 10))
-                continue
-            print(f"[TG] HTTP {r.status_code}: {r.text}")
-            return False
+                time.sleep(min(max(wait,2),10)); continue
+            print(f"[TG] HTTP {r.status_code}: {r.text}"); return False
         except Exception as e:
-            print(f"[TG] Error: {e}")
-            time.sleep(1.5)
+            print(f"[TG] Error: {e}"); time.sleep(1.5)
     return False
 
-# ========= Cliente Binance =========
+# ============ BINANCE ============
 if not API_KEY or not API_SECRET:
-    warn("Claves Binance no configuradas. Estás en modo lectura hasta que las añadas.")
+    warn("Claves Binance no configuradas. Modo lectura.")
 client = Client(API_KEY, API_SECRET)
 
-# ========= Estado persistente =========
 def load_state() -> dict:
     try:
-        with open(STATE_PATH, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        with open(STATE_PATH, "r") as f: return json.load(f)
+    except Exception: return {}
 
 def save_state(st: dict):
     try:
-        with open(STATE_PATH, "w") as f:
-            json.dump(st, f, indent=2)
-    except Exception as e:
-        warn(f"No se pudo guardar estado: {e}")
+        with open(STATE_PATH, "w") as f: json.dump(st, f, indent=2)
+    except Exception as e: warn(f"No se pudo guardar estado: {e}")
 
 state = load_state()
 state.setdefault("base_asset", BASE_ASSET)
-state.setdefault("open_symbol", None)
-state.setdefault("open_qty", 0.0)      # qty neta
+state.setdefault("open_symbol", None)     # p.ej. "BTCUSDC"
+state.setdefault("open_qty", 0.0)         # qty neta
 state.setdefault("avg_price", 0.0)
+state.setdefault("opened_ts", 0)
+state.setdefault("high_water_pnl", 0.0)   # mejor pnl% desde apertura
 state.setdefault("last_trade_ts", 0)
-state.setdefault("opened_ts", 0)       # epoch segs
-state.setdefault("high_water", 0.0)    # mejor PnL desde apertura
+state.setdefault("symbol_cooldowns", {})  # { "BTCUSDC": epoch_ts }
 
-# ========= Exchange info / filtros =========
 SYMBOL_INFO: Dict[str, dict] = {}
 
 def refresh_exchange_info():
@@ -117,15 +111,13 @@ def refresh_exchange_info():
     ex = client.get_exchange_info()
     SYMBOL_INFO = {s["symbol"]: s for s in ex["symbols"]}
 
-def symbol_exists(symbol: str) -> bool:
-    return symbol in SYMBOL_INFO
+def symbol_exists(symbol: str) -> bool: return symbol in SYMBOL_INFO
 
 def _get_filter(symbol: str, ftype: str) -> Optional[dict]:
-    info_s = SYMBOL_INFO.get(symbol)
+    info_s = SYMBOL_INFO.get(symbol); 
     if not info_s: return None
     for f in info_s["filters"]:
-        if f["filterType"] == ftype:
-            return f
+        if f["filterType"] == ftype: return f
     return None
 
 def lot_step(symbol: str) -> Decimal:
@@ -148,29 +140,31 @@ def round_by_step(qty: Decimal, step: Decimal) -> Decimal:
     n_steps = (qty / step).to_integral_value(rounding=ROUND_DOWN)
     return n_steps * step
 
-def round_by_tick(px: Decimal, tick: Decimal) -> Decimal:
-    if tick == 0: return px
-    n_ticks = (px / tick).to_integral_value(rounding=ROUND_DOWN)
-    return n_ticks * tick
+# ======= PRECIOS / VELAS / ATR =======
+def get_klines(symbol: str, interval="1m", limit=ATR_PERIOD+30) -> List[Tuple[Decimal,Decimal,Decimal]]:
+    raws = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    # devuelve (high, low, close)
+    return [(Decimal(str(k[2])), Decimal(str(k[3])), Decimal(str(k[4]))) for k in raws]
 
-# ========= Precios / velas =========
 def last_price(symbol: str) -> Decimal:
     r = client.get_symbol_ticker(symbol=symbol)
     return Decimal(str(r["price"]))
 
-def get_klines(symbol: str, interval="1m", limit=60) -> List[dict]:
-    raws = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-    return [{"c": Decimal(str(k[4]))} for k in raws]
+def calc_atr(symbol: str, period: int = ATR_PERIOD) -> Tuple[Decimal, Decimal]:
+    """Devuelve (ATR_abs, ATR_pct_sobre_close)."""
+    kl = get_klines(symbol, limit=period+1)
+    if len(kl) < period+1: return Decimal("0"), Decimal("0")
+    trs = []
+    prev_close = kl[0][2]
+    for (h,l,c) in kl[1:]:
+        tr = max(h-l, abs(h-prev_close), abs(l-prev_close))
+        trs.append(tr); prev_close = c
+    atr = sum(trs) / Decimal(len(trs))
+    last_close = kl[-1][2]
+    atr_pct = atr / last_close if last_close > 0 else Decimal("0")
+    return atr, atr_pct
 
-def ema(values: List[Decimal], period: int) -> Decimal:
-    if not values: return Decimal("0")
-    k = Decimal("2") / Decimal(period + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (Decimal("1") - k)
-    return e
-
-# ========= Balances =========
+# ======= BALANCES / CONSOLIDACIÓN (solo a USDC) =======
 def free_balance(asset: str) -> Decimal:
     try:
         bal = client.get_asset_balance(asset=asset)
@@ -183,408 +177,319 @@ def all_free_balances() -> Dict[str, Decimal]:
     bals = {}
     for b in client.get_account()["balances"]:
         q = Decimal(b["free"])
-        if q > 0:
-            bals[b["asset"]] = q
+        if q > 0: bals[b["asset"]] = q
     return bals
 
-# ========= Consolidación a USDC =========
 def sell_all_to_usdc(asset: str, qty: Decimal) -> bool:
     if asset == BASE_ASSET: return False
     symbol = f"{asset}{BASE_ASSET}"
-    if not symbol_exists(symbol):
-        info(f"🚫 No existe {symbol}, no consolido {asset}.")
+    if not symbol_exists(symbol): 
+        info(f"🚫 Sin par {symbol}. No convierto {asset}."); 
         return False
     px = last_price(symbol)
-    if px <= 0:
-        info(f"🚫 Sin precio para {symbol}.")
-        return False
     notional = qty * px
     ex_min = min_notional(symbol)
     min_needed = ex_min if ex_min > 0 else MIN_NOTIONAL_USDC
     if notional < min_needed:
-        info(f"🟡 {asset}: notional {notional:.4f} < min {min_needed:.4f}. "
-             f"{'Ignoro (dust)' if DUST_MODE=='IGNORE' else 'Intento vender igualmente'}")
-        if DUST_MODE == "IGNORE":
-            return False
+        info(f"🟡 {asset}: notional {notional:.4f} < min {min_needed:.4f}. {('Ignoro' if DUST_MODE=='IGNORE' else 'Intento vender')}")
+        if DUST_MODE == "IGNORE": return False
     q_round = round_by_step(qty, lot_step(symbol))
-    if q_round <= 0:
-        info(f"🟡 {asset}: qty tras redondeo es 0. No vendo.")
-        return False
+    if q_round <= 0: return False
     if LIVE_MODE:
         try:
-            info(f"🔁 Consolida {asset} -> {BASE_ASSET}: {symbol} qty={q_round}")
-            client.create_order(symbol=symbol, side=SIDE_SELL,
-                                type=ORDER_TYPE_MARKET, quantity=float(q_round))
-            time.sleep(0.7)
-            return True
+            info(f"🔁 Consolida {asset}->{BASE_ASSET} qty={q_round}")
+            client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=float(q_round))
+            time.sleep(0.7); return True
         except Exception as e:
-            err(f"Error vendiendo {asset}->{BASE_ASSET}: {e}")
-            tg_notify(f"⚠️ Error consolidando <b>{asset}</b>→{BASE_ASSET}: <code>{e}</code>")
+            err(f"Consolidación fallo {asset}->{BASE_ASSET}: {e}"); tg_notify(f"⚠️ Consolidación {asset}->USDC: <code>{e}</code>")
             return False
     else:
-        info(f"[DRY] Vendería {asset}->{BASE_ASSET} qty={q_round}")
-        return True
+        info(f"[DRY] Vendería {asset}->{BASE_ASSET} qty={q_round}"); return True
 
 def force_base_position_usdc():
-    refresh_exchange_info()
     bals = all_free_balances()
-    non_base = {a: q for a, q in bals.items() if a != BASE_ASSET and q > 0}
+    non_base = {a:q for a,q in bals.items() if a != BASE_ASSET and q > 0}
     if non_base:
-        info(f"🧹 Consolidación: {len(non_base)} activos ≠ {BASE_ASSET} detectados.")
-        for a, q in non_base.items():
-            sell_all_to_usdc(a, q)
+        info(f"🧹 Consolidación: {len(non_base)} activos ≠ {BASE_ASSET}.")
+        for a,q in non_base.items(): sell_all_to_usdc(a,q)
     usdc = free_balance(BASE_ASSET)
     info(f"💰 {BASE_ASSET} libre: {usdc:.2f}")
-    # Estado a sin posición
-    state["open_symbol"] = None
-    state["open_qty"] = 0.0
-    state["avg_price"] = 0.0
-    state["opened_ts"] = 0
-    state["high_water"] = 0.0
+    # limpiar estado de posición
+    state["open_symbol"]=None; state["open_qty"]=0.0; state["avg_price"]=0.0
+    state["opened_ts"]=0; state["high_water_pnl"]=0.0
     save_state(state)
     info("✅ Posición base forzada: USDC. Sin posición abierta.")
-    tg_notify("✅ Bot iniciado y consolidado a <b>USDC</b>. Sin posición abierta.")
+    tg_notify("✅ Iniciado y consolidado a <b>USDC</b>. Sin posición abierta.")
 
-# ========= Señal simple (precio vs EMA20) =========
-def score_symbol(symbol: str) -> Tuple[Decimal, dict]:
-    try:
-        kl = get_klines(symbol, limit=40)
-        closes = [k["c"] for k in kl]
-        if len(closes) < 20:
-            return Decimal("0"), {"reason": "pocas velas"}
-        px = closes[-1]
-        ema20 = ema(closes[-20:], 20)
-        score = (px - ema20) / (ema20 if ema20 != 0 else px)
-        return score, {"px": float(px), "ema20": float(ema20)}
-    except Exception as e:
-        warn(f"{symbol} fallo señal: {e}")
-        return Decimal("0"), {"reason":"error señal"}
-
-# ========= Órdenes (compra guarda qty neta, venta usa saldo real + safety) =========
+# ======= ÓRDENES con qty neta y venta segura =======
 def place_market_buy(symbol: str, usdc_to_spend: Decimal):
     px = last_price(symbol)
-    if px <= 0:
-        info(f"⛔ {symbol} sin precio válido.")
-        tg_notify(f"⛔ {symbol} sin precio válido para comprar.")
-        return None, None, None
-
-    ex_min = min_notional(symbol)
-    min_needed = ex_min if ex_min > 0 else MIN_NOTIONAL_USDC
+    if px <= 0: info(f"⛔ {symbol} sin precio."); tg_notify(f"⛔ {symbol} sin precio."); return None, None, None
+    # Notional mínimo
+    ex_min = min_notional(symbol); min_needed = ex_min if ex_min > 0 else MIN_NOTIONAL_USDC
     if usdc_to_spend < min_needed:
-        info(f"⛔ Notional insuficiente ({usdc_to_spend:.2f} < {min_needed:.2f}) para {symbol}.")
-        tg_notify(f"⛔ Notional insuficiente para {symbol}: <code>{usdc_to_spend:.2f} &lt; {min_needed:.2f}</code>")
-        return None, None, None
-
+        info(f"⛔ Notional insuficiente {usdc_to_spend:.2f}<{min_needed:.2f}"); return None,None,None
+    # Qty requerida (redondeo por step)
     step = lot_step(symbol)
     req_qty = usdc_to_spend / px
-    req_qty = round_by_step(req_qty, step) if step > 0 else req_qty
-    if req_qty <= 0:
-        info(f"⛔ Qty redondeada es 0 para {symbol}.")
-        tg_notify(f"⛔ Qty redondeada 0 para {symbol}.")
-        return None, None, None
+    req_qty = round_by_step(req_qty, step) if step>0 else req_qty
+    if req_qty <= 0: info("⛔ Qty=0"); return None,None,None
 
     if LIVE_MODE:
         try:
-            o = client.create_order(symbol=symbol, side=SIDE_BUY,
-                                    type=ORDER_TYPE_MARKET, quantity=float(req_qty))
-            # Cantidad neta tras comisión (si la comisión fue en el mismo activo)
-            base_asset = symbol.replace(BASE_ASSET, "")
-            filled_qty = Decimal("0")
-            commission_in_base = Decimal("0")
+            o = client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=float(req_qty))
+            base_asset = symbol.replace(BASE_ASSET,"")
+            filled_qty = Decimal("0"); commission_in_base = Decimal("0")
             if "fills" in o:
                 for f in o["fills"]:
-                    filled_qty += Decimal(str(f.get("qty", "0")))
-                    if f.get("commissionAsset") == base_asset:
-                        commission_in_base += Decimal(str(f.get("commission", "0")))
+                    filled_qty += Decimal(str(f.get("qty","0")))
+                    if f.get("commissionAsset")==base_asset:
+                        commission_in_base += Decimal(str(f.get("commission","0")))
             net_qty = filled_qty - commission_in_base
-            if net_qty <= 0:
-                # Fallback: leer del balance real
-                net_qty = free_balance(base_asset)
-
+            if net_qty <= 0: net_qty = free_balance(base_asset)
             info(f"✅ COMPRA {symbol} qty_neta={net_qty} notional≈{(net_qty*px):.2f}")
-            tg_notify(
-                f"🟢 <b>COMPRA</b> {symbol}\n"
-                f"Qty neta: <code>{net_qty}</code>\n"
-                f"Precio≈<code>{px:.6f}</code>\n"
-                f"Notional≈<code>{(net_qty*px):.2f} USDC</code>"
-            )
+            tg_notify(f"🟢 <b>COMPRA</b> {symbol}\nQty neta: <code>{net_qty}</code>\nPrecio≈<code>{px:.6f}</code>\nNotional≈<code>{(net_qty*px):.2f} USDC</code>")
             return o, net_qty, px
         except BinanceAPIException as be:
-            err(f"Orden BUY falló {symbol}: {be.message}")
-            tg_notify(f"⛔ BUY falló {symbol}: <code>{be.message}</code>")
-            return None, None, None
+            err(f"BUY {symbol}: {be.message}"); tg_notify(f"⛔ BUY {symbol}: <code>{be.message}</code>"); return None,None,None
         except Exception as e:
-            err(f"Orden BUY falló {symbol}: {e}")
-            tg_notify(f"⛔ BUY falló {symbol}: <code>{e}</code>")
-            return None, None, None
+            err(f"BUY {symbol}: {e}"); tg_notify(f"⛔ BUY {symbol}: <code>{e}</code>"); return None,None,None
     else:
-        info(f"[DRY] BUY {symbol} qty={req_qty} notional≈{(req_qty*px):.2f}")
-        tg_notify(f"🟢 [DRY] COMPRA {symbol} qty=<code>{req_qty}</code> px≈<code>{px:.6f}</code>")
-        return {"dry": True}, req_qty, px
+        info(f"[DRY] BUY {symbol} qty={req_qty} notional≈{(req_qty*px):.2f}"); return {"dry":True}, req_qty, px
 
+SAFETY_SELL_PCT = Decimal(os.getenv("SAFETY_SELL_PCT", "0.999"))
 def place_market_sell(symbol: str, qty_hint: Decimal):
-    base_asset = symbol.replace(BASE_ASSET, "")
-    free_asset = free_balance(base_asset)
-
+    base_asset = symbol.replace(BASE_ASSET,""); free_asset = free_balance(base_asset)
     qty_raw = min(qty_hint, free_asset) * SAFETY_SELL_PCT
-    step = lot_step(symbol)
-    q = round_by_step(qty_raw, step) if step > 0 else qty_raw
-
-    if q <= 0:
-        info(f"⛔ Qty venta 0 para {symbol} (free={free_asset}, hint={qty_hint}).")
-        tg_notify(f"⛔ Venta 0 para {symbol} (free={free_asset}, hint={qty_hint}).")
-        return None
-
+    q = round_by_step(qty_raw, lot_step(symbol)) if lot_step(symbol)>0 else qty_raw
+    if q <= 0: info(f"⛔ Venta 0 {symbol} (free={free_asset}, hint={qty_hint})"); return None
     if LIVE_MODE:
         try:
-            o = client.create_order(symbol=symbol, side=SIDE_SELL,
-                                    type=ORDER_TYPE_MARKET, quantity=float(q))
+            o = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=float(q))
             px = last_price(symbol)
             info(f"✅ VENTA {symbol} qty={q} notional≈{(q*px):.2f}")
-            tg_notify(
-                f"🔴 <b>VENTA</b> {symbol}\n"
-                f"Qty: <code>{q}</code>\n"
-                f"Precio≈<code>{px:.6f}</code>\n"
-                f"Notional≈<code>{(q*px):.2f} USDC</code>"
-            )
+            tg_notify(f"🔴 <b>VENTA</b> {symbol}\nQty: <code>{q}</code>\nPrecio≈<code>{px:.6f}</code>\nNotional≈<code>{(q*px):.2f} USDC</code>")
             return o
         except BinanceAPIException as be:
-            err(f"Orden SELL falló {symbol}: {be.message}")
-            tg_notify(f"⛔ SELL falló {symbol}: <code>{be.message}</code>\n"
-                      f"(free={free_asset} hint={qty_hint} q_try={q})")
-            return None
+            err(f"SELL {symbol}: {be.message}"); tg_notify(f"⛔ SELL {symbol}: <code>{be.message}</code>"); return None
         except Exception as e:
-            err(f"Orden SELL falló {symbol}: {e}")
-            tg_notify(f"⛔ SELL falló {symbol}: <code>{e}</code>")
-            return None
+            err(f"SELL {symbol}: {e}"); tg_notify(f"⛔ SELL {symbol}: <code>{e}</code>"); return None
     else:
-        px = last_price(symbol)
-        info(f"[DRY] SELL {symbol} qty={q} notional≈{(q*px):.2f}")
-        tg_notify(f"🔴 [DRY] VENTA {symbol} qty=<code>{q}</code> px≈<code>{px:.6f}</code>")
-        return {"dry": True}
+        info(f"[DRY] SELL {symbol} qty={q}"); return {"dry":True}
 
-# ========= Gestión de posición =========
-def position_open() -> bool: return bool(state.get("open_symbol"))
-def open_symbol() -> Optional[str]: return state.get("open_symbol")
+# ======= ESTRATEGIA (ATR + beneficio mínimo neto) =======
+def expected_net_profit_ok(symbol: str, entry_px: Decimal, qty: Decimal, atr_abs: Decimal) -> bool:
+    """Comprueba que el objetivo TP (entry + TP_ATR_MULT*ATR) deje >= MIN_PROFIT_USDC tras fees ida+vuelta."""
+    tp_px = entry_px + TP_ATR_MULT * atr_abs
+    gross = (tp_px - entry_px) * qty
+    fees = (entry_px * qty + tp_px * qty) * FEE_TAKER_PCT   # ida + vuelta
+    net  = gross - fees
+    return net >= MIN_PROFIT_USDC
+
+def symbol_on_cooldown(symbol: str) -> bool:
+    cd = state.get("symbol_cooldowns", {})
+    last = cd.get(symbol, 0)
+    if not last: return False
+    wait = SYMBOL_COOLDOWN_MIN*60 - int(time.time()-last)
+    if wait > 0:
+        info(f"⏳ Cooldown {symbol} {wait}s.")
+        return True
+    return False
+
+def open_position(symbol: str, usdc_free: Decimal):
+    # ATR filtro
+    atr_abs, atr_pct = calc_atr(symbol, ATR_PERIOD)
+    if atr_pct < MIN_ATR_PCT:
+        info(f"🧊 {symbol} ATR% bajo ({float(atr_pct)*100:.2f}%) < {float(MIN_ATR_PCT)*100:.2f}%"); 
+        return
+    # compra sólo si TP esperado supera fees + MIN_PROFIT_USDC
+    px = last_price(symbol)
+    to_spend = (usdc_free * ALLOC_PCT)
+    # Ensure notional ok
+    ex_min = min_notional(symbol); min_needed = ex_min if ex_min > 0 else MIN_NOTIONAL_USDC
+    if to_spend < min_needed:
+        info(f"⛔ Notional insuficiente para {symbol}"); return
+    # qty tentativa para check de beneficio
+    step = lot_step(symbol)
+    qty_tent = round_by_step(to_spend/px, step) if step>0 else (to_spend/px)
+    if qty_tent <= 0: info("⛔ qty_tent=0"); return
+    if not expected_net_profit_ok(symbol, px, qty_tent, atr_abs):
+        info(f"❎ {symbol} TP esperado no cubre fees + MIN_PROFIT_USDC."); 
+        return
+
+    order, net_qty, entry_px = place_market_buy(symbol, to_spend)
+    if order and net_qty and entry_px:
+        state["open_symbol"] = symbol
+        state["open_qty"]    = float(net_qty)
+        state["avg_price"]   = float(entry_px)
+        state["opened_ts"]   = int(time.time())
+        state["high_water_pnl"] = 0.0
+        save_state(state)
 
 def manage_position():
-    sym = open_symbol()
-    if not sym:
-        return
+    sym = state.get("open_symbol")
+    if not sym: return
     try:
-        px  = last_price(sym)
-        avg = Decimal(str(state.get("avg_price", 0)))
-        qty = Decimal(str(state.get("open_qty", 0)))
-        if avg <= 0 or qty <= 0:
-            info("⚠️ Estado inconsistente, cierro mem-pos.")
-            state["open_symbol"] = None
-            state["open_qty"] = 0.0
-            state["avg_price"] = 0.0
-            state["opened_ts"] = 0
-            state["high_water"] = 0.0
-            save_state(state)
-            return
+        px   = last_price(sym)
+        avg  = Decimal(str(state.get("avg_price", 0)))
+        qty  = Decimal(str(state.get("open_qty", 0)))
+        if avg<=0 or qty<=0:
+            info("⚠️ Estado inconsistente, cierro mem-pos."); 
+            state["open_symbol"]=None; state["open_qty"]=0.0; state["avg_price"]=0.0
+            state["opened_ts"]=0; state["high_water_pnl"]=0.0; save_state(state); return
 
         pnl = (px - avg) / avg
         opened_ts = int(state.get("opened_ts", 0))
-        minutes_open = int((time.time() - opened_ts) / 60) if opened_ts else 0
+        minutes_open = int((time.time()-opened_ts)/60) if opened_ts else 0
 
-        # Actualizar high-water (mejor PnL desde apertura)
-        hw = Decimal(str(state.get("high_water", 0.0)))
+        # ATR del momento para targets dinámicos
+        atr_abs, atr_pct = calc_atr(sym, ATR_PERIOD)
+        if atr_abs == 0:
+            info("ATR=0, mantengo."); return
+
+        # High-water PnL
+        hw = Decimal(str(state.get("high_water_pnl", 0.0)))
         if pnl > hw:
-            hw = pnl
-            state["high_water"] = float(hw)
-            save_state(state)
+            hw = pnl; state["high_water_pnl"] = float(hw); save_state(state)
 
-        # 1) TP directo
-        if pnl >= TP_PCT:
-            info(f"🎯 TP {sym} +{float(pnl)*100:.2f}% (avg={avg}, px={px})")
-            base_asset = sym.replace(BASE_ASSET, "")
-            free_asset = free_balance(base_asset)
-            info(f"🧮 Pre-SELL {sym}: hint_qty={qty} | free_asset={free_asset}")
+        # Targets
+        tp_px = avg + TP_ATR_MULT*atr_abs
+        sl_px = avg - SL_ATR_MULT*atr_abs
+        tp_hit = px >= tp_px
+        sl_hit = px <= sl_px
+
+        # Trailing armado?
+        trail_arm = (hw >= (TRAIL_ARM_MULT * (atr_abs/avg)))  # comparar en %
+        trail_giveback = (trail_arm and ((hw - pnl) >= (TRAIL_GIVEBACK * (atr_abs/avg))))
+
+        # Beneficio real en USDC ahora:
+        gross_now = max(Decimal("0"), (px - avg) * qty)
+        fees_now  = (avg*qty + px*qty) * FEE_TAKER_PCT
+        net_now   = gross_now - fees_now
+
+        # 1) SL por ATR
+        if sl_hit and minutes_open >= MIN_HOLD_MIN:
+            info(f"🛑 SL {sym} ATR ({float(pnl)*100:.2f}%)")
             if place_market_sell(sym, qty):
-                state["open_symbol"] = None
-                state["open_qty"] = 0.0
-                state["avg_price"] = 0.0
-                state["opened_ts"] = 0
-                state["high_water"] = 0.0
-                state["last_trade_ts"] = int(time.time())
-                save_state(state)
-                tg_notify(f"🎯 <b>TP</b> {sym} +{float(pnl)*100:.2f}%")
+                state["open_symbol"]=None; state["open_qty"]=0.0; state["avg_price"]=0.0
+                state["opened_ts"]=0; state["high_water_pnl"]=0.0
+                # cooldown símbolo
+                cds = state.get("symbol_cooldowns", {}); cds[sym]=int(time.time()); state["symbol_cooldowns"]=cds
+                state["last_trade_ts"]=int(time.time()); save_state(state); 
+                tg_notify(f"🛑 SL {sym} ({float(pnl)*100:.2f}%)"); 
             return
 
-        # 2) Trailing armado y giveback
-        if hw >= TRAIL_ARM_PCT and (hw - pnl) >= TRAIL_GIVEBACK_PCT:
-            info(f"🏳️ Trailing {sym}: hw={float(hw)*100:.2f}% → pnl={float(pnl)*100:.2f}% "
-                 f"| giveback={float(hw-pnl)*100:.2f}%")
-            base_asset = sym.replace(BASE_ASSET, "")
-            free_asset = free_balance(base_asset)
-            info(f"🧮 Pre-SELL {sym}: hint_qty={qty} | free_asset={free_asset}")
+        # 2) Trailing por ATR (si ya armó y cede)
+        if trail_giveback and minutes_open >= MIN_HOLD_MIN:
+            # Sólo cerrar si deja NETO suficiente (o al menos > 0) o si reversiona fuerte
+            if net_now >= MIN_PROFIT_USDC or hw - pnl >= (TRAIL_GIVEBACK * (atr_abs/avg) * 1.5):
+                info(f"🏳️ Trailing {sym} hw={float(hw)*100:.2f}% → pnl={float(pnl)*100:.2f}% (net≈{float(net_now):.2f} USDC)")
+                if place_market_sell(sym, qty):
+                    state["open_symbol"]=None; state["open_qty"]=0.0; state["avg_price"]=0.0
+                    state["opened_ts"]=0; state["high_water_pnl"]=0.0
+                    cds = state.get("symbol_cooldowns", {}); cds[sym]=int(time.time()); state["symbol_cooldowns"]=cds
+                    state["last_trade_ts"]=int(time.time()); save_state(state)
+                    tg_notify(f"🏳️ Trailing {sym} cierre net≈{float(net_now):.2f} USDC")
+                return
+            else:
+                info(f"⏩ Trailing armado pero neto insuficiente aún (net≈{float(net_now):.2f} USDC)")
+
+        # 3) TP por ATR
+        if tp_hit and minutes_open >= MIN_HOLD_MIN:
+            # sólo si deja neto >= mínimo
+            if expected_net_profit_ok(sym, avg, qty, atr_abs) and net_now >= MIN_PROFIT_USDC:
+                info(f"🎯 TP {sym} ATR + net≈{float(net_now):.2f} USDC")
+                if place_market_sell(sym, qty):
+                    state["open_symbol"]=None; state["open_qty"]=0.0; state["avg_price"]=0.0
+                    state["opened_ts"]=0; state["high_water_pnl"]=0.0
+                    cds = state.get("symbol_cooldowns", {}); cds[sym]=int(time.time()); state["symbol_cooldowns"]=cds
+                    state["last_trade_ts"]=int(time.time()); save_state(state)
+                    tg_notify(f"🎯 TP {sym} net≈{float(net_now):.2f} USDC")
+                return
+            else:
+                info(f"🟡 TP tocado pero neto < mínimo (net≈{float(net_now):.2f} USDC); sigo con trailing")
+
+        # 4) Break-even ampliado (sólo si cumple mínimo neto)
+        if minutes_open >= MIN_HOLD_MIN and net_now >= MIN_PROFIT_USDC:
+            # si no hay volatilidad suficiente para ATR trailing, aceptamos cierre rentable
+            info(f"🔄 BE/Fees OK {sym}: net≈{float(net_now):.2f} USDC (tras fees)")
             if place_market_sell(sym, qty):
-                state["open_symbol"] = None
-                state["open_qty"] = 0.0
-                state["avg_price"] = 0.0
-                state["opened_ts"] = 0
-                state["high_water"] = 0.0
-                state["last_trade_ts"] = int(time.time())
-                save_state(state)
-                tg_notify(f"🏳️ <b>Trailing</b> {sym} hw={float(hw)*100:.2f}% → pnl={float(pnl)*100:.2f}%")
+                state["open_symbol"]=None; state["open_qty"]=0.0; state["avg_price"]=0.0
+                state["opened_ts"]=0; state["high_water_pnl"]=0.0
+                cds = state.get("symbol_cooldowns", {}); cds[sym]=int(time.time()); state["symbol_cooldowns"]=cds
+                state["last_trade_ts"]=int(time.time()); save_state(state)
+                tg_notify(f"🔄 BE/Fees {sym} net≈{float(net_now):.2f} USDC")
             return
 
-        # 3) SL clásico
-        if (-pnl) >= SL_PCT:
-            info(f"🛑 SL {sym} -{float(pnl)*100:.2f}% (avg={avg}, px={px})")
-            base_asset = sym.replace(BASE_ASSET, "")
-            free_asset = free_balance(base_asset)
-            info(f"🧮 Pre-SELL {sym}: hint_qty={qty} | free_asset={free_asset}")
-            if place_market_sell(sym, qty):
-                state["open_symbol"] = None
-                state["open_qty"] = 0.0
-                state["avg_price"] = 0.0
-                state["opened_ts"] = 0
-                state["high_water"] = 0.0
-                state["last_trade_ts"] = int(time.time())
-                save_state(state)
-                tg_notify(f"🛑 <b>SL</b> {sym} -{float(pnl)*100:.2f}%")
-            return
+        # 5) Max hold: si pasan 4h y el neto no llega al mínimo y la volatilidad cayó, salir si es leve ganancia
+        if minutes_open >= MAX_HOLD_MIN:
+            if net_now > Decimal("0") and atr_pct < MIN_ATR_PCT:
+                info(f"⏱️ MAX HOLD {sym}: cierro con net≈{float(net_now):.2f} USDC (vol baja)")
+                if place_market_sell(sym, qty):
+                    state["open_symbol"]=None; state["open_qty"]=0.0; state["avg_price"]=0.0
+                    state["opened_ts"]=0; state["high_water_pnl"]=0.0
+                    cds = state.get("symbol_cooldowns", {}); cds[sym]=int(time.time()); state["symbol_cooldowns"]=cds
+                    state["last_trade_ts"]=int(time.time()); save_state(state)
+                    tg_notify(f"⏱️ MAX HOLD {sym} net≈{float(net_now):.2f} USDC")
+                return
 
-        # 4) Break-even/fees si no arma trailing
-        if pnl >= BE_EXIT_PCT and Decimal(str(state.get("high_water", 0.0))) < TRAIL_ARM_PCT:
-            info(f"🔄 BE/fees exit {sym}: pnl=+{float(pnl)*100:.2f}% (sin armar trailing)")
-            base_asset = sym.replace(BASE_ASSET, "")
-            free_asset = free_balance(base_asset)
-            info(f"🧮 Pre-SELL {sym}: hint_qty={qty} | free_asset={free_asset}")
-            if place_market_sell(sym, qty):
-                state["open_symbol"] = None
-                state["open_qty"] = 0.0
-                state["avg_price"] = 0.0
-                state["opened_ts"] = 0
-                state["high_water"] = 0.0
-                state["last_trade_ts"] = int(time.time())
-                save_state(state)
-                tg_notify(f"🔄 <b>BE/fees</b> {sym} cierre en +{float(pnl)*100:.2f}%")
-            return
-
-        # 5) Salida por estancamiento
-        if minutes_open >= STALE_MIN and abs(pnl) < FLAT_PNL_PCT:
-            info(f"⏱️ Estancamiento {sym}: {minutes_open} min con pnl={float(pnl)*100:.2f}% → rotación")
-            base_asset = sym.replace(BASE_ASSET, "")
-            free_asset = free_balance(base_asset)
-            info(f"🧮 Pre-SELL {sym}: hint_qty={qty} | free_asset={free_asset}")
-            if place_market_sell(sym, qty):
-                state["open_symbol"] = None
-                state["open_qty"] = 0.0
-                state["avg_price"] = 0.0
-                state["opened_ts"] = 0
-                state["high_water"] = 0.0
-                state["last_trade_ts"] = int(time.time())
-                save_state(state)
-                tg_notify(f"⏱️ <b>Flat exit</b> {sym} tras {minutes_open}m (pnl={float(pnl)*100:.2f}%)")
-            return
-
-        # Si nada aplica, solo informar
-        info(f"📊 {sym} PnL={float(pnl)*100:.2f}% | hw={float(hw)*100:.2f}% | open_for={minutes_open}m")
+        info(f"📊 {sym} pnl={float(pnl)*100:.2f}% | hw={float(hw)*100:.2f}% | hold={minutes_open}m | ATR%={float(atr_pct)*100:.2f}% | net≈{float(net_now):.2f} USDC")
 
     except Exception as e:
         warn(f"manage_position error: {e}")
         tg_notify(f"⚠️ manage_position error: <code>{e}</code>")
 
-# ========= Apertura de posición (solo símbolos USDC válidos) =========
-def position_can_open_now() -> bool:
-    if COOLDOWN_SEC <= 0: return True
-    last = int(state.get("last_trade_ts", 0))
-    if last == 0: return True
-    wait = COOLDOWN_SEC - int(time.time() - last)
-    if wait > 0:
-        info(f"⏳ Cooldown activo {wait}s.")
-        return False
-    return True
-
+# ======= LOOP =======
 def scan_loop():
     info("🤖 Escaneando…")
 
-    # Si hay posición abierta → gestionar
-    if position_open():
-        manage_position()
+    # 1) Con posición abierta -> gestionar
+    if state.get("open_symbol"): 
+        manage_position(); 
         return
 
-    # Sin posición: verificar USDC
-    free_usdc = free_balance(BASE_ASSET)
-    info(f"💰 {BASE_ASSET} libre: {free_usdc:.2f}")
-    if free_usdc < MIN_NOTIONAL_USDC:
-        info(f"⛔ USDC insuficiente para operar (min={MIN_NOTIONAL_USDC}).")
+    # 2) Sin posición: sólo USDC libre
+    usdc = free_balance(BASE_ASSET)
+    info(f"💰 {BASE_ASSET} libre: {usdc:.2f}")
+    if usdc < MIN_NOTIONAL_USDC: 
+        info("⛔ USDC insuficiente."); 
         return
 
-    if not position_can_open_now():
-        return
-
-    # Watchlist SOLO USDC y existente en exchange
+    # 3) Lista USDC válida y no en cooldown
     syms_conf = [s.strip().upper() for s in WATCHLIST.split(",") if s.strip()]
     symbols = [s for s in syms_conf if s.endswith(BASE_ASSET) and symbol_exists(s)]
     if not symbols:
-        info("⛔ WATCHLIST vacía o inválida (USDC).")
-        tg_notify("⛔ WATCHLIST vacía o inválida (USDC).")
+        info("⛔ WATCHLIST vacía/ inválida USDC."); tg_notify("⛔ WATCHLIST vacía/ inválida USDC."); return
+    symbols = [s for s in symbols if not symbol_on_cooldown(s)]
+    if not symbols: 
+        info("🟡 Todos en cooldown."); 
         return
 
-    # Puntuar y elegir mejor
-    best_sym = None
-    best_score = Decimal("-999")
+    # 4) Ranking simple por ATR% (prioriza volatilidad útil)
+    ranked = []
     for s in symbols:
-        sc, meta = score_symbol(s)
-        info(f"[SIG] {s} score={float(sc):.4f} meta={meta}")
-        if sc > best_score:
-            best_score = sc
-            best_sym = s
+        atr_abs, atr_pct = calc_atr(s, ATR_PERIOD)
+        ranked.append((s, atr_pct))
+        info(f"[VOL] {s} ATR%={float(atr_pct)*100:.2f}%")
+    ranked.sort(key=lambda x: x[1], reverse=True)
 
-    if best_sym is None or best_score <= 0:
-        info("🟡 Sin señal clara (score<=0). No compro.")
-        return
+    # 5) Probar abrir en orden de mayor ATR% (hasta encontrar uno que cumpla beneficio neto mínimo)
+    for s, _ in ranked:
+        open_position(s, usdc)
+        if state.get("open_symbol"): break  # abrió una
 
-    # Comprar con todo el USDC (según ALLOC_PCT)
-    to_spend = free_usdc * ALLOC_PCT
-    order, net_qty, px = place_market_buy(best_sym, to_spend)
-    if order and net_qty and px:
-        state["open_symbol"] = best_sym
-        state["open_qty"] = float(net_qty)   # qty neta
-        state["avg_price"] = float(px)
-        state["opened_ts"] = int(time.time())
-        state["high_water"] = 0.0
-        state["last_trade_ts"] = int(time.time())
-        save_state(state)
-    else:
-        info("🟠 No se pudo ejecutar compra: revisa logs anteriores.")
-
-# ========= Arranque =========
+# ======= ARRANQUE =======
 def main():
     info("🤖 Bot iniciado.")
-    refresh_exchange_info()
-    info("✅ Exchange info cargada.")
-    info(f"🧹 Dust: {'ignorado' if DUST_MODE=='IGNORE' else 'SELL'} (DUST_MODE={DUST_MODE}).")
-
-    # Consolidar todo a USDC si está activo
-    if AUTO_CONSOLIDATE:
-        force_base_position_usdc()
-    else:
-        usdc = free_balance(BASE_ASSET)
-        info(f"ℹ️ Arranque sin consolidación. {BASE_ASSET} libre: {usdc:.2f}")
-
-    if position_open():
-        sym = open_symbol()
-        info(f"ℹ️ Sincronizado estado con posición actual: {sym}")
-    else:
-        info(f"ℹ️ Sin posición abierta. Base: {BASE_ASSET}")
+    refresh_exchange_info(); info("✅ Exchange info cargada.")
+    if AUTO_CONSOLIDATE: force_base_position_usdc()
+    else: info(f"ℹ️ Consolidación desactivada. {BASE_ASSET} libre: {free_balance(BASE_ASSET):.2f}")
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        scan_loop, "interval",
-        seconds=SCAN_INTERVAL_SEC,
-        max_instances=1, coalesce=True, misfire_grace_time=10
-    )
+    scheduler.add_job(scan_loop, "interval", seconds=SCAN_INTERVAL_SEC, max_instances=1, coalesce=True, misfire_grace_time=10)
     scheduler.start()
-
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
         info("🛑 Detenido por usuario.")
     finally:
